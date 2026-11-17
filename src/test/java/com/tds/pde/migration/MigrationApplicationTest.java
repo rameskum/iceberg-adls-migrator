@@ -110,7 +110,8 @@ class MigrationApplicationTest {
         SpringApplication application = new SpringApplication(MigrationApplication.class);
 
         assertThatThrownBy(() -> MigrationApplication.run(application))
-                .hasRootCauseMessage("migration.source is required");
+                .hasStackTraceContaining("Field error in object 'migration' on field 'source'")
+                .hasStackTraceContaining("Field error in object 'migration' on field 'target'");
     }
 
     private static SpringApplication applicationTrackingClose(AtomicBoolean closed) {

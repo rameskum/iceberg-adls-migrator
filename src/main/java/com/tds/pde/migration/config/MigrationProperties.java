@@ -1,38 +1,42 @@
 package com.tds.pde.migration.config;
 
+import jakarta.validation.Valid;
+import jakarta.validation.constraints.AssertTrue;
+import jakarta.validation.constraints.Min;
+import jakarta.validation.constraints.NotNull;
+import jakarta.validation.constraints.Pattern;
+import jakarta.validation.constraints.Positive;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.util.Map;
-import java.util.Objects;
 import java.util.UUID;
-import java.util.regex.Pattern;
+import org.hibernate.validator.constraints.time.DurationMin;
 import org.jspecify.annotations.Nullable;
 import org.springframework.boot.context.properties.ConfigurationProperties;
 import org.springframework.boot.context.properties.bind.DefaultValue;
 import org.springframework.util.unit.DataSize;
+import org.springframework.validation.annotation.Validated;
 
 /**
  * All externalized migration settings, bound from the {@code migration.*} namespace.
  * Invalid, missing or unknown values (such as a misspelled job parameter) fail application startup, before any
- * data is touched.
+ * data is touched; every invalid property is reported at once.
  */
+@Validated
 @ConfigurationProperties(prefix = "migration", ignoreUnknownFields = false)
 public record MigrationProperties(
-        @Nullable String runId,
-        Source source,
-        Target target,
-        Datasets datasets,
-        @DefaultValue Azure azure,
-        @DefaultValue Parquet parquet,
-        @DefaultValue Progress progress,
-        @DefaultValue Failure failure,
-        State state) {
+        @Nullable @Pattern(regexp = "\\d{8}-\\d{6}-[0-9a-f]{6}", message = "must look like 20261117-103000-ab12cd")
+        String runId,
+        @NotNull @Valid Source source,
+        @NotNull @Valid Target target,
+        @NotNull @Valid Datasets datasets,
+        @DefaultValue @Valid Azure azure,
+        @DefaultValue @Valid Parquet parquet,
+        @DefaultValue @Valid Progress progress,
+        @DefaultValue @Valid Failure failure,
+        @NotNull @Valid State state) {
 
     public MigrationProperties {
-        require(source, "migration.source");
-        require(target, "migration.target");
-        require(datasets, "migration.datasets");
-        require(state, "migration.state");
         runId = blankToNull(runId);
     }
 
@@ -41,10 +45,9 @@ public record MigrationProperties(
      * @param snapshotId optional snapshot to migrate instead of the table's current snapshot
      * @param hadoop     extra Hadoop configuration, copied verbatim; quote dotted keys as {@code "[fs.defaultFS]"}
      */
-    public record Source(UUID datasetId, @Nullable Long snapshotId, Map<String, String> hadoop) {
+    public record Source(@NotNull UUID datasetId, @Nullable Long snapshotId, Map<String, String> hadoop) {
 
         public Source {
-            require(datasetId, "migration.source.dataset-id");
             hadoop = hadoop == null ? Map.of() : Map.copyOf(hadoop);
         }
     }
@@ -52,33 +55,19 @@ public record MigrationProperties(
     /**
      * @param datasetId UUID of the target dataset in the dataset API
      * @param clean     delete everything under the target location and start a fresh run
-     * @param blockSize size of each staged block uploaded to Azure Blob Storage
+     * @param blockSize size of each staged block uploaded to Azure Blob Storage, at most Azure's 4000 MiB
      */
-    public record Target(UUID datasetId, @DefaultValue("false") boolean clean,
-                              @DefaultValue("8MB") DataSize blockSize) {
-
-        private static final DataSize MAX_BLOCK_SIZE = DataSize.ofMegabytes(4000);
-
-        public Target {
-            require(datasetId, "migration.target.dataset-id");
-            if (blockSize.toBytes() <= 0 || blockSize.compareTo(MAX_BLOCK_SIZE) > 0) {
-                throw new IllegalArgumentException(
-                        "migration.target.block-size must be between 1B and 4000MB, was " + blockSize);
-            }
-        }
+    public record Target(@NotNull UUID datasetId, @DefaultValue("false") boolean clean,
+                         @DefaultValue("8MB") @DataSizeRange(min = 1, max = 4000L * 1024 * 1024) DataSize blockSize) {
     }
 
     /**
      * @param stubDirectory folder holding one {@code <dataset-id>.json} descriptor per dataset
      */
-    public record Datasets(Path stubDirectory) {
-
-        public Datasets {
-            require(stubDirectory, "migration.datasets.stub-directory");
-        }
+    public record Datasets(@NotNull Path stubDirectory) {
     }
 
-    public record Azure(@DefaultValue Auth auth) {
+    public record Azure(@DefaultValue @Valid Auth auth) {
 
         public enum AuthMode {
             MANAGED_IDENTITY,
@@ -96,15 +85,17 @@ public record MigrationProperties(
             public Auth {
                 clientId = blankToNull(clientId);
                 connectionString = blankToNull(connectionString);
-                if (mode == AuthMode.CONNECTION_STRING && connectionString == null) {
-                    throw new IllegalArgumentException(
-                            "migration.azure.auth.connection-string is required when mode is CONNECTION_STRING");
-                }
+            }
+
+            @AssertTrue(message = "connection-string is required when mode is CONNECTION_STRING")
+            public boolean isConnectionStringSetWhenRequired() {
+                return mode != AuthMode.CONNECTION_STRING || connectionString != null;
             }
         }
     }
 
-    public record Parquet(@DefaultValue("128MB") DataSize rowGroupSize, @DefaultValue("1MB") DataSize pageSize,
+    public record Parquet(@DefaultValue("128MB") @DataSizeRange(min = 1) DataSize rowGroupSize,
+                          @DefaultValue("1MB") @DataSizeRange(min = 1) DataSize pageSize,
                           @DefaultValue("ZSTD") Compression compression) {
 
         public enum Compression {
@@ -113,26 +104,13 @@ public record MigrationProperties(
             GZIP,
             UNCOMPRESSED
         }
-
-        public Parquet {
-            requirePositive(rowGroupSize, "migration.parquet.row-group-size");
-            requirePositive(pageSize, "migration.parquet.page-size");
-        }
     }
 
     /**
      * Record progress is logged whenever either threshold is crossed.
      */
-    public record Progress(@DefaultValue("100000") long logEveryRecords, @DefaultValue("30s") Duration logEvery) {
-
-        public Progress {
-            if (logEveryRecords <= 0) {
-                throw new IllegalArgumentException("migration.progress.log-every-records must be positive");
-            }
-            if (logEvery.isNegative() || logEvery.isZero()) {
-                throw new IllegalArgumentException("migration.progress.log-every must be positive");
-            }
-        }
+    public record Progress(@DefaultValue("100000") @Positive long logEveryRecords,
+                           @DefaultValue("30s") @DurationMin(millis = 1) Duration logEvery) {
     }
 
     public record Failure(@DefaultValue("FAIL_FAST") OnFileFailure onFileFailure) {
@@ -146,54 +124,23 @@ public record MigrationProperties(
     }
 
     /**
-     * The state tables, shared by every migration job; created at startup when missing.
+     * The state tables, shared by every migration job; created at startup when missing. Their names are spliced
+     * into SQL because identifiers cannot be bound as parameters, so only plain {@code [catalog.][schema.]table}
+     * identifiers are accepted.
      *
      * @param controlTable fully qualified control table, e.g. {@code main.migration.migration_control}
      * @param runTable     fully qualified run table, e.g. {@code main.migration.migration_run}
      * @param fileTable    fully qualified file table, e.g. {@code main.migration.migration_file}
      * @param writeRetries attempts for each state write before the run is stopped
      */
-    public record State(String controlTable, String runTable, String fileTable,
-                        @DefaultValue("5") int writeRetries) {
+    public record State(@NotNull @Pattern(regexp = TABLE_NAME, message = TABLE_NAME_MESSAGE) String controlTable,
+                        @NotNull @Pattern(regexp = TABLE_NAME, message = TABLE_NAME_MESSAGE) String runTable,
+                        @NotNull @Pattern(regexp = TABLE_NAME, message = TABLE_NAME_MESSAGE) String fileTable,
+                        @DefaultValue("5") @Min(1) int writeRetries) {
 
-        // Table names are spliced into SQL because identifiers cannot be bound as parameters, so only plain
-        // identifiers pass.
-        private static final Pattern TABLE_NAME =
-                Pattern.compile("[A-Za-z_][A-Za-z0-9_]*(\\.[A-Za-z_][A-Za-z0-9_]*){0,2}");
-
-        public State {
-            requireTableName(controlTable, "migration.state.control-table");
-            requireTableName(runTable, "migration.state.run-table");
-            requireTableName(fileTable, "migration.state.file-table");
-            if (writeRetries < 1) {
-                throw new IllegalArgumentException("migration.state.write-retries must be at least 1");
-            }
-        }
-
-        private static void requireTableName(String value, String property) {
-            requireText(value, property);
-            if (!TABLE_NAME.matcher(value).matches()) {
-                throw new IllegalArgumentException(
-                        property + " must be [catalog.][schema.]table using letters, digits and underscores, was '"
-                                + value + "'");
-            }
-        }
-    }
-
-    private static void require(Object value, String property) {
-        Objects.requireNonNull(value, () -> property + " is required");
-    }
-
-    private static void requireText(String value, String property) {
-        if (value == null || value.isBlank()) {
-            throw new IllegalArgumentException(property + " is required");
-        }
-    }
-
-    private static void requirePositive(DataSize value, String property) {
-        if (value.toBytes() <= 0) {
-            throw new IllegalArgumentException(property + " must be positive");
-        }
+        static final String TABLE_NAME = "[A-Za-z_][A-Za-z0-9_]*(\\.[A-Za-z_][A-Za-z0-9_]*){0,2}";
+        static final String TABLE_NAME_MESSAGE =
+                "must be [catalog.][schema.]table using letters, digits and underscores";
     }
 
     private static @Nullable String blankToNull(@Nullable String value) {

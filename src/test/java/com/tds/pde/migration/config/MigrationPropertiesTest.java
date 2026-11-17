@@ -12,13 +12,16 @@ import java.util.HashMap;
 import java.util.Map;
 import org.junit.jupiter.api.Test;
 import org.springframework.boot.context.properties.bind.BindException;
+import org.springframework.boot.context.properties.bind.Bindable;
 import org.springframework.boot.context.properties.bind.Binder;
+import org.springframework.boot.context.properties.bind.validation.ValidationBindHandler;
 import org.springframework.boot.context.properties.source.ConfigurationPropertySources;
 import org.springframework.boot.context.properties.source.MapConfigurationPropertySource;
 import org.springframework.boot.env.YamlPropertySourceLoader;
 import org.springframework.core.env.StandardEnvironment;
 import org.springframework.core.io.FileSystemResource;
 import org.springframework.util.unit.DataSize;
+import org.springframework.validation.beanvalidation.LocalValidatorFactoryBean;
 
 class MigrationPropertiesTest {
 
@@ -33,9 +36,16 @@ class MigrationPropertiesTest {
         return values;
     }
 
+    /** Binds and validates the way Spring Boot does for {@code @Validated} configuration properties. */
     private static MigrationProperties bind(Map<String, String> values) {
-        return new Binder(new MapConfigurationPropertySource(values))
-                .bindOrCreate("migration", MigrationProperties.class);
+        return bind(new Binder(new MapConfigurationPropertySource(values)));
+    }
+
+    private static MigrationProperties bind(Binder binder) {
+        LocalValidatorFactoryBean validator = new LocalValidatorFactoryBean();
+        validator.afterPropertiesSet();
+        return binder.bindOrCreate("migration", Bindable.of(MigrationProperties.class),
+                new ValidationBindHandler(validator));
     }
 
     @Test
@@ -82,11 +92,11 @@ class MigrationPropertiesTest {
     void rejectsMissingSourceDataset() {
         Map<String, String> values = required();
         values.remove("migration.source.dataset-id");
+        values.put("migration.source.hadoop[fs.defaultFS]", "hdfs://namenode:8020");
 
         assertThatThrownBy(() -> bind(values))
                 .isInstanceOf(BindException.class)
-                .rootCause()
-                .hasMessageContaining("migration.source");
+                .hasStackTraceContaining("Field error in object 'migration.source' on field 'datasetId'");
     }
 
     @Test
@@ -96,8 +106,8 @@ class MigrationPropertiesTest {
 
         assertThatThrownBy(() -> bind(values))
                 .isInstanceOf(BindException.class)
-                .rootCause()
-                .hasMessageContaining("migration.state.run-table");
+                .hasStackTraceContaining("runTable")
+                .hasStackTraceContaining("must be [catalog.][schema.]table");
     }
 
     @Test
@@ -107,8 +117,8 @@ class MigrationPropertiesTest {
 
         assertThatThrownBy(() -> bind(values))
                 .isInstanceOf(BindException.class)
-                .rootCause()
-                .hasMessageContaining("migration.state.file-table");
+                .hasStackTraceContaining("fileTable")
+                .hasStackTraceContaining("must be [catalog.][schema.]table");
     }
 
     @Test
@@ -118,8 +128,7 @@ class MigrationPropertiesTest {
 
         assertThatThrownBy(() -> bind(values))
                 .isInstanceOf(BindException.class)
-                .rootCause()
-                .hasMessageContaining("migration.azure.auth.connection-string");
+                .hasStackTraceContaining("connection-string is required when mode is CONNECTION_STRING");
     }
 
     @Test
@@ -129,8 +138,8 @@ class MigrationPropertiesTest {
 
         assertThatThrownBy(() -> bind(values))
                 .isInstanceOf(BindException.class)
-                .rootCause()
-                .hasMessageContaining("migration.target.block-size");
+                .hasStackTraceContaining("blockSize")
+                .hasStackTraceContaining("must be between 1 and 4194304000 bytes");
     }
 
     @Test
@@ -140,8 +149,50 @@ class MigrationPropertiesTest {
 
         assertThatThrownBy(() -> bind(values))
                 .isInstanceOf(BindException.class)
-                .rootCause()
-                .hasMessageContaining("migration.progress.log-every-records");
+                .hasStackTraceContaining("logEveryRecords")
+                .hasStackTraceContaining("must be greater than 0");
+    }
+
+    @Test
+    void reportsEveryInvalidPropertyOfASectionTogether() {
+        Map<String, String> values = required();
+        values.put("migration.state.run-table", "runs; DROP TABLE x");
+        values.put("migration.state.file-table", "a.b.c.d");
+        values.put("migration.state.write-retries", "0");
+
+        assertThatThrownBy(() -> bind(values))
+                .isInstanceOf(BindException.class)
+                .hasStackTraceContaining("on field 'runTable'")
+                .hasStackTraceContaining("on field 'fileTable'")
+                .hasStackTraceContaining("on field 'writeRetries'");
+    }
+
+    @Test
+    void rejectsARunIdThatIsNotOfTheGeneratedShape() {
+        Map<String, String> values = required();
+        values.put("migration.run-id", "resume-please");
+
+        assertThatThrownBy(() -> bind(values))
+                .isInstanceOf(BindException.class)
+                .hasStackTraceContaining("must look like 20261117-103000-ab12cd");
+    }
+
+    @Test
+    void rejectsANonPositiveLogInterval() {
+        Map<String, String> values = required();
+        values.put("migration.progress.log-every", "0s");
+
+        assertThatThrownBy(() -> bind(values))
+                .isInstanceOf(BindException.class)
+                .hasStackTraceContaining("on field 'logEvery'");
+    }
+
+    @Test
+    void acceptsARunIdOfTheGeneratedShape() {
+        Map<String, String> values = required();
+        values.put("migration.run-id", "20261117-103000-ab12cd");
+
+        assertThat(bind(values).runId()).isEqualTo("20261117-103000-ab12cd");
     }
 
     @Test
@@ -151,8 +202,7 @@ class MigrationPropertiesTest {
                 .load("example", new FileSystemResource("config/application-example.yaml"))
                 .forEach(environment.getPropertySources()::addFirst);
 
-        MigrationProperties properties = new Binder(ConfigurationPropertySources.get(environment))
-                .bindOrCreate("migration", MigrationProperties.class);
+        MigrationProperties properties = bind(new Binder(ConfigurationPropertySources.get(environment)));
 
         assertThat(properties.runId()).isNull();
         assertThat(properties.source().datasetId()).isEqualTo(java.util.UUID.fromString("0e9c1a5e-4c55-4a3b-9f3e-1c2a7d8b6e01"));
