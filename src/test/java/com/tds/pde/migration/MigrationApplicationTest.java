@@ -1,39 +1,64 @@
 package com.tds.pde.migration;
 
+import static org.apache.iceberg.types.Types.NestedField.required;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
-import com.tds.pde.migration.config.MigrationProperties;
+import com.tds.pde.migration.dataset.DatasetLookupException;
+import com.tds.pde.migration.testing.IcebergTestTables;
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.concurrent.atomic.AtomicBoolean;
+import org.apache.iceberg.PartitionSpec;
+import org.apache.iceberg.Schema;
+import org.apache.iceberg.Table;
+import org.apache.iceberg.types.Types;
+import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
 import org.springframework.boot.SpringApplication;
-import org.springframework.context.annotation.Bean;
-import org.springframework.context.annotation.Primary;
 import org.springframework.context.event.ContextClosedEvent;
 
 class MigrationApplicationTest {
 
-    private static final String[] ARGS = {
-            "--migration.source.dataset-id=orders-src",
-            "--migration.destination.dataset-id=orders-adls",
-            "--migration.datasets.stub-directory=/tmp/datasets",
-            "--migration.state.run-table=migration_run",
-            "--migration.state.file-table=migration_file",
-            "--spring.datasource.url=jdbc:h2:mem:application-test",
-            "--spring.datasource.driver-class-name=org.h2.Driver",
-    };
+    @TempDir
+    Path tempDir;
+
+    private Path datasets;
+
+    @BeforeEach
+    void createSourceTableAndDescriptors() throws IOException {
+        Table table = IcebergTestTables.create(tempDir.resolve("orders"),
+                new Schema(required(1, "id", Types.LongType.get())), PartitionSpec.unpartitioned());
+        datasets = Files.createDirectory(tempDir.resolve("datasets"));
+        Files.writeString(datasets.resolve("orders-src.json"), """
+                { "datasetId": "orders-src", "format": "ICEBERG", "location": "%s" }
+                """.formatted(table.location()));
+        Files.writeString(datasets.resolve("orders-adls.json"), """
+                { "datasetId": "orders-adls", "format": "PARQUET",
+                  "location": "abfss://data@account.dfs.core.windows.net/sales/orders" }
+                """);
+    }
+
+    private String[] args(String sourceDatasetId) {
+        return new String[] {
+                "--migration.source.dataset-id=" + sourceDatasetId,
+                "--migration.destination.dataset-id=orders-adls",
+                "--migration.datasets.stub-directory=" + datasets,
+                "--migration.state.run-table=migration_run",
+                "--migration.state.file-table=migration_file",
+                "--spring.datasource.url=jdbc:h2:mem:application-test",
+                "--spring.datasource.driver-class-name=org.h2.Driver",
+        };
+    }
 
     @Test
     void closesTheContextAfterASuccessfulMigration() {
         AtomicBoolean closed = new AtomicBoolean();
-        SpringApplication application = new SpringApplication(MigrationApplication.class);
-        application.addListeners(event -> {
-            if (event instanceof ContextClosedEvent) {
-                closed.set(true);
-            }
-        });
+        SpringApplication application = applicationTrackingClose(closed);
 
-        MigrationApplication.run(application, ARGS);
+        MigrationApplication.run(application, args("orders-src"));
 
         assertThat(closed).isTrue();
     }
@@ -41,17 +66,12 @@ class MigrationApplicationTest {
     @Test
     void closesTheContextAndRethrowsWhenTheMigrationFails() {
         AtomicBoolean closed = new AtomicBoolean();
-        SpringApplication application =
-                new SpringApplication(MigrationApplication.class, FailingOrchestratorConfig.class);
-        application.addListeners(event -> {
-            if (event instanceof ContextClosedEvent) {
-                closed.set(true);
-            }
-        });
+        SpringApplication application = applicationTrackingClose(closed);
 
-        assertThatThrownBy(() -> MigrationApplication.run(application, ARGS))
+        assertThatThrownBy(() -> MigrationApplication.run(application, args("unknown-dataset")))
                 .isInstanceOf(MigrationFailedException.class)
-                .hasMessage("boom");
+                .hasCauseInstanceOf(DatasetLookupException.class)
+                .hasMessageContaining("Dataset 'unknown-dataset' not found");
         assertThat(closed).isTrue();
     }
 
@@ -63,18 +83,13 @@ class MigrationApplicationTest {
                 .hasRootCauseMessage("migration.source is required");
     }
 
-    /** Deliberately not a {@code @Configuration}, so component scanning never picks it up for other tests. */
-    static class FailingOrchestratorConfig {
-
-        @Bean
-        @Primary
-        MigrationOrchestrator failingOrchestrator(MigrationProperties properties) {
-            return new MigrationOrchestrator(properties) {
-                @Override
-                public void migrate() {
-                    throw new MigrationFailedException("boom");
-                }
-            };
-        }
+    private static SpringApplication applicationTrackingClose(AtomicBoolean closed) {
+        SpringApplication application = new SpringApplication(MigrationApplication.class);
+        application.addListeners(event -> {
+            if (event instanceof ContextClosedEvent) {
+                closed.set(true);
+            }
+        });
+        return application;
     }
 }

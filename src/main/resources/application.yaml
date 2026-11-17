@@ -14,3 +14,8 @@ spring:
       maximum-pool-size: 2
       # Milliseconds (5 minutes): a stopped Databricks SQL warehouse can take minutes to start
       connection-timeout: 300000
+
+logging:
+  level:
+    # Native Hadoop libraries are optional; their absence is expected and not worth a warning on every run
+    org.apache.hadoop.util.NativeCodeLoader: error
