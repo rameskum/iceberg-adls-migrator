@@ -21,3 +21,5 @@ logging:
     org.apache.hadoop.util.NativeCodeLoader: error
     # Reports, at INFO, every engine integration (Spark, Flink, Arrow) that is absent by design
     org.apache.iceberg.formats.FormatModelRegistry: warn
+    # Warns on every request that it leaves Content-Length to java.net.http, which sets it from the body anyway
+    com.azure.core.http.jdk.httpclient.JdkHttpClient: error
