@@ -23,9 +23,9 @@ class StubDatasetClientTest {
 
     @Test
     void readsADescriptorWithItsSchema() throws IOException {
-        Files.writeString(directory.resolve("orders-adls.json"), """
+        Files.writeString(directory.resolve("5b2f7d3c-8a1e-4f6b-b2d4-9c0e3a7f1d02.json"), """
                 {
-                  "datasetId": "orders-adls",
+                  "datasetId": "5b2f7d3c-8a1e-4f6b-b2d4-9c0e3a7f1d02",
                   "format": "PARQUET",
                   "location": "abfss://data@account.dfs.core.windows.net/sales/orders",
                   "owner": "sales-team",
@@ -36,7 +36,7 @@ class StubDatasetClientTest {
                 }
                 """);
 
-        DatasetDescriptor descriptor = client().getDataset("orders-adls");
+        DatasetDescriptor descriptor = client().getDataset("5b2f7d3c-8a1e-4f6b-b2d4-9c0e3a7f1d02");
 
         assertThat(descriptor.format()).isEqualTo(DatasetFormat.PARQUET);
         assertThat(descriptor.location()).isEqualTo("abfss://data@account.dfs.core.windows.net/sales/orders");
@@ -47,11 +47,11 @@ class StubDatasetClientTest {
 
     @Test
     void readsADescriptorWithoutASchema() throws IOException {
-        Files.writeString(directory.resolve("orders-src.json"), """
-                { "datasetId": "orders-src", "format": "ICEBERG", "location": "hdfs://nn/warehouse/orders", "schema": null }
+        Files.writeString(directory.resolve("0e9c1a5e-4c55-4a3b-9f3e-1c2a7d8b6e01.json"), """
+                { "datasetId": "0e9c1a5e-4c55-4a3b-9f3e-1c2a7d8b6e01", "format": "ICEBERG", "location": "hdfs://nn/warehouse/orders", "schema": null }
                 """);
 
-        DatasetDescriptor descriptor = client().getDataset("orders-src");
+        DatasetDescriptor descriptor = client().getDataset("0e9c1a5e-4c55-4a3b-9f3e-1c2a7d8b6e01");
 
         assertThat(descriptor.format()).isEqualTo(DatasetFormat.ICEBERG);
         assertThat(descriptor.schema()).isNull();
@@ -73,25 +73,25 @@ class StubDatasetClientTest {
 
     @Test
     void rejectsADescriptorForAnotherDataset() throws IOException {
-        Files.writeString(directory.resolve("orders-src.json"), """
+        Files.writeString(directory.resolve("0e9c1a5e-4c55-4a3b-9f3e-1c2a7d8b6e01.json"), """
                 { "datasetId": "customers", "format": "ICEBERG", "location": "hdfs://nn/warehouse/customers" }
                 """);
 
-        assertThatThrownBy(() -> client().getDataset("orders-src"))
+        assertThatThrownBy(() -> client().getDataset("0e9c1a5e-4c55-4a3b-9f3e-1c2a7d8b6e01"))
                 .isInstanceOf(DatasetLookupException.class)
-                .hasMessageContaining("is for dataset 'customers', expected 'orders-src'");
+                .hasMessageContaining("is for dataset 'customers', expected '0e9c1a5e-4c55-4a3b-9f3e-1c2a7d8b6e01'");
     }
 
     @Test
     void rejectsADescriptorMissingRequiredFields() throws IOException {
-        Files.writeString(directory.resolve("orders-src.json"), """
-                { "datasetId": "orders-src", "format": "ICEBERG" }
+        Files.writeString(directory.resolve("0e9c1a5e-4c55-4a3b-9f3e-1c2a7d8b6e01.json"), """
+                { "datasetId": "0e9c1a5e-4c55-4a3b-9f3e-1c2a7d8b6e01", "format": "ICEBERG" }
                 """);
 
-        assertThatThrownBy(() -> client().getDataset("orders-src"))
+        assertThatThrownBy(() -> client().getDataset("0e9c1a5e-4c55-4a3b-9f3e-1c2a7d8b6e01"))
                 .isInstanceOf(DatasetLookupException.class)
-                .hasMessageStartingWith("Invalid descriptor for dataset 'orders-src'")
+                .hasMessageStartingWith("Invalid descriptor for dataset '0e9c1a5e-4c55-4a3b-9f3e-1c2a7d8b6e01'")
                 .rootCause()
-                .hasMessage("location is required for dataset orders-src");
+                .hasMessage("location is required for dataset 0e9c1a5e-4c55-4a3b-9f3e-1c2a7d8b6e01");
     }
 }

@@ -3,8 +3,8 @@ package com.tds.pde.migration.processing;
 import static org.apache.iceberg.types.Types.NestedField.required;
 import static org.assertj.core.api.Assertions.assertThat;
 
-import com.tds.pde.migration.destination.DestinationPathResolver;
-import com.tds.pde.migration.destination.ParquetDataWriter;
+import com.tds.pde.migration.target.TargetPathResolver;
+import com.tds.pde.migration.target.ParquetDataWriter;
 import com.tds.pde.migration.schema.OutputSchema;
 import com.tds.pde.migration.source.IcebergDataReader;
 import com.tds.pde.migration.source.IcebergMetadataReader;
@@ -62,8 +62,8 @@ class BoundedMemoryTest {
 
         MigrationPlan plan = new IcebergMetadataReader(new Configuration()).plan(table.location(), null);
         SourceFile file = plan.partitions().getFirst().files().getFirst();
-        FileTask task = new FileTask(file, "", new DestinationPathResolver().resolve("out", "", file.location()));
-        LocalFileBlobStore blobStore = new LocalFileBlobStore(tempDir.resolve("destination"));
+        FileTask task = new FileTask(file, "", new TargetPathResolver().resolve("out", "", file.location()));
+        LocalFileBlobStore blobStore = new LocalFileBlobStore(tempDir.resolve("target"));
         DataFileProcessor processor = new DataFileProcessor(new IcebergDataReader(),
                 new ParquetDataWriter(TestProperties.bind(Map.of("migration.parquet.row-group-size", "16MB"))),
                 blobStore);
@@ -73,7 +73,7 @@ class BoundedMemoryTest {
 
         assertThat(result.error()).isNull();
         assertThat(result.recordsWritten()).isEqualTo(ROWS);
-        Path output = blobStore.file(task.destination());
+        Path output = blobStore.file(task.target());
         assertThat(Files.size(output)).as("output file must exceed the heap").isGreaterThan(maxHeap);
         assertThat(ParquetOutput.of(output).rowCount()).isEqualTo(ROWS);
     }

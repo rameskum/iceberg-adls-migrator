@@ -8,10 +8,10 @@ import org.jspecify.annotations.Nullable;
  *
  * @param snapshotId       pinned source snapshot; {@code null} when the table had never been written
  * @param sourceSchemaJson schema the source rows are read into, as Iceberg schema JSON
- * @param outputSchemaJson schema every destination file is written with, as Iceberg schema JSON
+ * @param outputSchemaJson schema every target file is written with, as Iceberg schema JSON
  */
-public record RunRecord(String runId, Status status, String sourceDatasetId, String destinationDatasetId,
-                        String sourceTableLocation, String destinationLocation, @Nullable Long snapshotId,
+public record RunRecord(String runId, Status status, String sourceDatasetId, String targetDatasetId,
+                        String sourceTableLocation, String targetLocation, @Nullable Long snapshotId,
                         String sourceSchemaJson, String outputSchemaJson, long totalPartitions, long totalFiles,
                         long totalRecords, Instant startedAt, @Nullable Instant finishedAt, @Nullable String error) {
 

@@ -5,9 +5,9 @@ import static org.apache.iceberg.types.Types.NestedField.required;
 import static org.assertj.core.api.Assertions.assertThat;
 
 import com.tds.pde.migration.dataset.DatasetSchema;
-import com.tds.pde.migration.destination.DestinationPathResolver;
-import com.tds.pde.migration.destination.ParquetDataWriter;
-import com.tds.pde.migration.schema.DestinationSchemaValidator;
+import com.tds.pde.migration.target.TargetPathResolver;
+import com.tds.pde.migration.target.ParquetDataWriter;
+import com.tds.pde.migration.schema.TargetSchemaValidator;
 import com.tds.pde.migration.schema.OutputSchema;
 import com.tds.pde.migration.source.IcebergDataReader;
 import com.tds.pde.migration.source.IcebergMetadataReader;
@@ -93,7 +93,7 @@ class DataFileProcessorTest {
         assertThat(result.recordsDeleted()).isZero();
         assertThat(blobStore.aborted()).isEmpty();
 
-        InMemoryBlobStore.Blob blob = blobStore.blob(run.task(0).destination()).orElseThrow();
+        InMemoryBlobStore.Blob blob = blobStore.blob(run.task(0).target()).orElseThrow();
         ParquetOutput output = ParquetOutput.of(blob.content(), tempDir);
         assertThat(output.records(ORDERS)).containsExactlyElementsOf(rows);
 
@@ -194,7 +194,7 @@ class DataFileProcessorTest {
     }
 
     @Test
-    void convertsUuidAndTimeColumnsTheDestinationDeclaresAsString() {
+    void convertsUuidAndTimeColumnsTheTargetDeclaresAsString() {
         Schema schema = new Schema(
                 required(1, "id", Types.UUIDType.get()),
                 optional(2, "opened_at", Types.TimeType.get()));
@@ -204,7 +204,7 @@ class DataFileProcessorTest {
         row.setField("id", id);
         row.setField("opened_at", LocalTime.of(9, 30, 5, 120_000_000));
         IcebergTestTables.append(table, List.of(row));
-        OutputSchema outputSchema = new DestinationSchemaValidator().resolve(schema, new DatasetSchema(List.of(
+        OutputSchema outputSchema = new TargetSchemaValidator().resolve(schema, new DatasetSchema(List.of(
                 new DatasetSchema.Field("id", "string", false),
                 new DatasetSchema.Field("opened_at", "string", true))));
 
@@ -260,7 +260,7 @@ class DataFileProcessorTest {
         assertThat(result.succeeded()).isFalse();
         assertThat(result.error()).rootCause().hasMessageContaining("injected write failure");
         assertThat(blobStore.blobs()).isEmpty();
-        assertThat(blobStore.aborted()).containsExactly(run.task(0).destination());
+        assertThat(blobStore.aborted()).containsExactly(run.task(0).target());
     }
 
     @Test
@@ -275,7 +275,7 @@ class DataFileProcessorTest {
         assertThat(result.succeeded()).isFalse();
         assertThat(result.error()).hasMessageContaining("injected commit failure");
         assertThat(blobStore.blobs()).isEmpty();
-        assertThat(blobStore.aborted()).containsExactly(run.task(0).destination());
+        assertThat(blobStore.aborted()).containsExactly(run.task(0).target());
     }
 
     @Test
@@ -328,7 +328,7 @@ class DataFileProcessorTest {
         MigrationPlan plan = metadataReader.plan(table.location(), null);
         RunContext context = new RunContext("run-1", plan.table(),
                 outputSchema == null ? OutputSchema.unchanged(plan.table().schema()) : outputSchema);
-        DestinationPathResolver paths = new DestinationPathResolver();
+        TargetPathResolver paths = new TargetPathResolver();
         List<FileTask> tasks = new ArrayList<>();
         for (PlannedPartition partition : plan.partitions()) {
             for (SourceFile file : partition.files()) {
@@ -346,7 +346,7 @@ class DataFileProcessorTest {
     }
 
     private ParquetOutput output(FileResult result) {
-        return ParquetOutput.of(blobStore.blob(result.task().destination()).orElseThrow().content(), tempDir);
+        return ParquetOutput.of(blobStore.blob(result.task().target()).orElseThrow().content(), tempDir);
     }
 
     private List<Long> idsWritten(FileResult result) {

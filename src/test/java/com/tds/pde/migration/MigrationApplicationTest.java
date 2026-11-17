@@ -5,8 +5,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import com.tds.pde.migration.dataset.DatasetLookupException;
-import com.tds.pde.migration.testing.H2State;
-import com.tds.pde.migration.testing.H2StateStore;
+import com.tds.pde.migration.testing.InMemoryState;
 import com.tds.pde.migration.testing.IcebergTestTables;
 import com.tds.pde.migration.testing.InMemoryBlobStore;
 import com.tds.pde.migration.testing.InMemoryStorage;
@@ -30,21 +29,21 @@ class MigrationApplicationTest {
     @TempDir
     Path tempDir;
 
-    private final H2StateStore stateStore = new H2StateStore();
+    private final InMemoryState.Store stateStore = new InMemoryState.Store();
     private Path datasets;
 
     @BeforeEach
     void createSourceTableAndDescriptors() throws IOException {
         InMemoryStorage.current = new InMemoryBlobStore();
-        H2State.current = stateStore;
+        InMemoryState.current = stateStore;
         Table table = IcebergTestTables.create(tempDir.resolve("orders"),
                 new Schema(required(1, "id", Types.LongType.get())), PartitionSpec.unpartitioned());
         datasets = Files.createDirectory(tempDir.resolve("datasets"));
-        Files.writeString(datasets.resolve("orders-src.json"), """
-                { "datasetId": "orders-src", "format": "ICEBERG", "location": "%s" }
+        Files.writeString(datasets.resolve("0e9c1a5e-4c55-4a3b-9f3e-1c2a7d8b6e01.json"), """
+                { "datasetId": "0e9c1a5e-4c55-4a3b-9f3e-1c2a7d8b6e01", "format": "ICEBERG", "location": "%s" }
                 """.formatted(table.location()));
-        Files.writeString(datasets.resolve("orders-adls.json"), """
-                { "datasetId": "orders-adls", "format": "PARQUET",
+        Files.writeString(datasets.resolve("5b2f7d3c-8a1e-4f6b-b2d4-9c0e3a7f1d02.json"), """
+                { "datasetId": "5b2f7d3c-8a1e-4f6b-b2d4-9c0e3a7f1d02", "format": "PARQUET",
                   "location": "abfss://data@account.dfs.core.windows.net/sales/orders" }
                 """);
     }
@@ -52,11 +51,11 @@ class MigrationApplicationTest {
     private String[] args(String sourceDatasetId) {
         return new String[] {
                 "--migration.source.dataset-id=" + sourceDatasetId,
-                "--migration.destination.dataset-id=orders-adls",
+                "--migration.target.dataset-id=5b2f7d3c-8a1e-4f6b-b2d4-9c0e3a7f1d02",
                 "--migration.datasets.stub-directory=" + datasets,
-                "--migration.state.run-table=" + H2StateStore.RUN_TABLE,
-                "--migration.state.file-table=" + H2StateStore.FILE_TABLE,
-                "--migration.state.control-table=" + H2StateStore.CONTROL_TABLE,
+                "--migration.state.run-table=" + "migration_run",
+                "--migration.state.file-table=" + "migration_file",
+                "--migration.state.control-table=" + "migration_control",
         };
     }
 
@@ -64,7 +63,7 @@ class MigrationApplicationTest {
     void closesTheContextAfterASuccessfulMigration() {
         AtomicBoolean closed = new AtomicBoolean();
 
-        MigrationApplication.run(applicationTrackingClose(closed), args("orders-src"));
+        MigrationApplication.run(applicationTrackingClose(closed), args("0e9c1a5e-4c55-4a3b-9f3e-1c2a7d8b6e01"));
 
         assertThat(closed).isTrue();
     }
@@ -73,11 +72,37 @@ class MigrationApplicationTest {
     void closesTheContextAndRethrowsWhenTheMigrationFails() {
         AtomicBoolean closed = new AtomicBoolean();
 
-        assertThatThrownBy(() -> MigrationApplication.run(applicationTrackingClose(closed), args("unknown-dataset")))
+        String unknownDataset = "9d3c2b1a-0f6e-4d5c-8b7a-6e5f4d3c2b1a";
+
+        assertThatThrownBy(() -> MigrationApplication.run(applicationTrackingClose(closed), args(unknownDataset)))
                 .isInstanceOf(MigrationFailedException.class)
                 .hasCauseInstanceOf(DatasetLookupException.class)
-                .hasMessageContaining("Dataset 'unknown-dataset' not found");
+                .hasMessageContaining("Dataset '" + unknownDataset + "' not found");
         assertThat(closed).isTrue();
+    }
+
+    @Test
+    void rejectsAMisspelledMigrationParameterBeforeAnythingRuns() {
+        String[] args = java.util.stream.Stream.concat(java.util.Arrays.stream(args("0e9c1a5e-4c55-4a3b-9f3e-1c2a7d8b6e01")),
+                java.util.stream.Stream.of("--migration.run-ld=20261117-103000-ab12cd")).toArray(String[]::new);
+
+        assertThatThrownBy(() -> MigrationApplication.run(applicationTrackingClose(new AtomicBoolean()), args))
+                .hasStackTraceContaining("migration.run-ld");
+    }
+
+    @Test
+    void rejectsParametersOutsideTheKnownPrefixes() {
+        assertThatThrownBy(() -> MigrationApplication.run(applicationTrackingClose(new AtomicBoolean()),
+                "--migraton.run-id=20261117-103000-ab12cd"))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageStartingWith("Unknown job parameter '--migraton.run-id=20261117-103000-ab12cd'");
+    }
+
+    @Test
+    void rejectsADatasetIdThatIsNotAUuid() {
+        assertThatThrownBy(() -> MigrationApplication.run(applicationTrackingClose(new AtomicBoolean()),
+                args("orders")))
+                .hasStackTraceContaining("migration.source.dataset-id");
     }
 
     @Test
@@ -89,7 +114,7 @@ class MigrationApplicationTest {
     }
 
     private static SpringApplication applicationTrackingClose(AtomicBoolean closed) {
-        SpringApplication application = new SpringApplication(MigrationApplication.class, InMemoryStorage.class, H2State.class);
+        SpringApplication application = new SpringApplication(MigrationApplication.class, InMemoryStorage.class, InMemoryState.class);
         application.addListeners(event -> {
             if (event instanceof ContextClosedEvent) {
                 closed.set(true);

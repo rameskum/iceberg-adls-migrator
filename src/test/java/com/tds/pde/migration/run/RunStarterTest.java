@@ -9,14 +9,13 @@ import com.tds.pde.migration.MigrationFailedException;
 import com.tds.pde.migration.dataset.DatasetDescriptor;
 import com.tds.pde.migration.dataset.DatasetFormat;
 import com.tds.pde.migration.dataset.DatasetSchema;
-import com.tds.pde.migration.destination.DestinationPathResolver;
-import com.tds.pde.migration.destination.azure.AzureLocation;
-import com.tds.pde.migration.schema.DestinationSchemaValidator;
+import com.tds.pde.migration.target.TargetPathResolver;
+import com.tds.pde.migration.target.azure.AzureLocation;
+import com.tds.pde.migration.schema.TargetSchemaValidator;
 import com.tds.pde.migration.source.IcebergMetadataReader;
 import com.tds.pde.migration.state.FileRecord;
-import com.tds.pde.migration.state.MigrationStateRepository;
 import com.tds.pde.migration.state.RunRecord;
-import com.tds.pde.migration.testing.H2StateStore;
+import com.tds.pde.migration.testing.InMemoryState;
 import com.tds.pde.migration.testing.IcebergTestTables;
 import com.tds.pde.migration.testing.InMemoryBlobStore;
 import com.tds.pde.migration.testing.TestProperties;
@@ -49,9 +48,7 @@ class RunStarterTest {
     @TempDir
     Path tempDir;
 
-    private final H2StateStore stateStore = new H2StateStore();
-    private final MigrationStateRepository state =
-            new MigrationStateRepository(stateStore.executor(), TestProperties.defaults());
+    private final InMemoryState.Store state = new InMemoryState.Store();
     private final InMemoryBlobStore blobStore = new InMemoryBlobStore();
     private Table table;
     private DatasetDescriptor source;
@@ -63,12 +60,12 @@ class RunStarterTest {
         IcebergTestTables.append(table, rows("EU", 2));
         IcebergTestTables.append(table, rows("EU", 1));
         IcebergTestTables.append(table, rows("US", 3));
-        source = new DatasetDescriptor("orders-src", DatasetFormat.ICEBERG, table.location(), null);
+        source = new DatasetDescriptor("0e9c1a5e-4c55-4a3b-9f3e-1c2a7d8b6e01", DatasetFormat.ICEBERG, table.location(), null);
     }
 
     @Test
-    void startsANewRunIntoAnEmptyDestinationAndRecordsEveryFile() {
-        StartedRun started = starter(Map.of()).start(source, destination(null), LOCATION, blobStore);
+    void startsANewRunIntoAnEmptyTargetAndRecordsEveryFile() {
+        StartedRun started = starter(Map.of()).start(source, target(null), LOCATION, blobStore);
 
         assertThat(started.resumed()).isFalse();
         assertThat(started.runId()).matches("\\d{8}-\\d{6}-[0-9a-f]{6}");
@@ -81,45 +78,45 @@ class RunStarterTest {
         assertThat(state.findFiles(started.runId())).hasSize(3)
                 .allSatisfy(file -> {
                     assertThat(file.status()).isEqualTo(FileRecord.Status.PENDING);
-                    assertThat(file.destinationPath()).startsWith("sales/orders/region=");
+                    assertThat(file.targetPath()).startsWith("sales/orders/region=");
                 });
         assertThat(started.context().runId()).isEqualTo(started.runId());
     }
 
     @Test
-    void ignoresTheRunLockWhenCheckingThatTheDestinationIsEmpty() {
+    void ignoresTheRunLockWhenCheckingThatTheTargetIsEmpty() {
         blobStore.acquireLock(LOCK);
 
-        assertThat(starter(Map.of()).start(source, destination(null), LOCATION, blobStore).resumed()).isFalse();
+        assertThat(starter(Map.of()).start(source, target(null), LOCATION, blobStore).resumed()).isFalse();
     }
 
     @Test
-    void refusesANewRunIntoADestinationThatAlreadyHoldsFiles() throws IOException {
-        StartedRun earlier = starter(Map.of()).start(source, destination(null), LOCATION, blobStore);
+    void refusesANewRunIntoATargetThatAlreadyHoldsFiles() throws IOException {
+        StartedRun earlier = starter(Map.of()).start(source, target(null), LOCATION, blobStore);
         state.updateRunStatus(earlier.runId(), RunRecord.Status.SUCCEEDED, null, null);
         publish(LOCATION.blobName("region=EU__part-0-1234abcd.parquet"));
 
-        assertThatThrownBy(() -> starter(Map.of()).start(source, destination(null), LOCATION, blobStore))
+        assertThatThrownBy(() -> starter(Map.of()).start(source, target(null), LOCATION, blobStore))
                 .isInstanceOf(MigrationFailedException.class)
                 .hasMessageContaining("already holds 1 files written by run " + earlier.runId() + " (SUCCEEDED)")
-                .hasMessageContaining("migration.destination.clean=true");
+                .hasMessageContaining("migration.target.clean=true");
     }
 
     @Test
-    void doesNotMistakeASiblingFolderForTheDestination() throws IOException {
+    void doesNotMistakeASiblingFolderForTheTarget() throws IOException {
         publish("sales/orders-archive/part-0.parquet");
 
-        assertThat(starter(Map.of()).start(source, destination(null), LOCATION, blobStore).resumed()).isFalse();
+        assertThat(starter(Map.of()).start(source, target(null), LOCATION, blobStore).resumed()).isFalse();
     }
 
     @Test
     void resumesTheLatestUnfinishedRunWithItsPinnedSnapshotAndSchema() {
-        StartedRun first = starter(Map.of()).start(source, destination(null), LOCATION, blobStore);
+        StartedRun first = starter(Map.of()).start(source, target(null), LOCATION, blobStore);
         state.updateRunStatus(first.runId(), RunRecord.Status.FAILED, null, "boom");
         IcebergTestTables.append(table, rows("APAC", 5));
         table.updateSchema().renameColumn("region", "market").commit();
 
-        StartedRun resumed = starter(Map.of()).start(source, destination(null), LOCATION, blobStore);
+        StartedRun resumed = starter(Map.of()).start(source, target(null), LOCATION, blobStore);
 
         assertThat(resumed.resumed()).isTrue();
         assertThat(resumed.runId()).isEqualTo(first.runId());
@@ -132,11 +129,11 @@ class RunStarterTest {
 
     @Test
     void resumesTheRequestedRun() {
-        StartedRun first = starter(Map.of()).start(source, destination(null), LOCATION, blobStore);
+        StartedRun first = starter(Map.of()).start(source, target(null), LOCATION, blobStore);
         state.updateRunStatus(first.runId(), RunRecord.Status.SUCCEEDED, null, null);
 
         StartedRun resumed = starter(Map.of("migration.run-id", first.runId()))
-                .start(source, destination(null), LOCATION, blobStore);
+                .start(source, target(null), LOCATION, blobStore);
 
         assertThat(resumed.resumed()).isTrue();
         assertThat(resumed.runId()).isEqualTo(first.runId());
@@ -145,15 +142,15 @@ class RunStarterTest {
     @Test
     void rejectsAnUnknownRun() {
         assertThatThrownBy(() -> starter(Map.of("migration.run-id", "nope"))
-                .start(source, destination(null), LOCATION, blobStore))
+                .start(source, target(null), LOCATION, blobStore))
                 .isInstanceOf(MigrationFailedException.class)
                 .hasMessage("Run nope does not exist");
     }
 
     @Test
-    void rejectsARunOfAnotherDestination() {
-        StartedRun first = starter(Map.of()).start(source, destination(null), LOCATION, blobStore);
-        DatasetDescriptor elsewhere = new DatasetDescriptor("orders-adls", DatasetFormat.PARQUET,
+    void rejectsARunOfAnotherTarget() {
+        StartedRun first = starter(Map.of()).start(source, target(null), LOCATION, blobStore);
+        DatasetDescriptor elsewhere = new DatasetDescriptor("5b2f7d3c-8a1e-4f6b-b2d4-9c0e3a7f1d02", DatasetFormat.PARQUET,
                 "abfss://data@salesacct.dfs.core.windows.net/elsewhere", null);
 
         assertThatThrownBy(() -> starter(Map.of("migration.run-id", first.runId()))
@@ -163,25 +160,27 @@ class RunStarterTest {
     }
 
     @Test
-    void refusesToResumeWhenTheDestinationSchemaChanged() {
-        StartedRun first = starter(Map.of()).start(source, destination(null), LOCATION, blobStore);
+    void refusesToResumeWhenTheTargetSchemaChanged() {
+        StartedRun first = starter(Map.of()).start(source, target(null), LOCATION, blobStore);
         state.updateRunStatus(first.runId(), RunRecord.Status.FAILED, null, null);
         DatasetSchema nowConvertsUuid = new DatasetSchema(List.of(
                 new DatasetSchema.Field("id", "string", false), new DatasetSchema.Field("region", "string", true)));
 
-        assertThatThrownBy(() -> starter(Map.of()).start(source, destination(nowConvertsUuid), LOCATION, blobStore))
+        assertThatThrownBy(() -> starter(Map.of()).start(source, target(nowConvertsUuid), LOCATION, blobStore))
                 .isInstanceOf(MigrationFailedException.class)
-                .hasMessageContaining("destination schema changed since run " + first.runId());
+                .hasMessageContaining("target schema changed since run " + first.runId());
     }
 
     @Test
     void refusesToResumeWhenThePinnedSnapshotNoLongerMatchesTheRecordedFiles() {
-        StartedRun first = starter(Map.of()).start(source, destination(null), LOCATION, blobStore);
+        StartedRun first = starter(Map.of()).start(source, target(null), LOCATION, blobStore);
         state.updateRunStatus(first.runId(), RunRecord.Status.FAILED, null, null);
-        stateStore.jdbc().sql("UPDATE migration_file SET physical_records = 99 WHERE run_id = ?")
-                .param(first.runId()).update();
+        state.findFiles(first.runId()).forEach(file -> state.replaceFile(new FileRecord(file.runId(),
+                file.fileKey(), file.sourcePath(), file.specId(), file.partitionPath(), file.targetPath(), 99,
+                file.status(), file.recordsWritten(), file.recordsDeleted(), file.attempts(), file.lastError(),
+                file.updatedAt())));
 
-        assertThatThrownBy(() -> starter(Map.of()).start(source, destination(null), LOCATION, blobStore))
+        assertThatThrownBy(() -> starter(Map.of()).start(source, target(null), LOCATION, blobStore))
                 .isInstanceOf(MigrationFailedException.class)
                 .hasMessageContaining("no longer yields the files run " + first.runId() + " recorded")
                 .hasMessageContaining("changed: ");
@@ -189,23 +188,23 @@ class RunStarterTest {
 
     @Test
     void refusesToResumeWithADifferentConfiguredSnapshot() {
-        StartedRun first = starter(Map.of()).start(source, destination(null), LOCATION, blobStore);
+        StartedRun first = starter(Map.of()).start(source, target(null), LOCATION, blobStore);
 
         assertThatThrownBy(() -> starter(Map.of("migration.run-id", first.runId(),
-                "migration.source.snapshot-id", "123")).start(source, destination(null), LOCATION, blobStore))
+                "migration.source.snapshot-id", "123")).start(source, target(null), LOCATION, blobStore))
                 .isInstanceOf(MigrationFailedException.class)
                 .hasMessageContaining("is pinned to snapshot");
     }
 
     @Test
-    void cleansTheDestinationAndSupersedesEarlierRuns() throws IOException {
-        StartedRun first = starter(Map.of()).start(source, destination(null), LOCATION, blobStore);
+    void cleansTheTargetAndSupersedesEarlierRuns() throws IOException {
+        StartedRun first = starter(Map.of()).start(source, target(null), LOCATION, blobStore);
         publish(LOCATION.blobName("region=EU__part-0-1234abcd.parquet"));
         publish("sales/orders-archive/keep.parquet");
         blobStore.acquireLock(LOCK);
 
-        StartedRun fresh = starter(Map.of("migration.destination.clean", "true"))
-                .start(source, destination(null), LOCATION, blobStore);
+        StartedRun fresh = starter(Map.of("migration.target.clean", "true"))
+                .start(source, target(null), LOCATION, blobStore);
 
         assertThat(fresh.resumed()).isFalse();
         assertThat(fresh.runId()).isNotEqualTo(first.runId());
@@ -217,38 +216,38 @@ class RunStarterTest {
     void refusesToCleanAWholeContainer() {
         AzureLocation root = AzureLocation.parse("abfss://data@salesacct.dfs.core.windows.net");
 
-        assertThatThrownBy(() -> starter(Map.of("migration.destination.clean", "true"))
-                .start(source, destination(null), root, blobStore))
+        assertThatThrownBy(() -> starter(Map.of("migration.target.clean", "true"))
+                .start(source, target(null), root, blobStore))
                 .isInstanceOf(MigrationFailedException.class)
                 .hasMessageContaining("Refusing to clean");
     }
 
     @Test
     void refusesToCombineCleanWithARunId() {
-        assertThatThrownBy(() -> starter(Map.of("migration.destination.clean", "true", "migration.run-id", "r"))
-                .start(source, destination(null), LOCATION, blobStore))
+        assertThatThrownBy(() -> starter(Map.of("migration.target.clean", "true", "migration.run-id", "r"))
+                .start(source, target(null), LOCATION, blobStore))
                 .isInstanceOf(MigrationFailedException.class)
                 .hasMessageContaining("cannot be combined with migration.run-id=r");
     }
 
     @Test
     void refusesToResumeASupersededRun() {
-        StartedRun first = starter(Map.of()).start(source, destination(null), LOCATION, blobStore);
-        state.supersedeRuns(destination(null).location());
+        StartedRun first = starter(Map.of()).start(source, target(null), LOCATION, blobStore);
+        state.supersedeRuns(target(null).location());
 
         assertThatThrownBy(() -> starter(Map.of("migration.run-id", first.runId()))
-                .start(source, destination(null), LOCATION, blobStore))
+                .start(source, target(null), LOCATION, blobStore))
                 .isInstanceOf(MigrationFailedException.class)
                 .hasMessageContaining("was superseded");
     }
 
     private RunStarter starter(Map<String, String> overrides) {
         return new RunStarter(TestProperties.bind(overrides), state, new IcebergMetadataReader(new Configuration()),
-                new DestinationSchemaValidator(), new DestinationPathResolver());
+                new TargetSchemaValidator(), new TargetPathResolver());
     }
 
-    private static DatasetDescriptor destination(DatasetSchema schema) {
-        return new DatasetDescriptor("orders-adls", DatasetFormat.PARQUET,
+    private static DatasetDescriptor target(DatasetSchema schema) {
+        return new DatasetDescriptor("5b2f7d3c-8a1e-4f6b-b2d4-9c0e3a7f1d02", DatasetFormat.PARQUET,
                 "abfss://data@salesacct.dfs.core.windows.net/sales/orders", schema);
     }
 

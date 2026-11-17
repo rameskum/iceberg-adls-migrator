@@ -1,18 +1,18 @@
-package com.tds.pde.migration.destination.azure;
+package com.tds.pde.migration.target.azure;
 
 import com.azure.core.credential.TokenCredential;
 import com.azure.storage.blob.BlobServiceClient;
 import com.azure.storage.blob.BlobServiceClientBuilder;
 import com.tds.pde.migration.config.MigrationProperties;
-import com.tds.pde.migration.destination.BlobStore;
-import com.tds.pde.migration.destination.BlobStoreFactory;
+import com.tds.pde.migration.target.BlobStore;
+import com.tds.pde.migration.target.BlobStoreFactory;
 import java.time.Duration;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.stereotype.Component;
 
 /**
- * Opens Azure Blob Storage for a destination location.
+ * Opens Azure Blob Storage for a target location.
  */
 @Slf4j
 @Component
@@ -24,7 +24,7 @@ public class AzureBlobStoreFactory implements BlobStoreFactory {
 
     public AzureBlobStoreFactory(MigrationProperties properties, ObjectProvider<TokenCredential> credential) {
         this.auth = properties.azure().auth();
-        this.blockSize = Math.toIntExact(properties.destination().blockSize().toBytes());
+        this.blockSize = Math.toIntExact(properties.target().blockSize().toBytes());
         this.credential = credential;
     }
 
@@ -44,7 +44,7 @@ public class AzureBlobStoreFactory implements BlobStoreFactory {
                     .connectionString(auth.connectionString())
                     .buildClient();
         };
-        log.info("Destination storage opened: endpoint={} container={} prefix={} authMode={}",
+        log.info("Target storage opened: endpoint={} container={} prefix={} authMode={}",
                 service.getAccountUrl(), location.container(), location.prefix(), auth.mode());
         return new AzureBlobStore(service.getBlobContainerClient(location.container()), blockSize, lockRenewInterval);
     }

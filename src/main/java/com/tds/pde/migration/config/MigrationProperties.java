@@ -4,6 +4,7 @@ import java.nio.file.Path;
 import java.time.Duration;
 import java.util.Map;
 import java.util.Objects;
+import java.util.UUID;
 import java.util.regex.Pattern;
 import org.jspecify.annotations.Nullable;
 import org.springframework.boot.context.properties.ConfigurationProperties;
@@ -12,13 +13,14 @@ import org.springframework.util.unit.DataSize;
 
 /**
  * All externalized migration settings, bound from the {@code migration.*} namespace.
- * Invalid or missing required values fail application startup, before any data is touched.
+ * Invalid, missing or unknown values (such as a misspelled job parameter) fail application startup, before any
+ * data is touched.
  */
-@ConfigurationProperties("migration")
+@ConfigurationProperties(prefix = "migration", ignoreUnknownFields = false)
 public record MigrationProperties(
         @Nullable String runId,
         Source source,
-        Destination destination,
+        Target target,
         Datasets datasets,
         @DefaultValue Azure azure,
         @DefaultValue Parquet parquet,
@@ -28,40 +30,40 @@ public record MigrationProperties(
 
     public MigrationProperties {
         require(source, "migration.source");
-        require(destination, "migration.destination");
+        require(target, "migration.target");
         require(datasets, "migration.datasets");
         require(state, "migration.state");
         runId = blankToNull(runId);
     }
 
     /**
-     * @param datasetId  identifier of the source dataset in the dataset API
+     * @param datasetId  UUID of the source dataset in the dataset API
      * @param snapshotId optional snapshot to migrate instead of the table's current snapshot
      * @param hadoop     extra Hadoop configuration, copied verbatim; quote dotted keys as {@code "[fs.defaultFS]"}
      */
-    public record Source(String datasetId, @Nullable Long snapshotId, Map<String, String> hadoop) {
+    public record Source(UUID datasetId, @Nullable Long snapshotId, Map<String, String> hadoop) {
 
         public Source {
-            requireText(datasetId, "migration.source.dataset-id");
+            require(datasetId, "migration.source.dataset-id");
             hadoop = hadoop == null ? Map.of() : Map.copyOf(hadoop);
         }
     }
 
     /**
-     * @param datasetId identifier of the destination dataset in the dataset API
-     * @param clean     delete everything under the destination location and start a fresh run
+     * @param datasetId UUID of the target dataset in the dataset API
+     * @param clean     delete everything under the target location and start a fresh run
      * @param blockSize size of each staged block uploaded to Azure Blob Storage
      */
-    public record Destination(String datasetId, @DefaultValue("false") boolean clean,
+    public record Target(UUID datasetId, @DefaultValue("false") boolean clean,
                               @DefaultValue("8MB") DataSize blockSize) {
 
         private static final DataSize MAX_BLOCK_SIZE = DataSize.ofMegabytes(4000);
 
-        public Destination {
-            requireText(datasetId, "migration.destination.dataset-id");
+        public Target {
+            require(datasetId, "migration.target.dataset-id");
             if (blockSize.toBytes() <= 0 || blockSize.compareTo(MAX_BLOCK_SIZE) > 0) {
                 throw new IllegalArgumentException(
-                        "migration.destination.block-size must be between 1B and 4000MB, was " + blockSize);
+                        "migration.target.block-size must be between 1B and 4000MB, was " + blockSize);
             }
         }
     }

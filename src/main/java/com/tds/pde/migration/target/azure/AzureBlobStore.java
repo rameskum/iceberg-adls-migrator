@@ -1,4 +1,4 @@
-package com.tds.pde.migration.destination.azure;
+package com.tds.pde.migration.target.azure;
 
 import com.azure.core.util.BinaryData;
 import com.azure.storage.blob.BlobClient;
@@ -9,10 +9,10 @@ import com.azure.storage.blob.models.BlobStorageException;
 import com.azure.storage.blob.models.ListBlobsOptions;
 import com.azure.storage.blob.specialized.BlobLeaseClient;
 import com.azure.storage.blob.specialized.BlobLeaseClientBuilder;
-import com.tds.pde.migration.destination.BlobStore;
-import com.tds.pde.migration.destination.LockUnavailableException;
-import com.tds.pde.migration.destination.RunLock;
-import com.tds.pde.migration.destination.StagedUpload;
+import com.tds.pde.migration.target.BlobStore;
+import com.tds.pde.migration.target.LockUnavailableException;
+import com.tds.pde.migration.target.RunLock;
+import com.tds.pde.migration.target.StagedUpload;
 import java.time.Duration;
 import java.util.List;
 import java.util.Map;

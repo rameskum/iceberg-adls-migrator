@@ -6,8 +6,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 
 import com.tds.pde.migration.state.MigrationStateRepository;
 import com.tds.pde.migration.state.RunRecord;
-import com.tds.pde.migration.testing.H2State;
-import com.tds.pde.migration.testing.H2StateStore;
+import com.tds.pde.migration.testing.InMemoryState;
 import com.tds.pde.migration.testing.InMemoryBlobStore;
 import com.tds.pde.migration.testing.InMemoryStorage;
 import com.tds.pde.migration.testing.ParquetOutput;
@@ -83,28 +82,28 @@ class HdfsEndToEndTest {
 
         InMemoryBlobStore blobStore = new InMemoryBlobStore();
         InMemoryStorage.current = blobStore;
-        H2StateStore stateStore = new H2StateStore();
-        H2State.current = stateStore;
+        InMemoryState.Store stateStore = new InMemoryState.Store();
+        InMemoryState.current = stateStore;
         Path datasets = Files.createDirectory(tempDir.resolve("datasets"));
-        Files.writeString(datasets.resolve("orders-src.json"), """
-                { "datasetId": "orders-src", "format": "ICEBERG", "location": "%s" }
+        Files.writeString(datasets.resolve("0e9c1a5e-4c55-4a3b-9f3e-1c2a7d8b6e01.json"), """
+                { "datasetId": "0e9c1a5e-4c55-4a3b-9f3e-1c2a7d8b6e01", "format": "ICEBERG", "location": "%s" }
                 """.formatted(tableLocation));
-        Files.writeString(datasets.resolve("orders-adls.json"), """
-                { "datasetId": "orders-adls", "format": "PARQUET",
+        Files.writeString(datasets.resolve("5b2f7d3c-8a1e-4f6b-b2d4-9c0e3a7f1d02.json"), """
+                { "datasetId": "5b2f7d3c-8a1e-4f6b-b2d4-9c0e3a7f1d02", "format": "PARQUET",
                   "location": "abfss://data@salesacct.dfs.core.windows.net/sales/orders" }
                 """);
 
-        MigrationApplication.run(new SpringApplication(MigrationApplication.class, InMemoryStorage.class, H2State.class),
-                "--migration.source.dataset-id=orders-src",
-                "--migration.destination.dataset-id=orders-adls",
+        MigrationApplication.run(new SpringApplication(MigrationApplication.class, InMemoryStorage.class, InMemoryState.class),
+                "--migration.source.dataset-id=0e9c1a5e-4c55-4a3b-9f3e-1c2a7d8b6e01",
+                "--migration.target.dataset-id=5b2f7d3c-8a1e-4f6b-b2d4-9c0e3a7f1d02",
                 "--migration.source.hadoop[fs.defaultFS]=" + nameNode,
                 "--migration.datasets.stub-directory=" + datasets,
-                "--migration.state.run-table=" + H2StateStore.RUN_TABLE,
-                "--migration.state.file-table=" + H2StateStore.FILE_TABLE,
-                "--migration.state.control-table=" + H2StateStore.CONTROL_TABLE);
+                "--migration.state.run-table=" + "migration_run",
+                "--migration.state.file-table=" + "migration_file",
+                "--migration.state.control-table=" + "migration_control");
 
-        RunRecord run = new MigrationStateRepository(stateStore.executor(), TestProperties.defaults())
-                .findLatestRunForDestination("abfss://data@salesacct.dfs.core.windows.net/sales/orders")
+        RunRecord run = stateStore
+                .findLatestRunForTarget("abfss://data@salesacct.dfs.core.windows.net/sales/orders")
                 .orElseThrow();
         assertThat(run.status()).isEqualTo(RunRecord.Status.SUCCEEDED);
         assertThat(run.sourceTableLocation()).startsWith("hdfs://");

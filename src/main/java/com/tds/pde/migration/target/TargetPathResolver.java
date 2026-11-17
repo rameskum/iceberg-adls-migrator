@@ -1,18 +1,18 @@
-package com.tds.pde.migration.destination;
+package com.tds.pde.migration.target;
 
 import com.tds.pde.migration.source.SourceFile;
 import java.util.Locale;
 import org.springframework.stereotype.Component;
 
 /**
- * Names destination files: one flat folder, with the partition and source file encoded in the file name,
+ * Names target files: one flat folder, with the partition and source file encoded in the file name,
  * for example {@code region=EU.event_ts_day=2024-01-01__00000-5-a1b2-00001-9f3e1c2a.parquet}.
  *
  * <p>Names are deterministic, so a rerun writes the same file again. The hash of the full source location keeps
  * apart source files that share a file name in different directories.
  */
 @Component
-public class DestinationPathResolver {
+public class TargetPathResolver {
 
     static final int MAX_FILE_NAME_LENGTH = 255;
 
@@ -21,7 +21,7 @@ public class DestinationPathResolver {
     private static final int HASH_LENGTH = 8;
 
     /**
-     * @param prefix        folder within the destination container, without leading or trailing slash; may be empty
+     * @param prefix        folder within the target container, without leading or trailing slash; may be empty
      * @param partitionPath Hive-style source partition path; empty when unpartitioned
      */
     public String resolve(String prefix, String partitionPath, String sourceLocation) {

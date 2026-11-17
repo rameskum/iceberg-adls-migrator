@@ -1,6 +1,6 @@
 package com.tds.pde.migration.processing;
 
-import com.tds.pde.migration.destination.BlobStore;
+import com.tds.pde.migration.target.BlobStore;
 import java.net.URLEncoder;
 import java.nio.charset.StandardCharsets;
 import java.util.Map;
@@ -8,7 +8,7 @@ import java.util.Objects;
 import java.util.Optional;
 
 /**
- * The metadata committed with every destination blob, which makes a published blob its own proof of completion:
+ * The metadata committed with every target blob, which makes a published blob its own proof of completion:
  * the blob and its metadata appear in one atomic commit, so a blob carrying this run's markers is a finished file
  * even if recording the completion in the state store failed afterwards.
  */
@@ -39,11 +39,11 @@ public final class PublishedFile {
     }
 
     /**
-     * @return the counts recorded at publish time when the task's destination blob was published by this run
+     * @return the counts recorded at publish time when the task's target blob was published by this run
      *         from this source file at this snapshot; empty otherwise
      */
     public static Optional<Counts> find(BlobStore blobStore, RunContext run, FileTask task) {
-        return blobStore.metadata(task.destination())
+        return blobStore.metadata(task.target())
                 .filter(metadata -> Objects.equals(metadata.get(RUN_ID), run.runId())
                         && Objects.equals(metadata.get(SOURCE_FILE), encode(task.source().location()))
                         && Objects.equals(metadata.get(SOURCE_SNAPSHOT_ID), String.valueOf(run.source().snapshotId()))

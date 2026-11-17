@@ -1,4 +1,4 @@
-package com.tds.pde.migration.destination.azure;
+package com.tds.pde.migration.target.azure;
 
 import com.azure.core.credential.TokenCredential;
 import com.azure.identity.ManagedIdentityCredentialBuilder;

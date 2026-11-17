@@ -1,9 +1,9 @@
 package com.tds.pde.migration.processing;
 
-import com.tds.pde.migration.destination.BlobStore;
-import com.tds.pde.migration.destination.OutputRecordMapper;
-import com.tds.pde.migration.destination.ParquetDataWriter;
-import com.tds.pde.migration.destination.StagedUpload;
+import com.tds.pde.migration.target.BlobStore;
+import com.tds.pde.migration.target.OutputRecordMapper;
+import com.tds.pde.migration.target.ParquetDataWriter;
+import com.tds.pde.migration.target.StagedUpload;
 import com.tds.pde.migration.source.IcebergDataReader;
 import com.tds.pde.migration.source.SourceRecords;
 import java.time.Duration;
@@ -13,7 +13,7 @@ import org.apache.iceberg.data.Record;
 import org.apache.iceberg.io.FileAppender;
 
 /**
- * Copies one source data file to one destination Parquet file: streams its live rows, writes them, verifies the
+ * Copies one source data file to one target Parquet file: streams its live rows, writes them, verifies the
  * written file, and only then publishes it. Knows nothing about runs, progress totals or state persistence, so
  * it can be wrapped by checkpointing or parallel execution unchanged.
  */
@@ -46,16 +46,16 @@ public class DataFileProcessor {
     }
 
     /**
-     * Never throws for a failure of this file: the failure is logged with its source and destination and returned.
+     * Never throws for a failure of this file: the failure is logged with its source and target and returned.
      */
     public FileResult process(RunContext run, FileTask task, FileProgressListener listener) {
         long started = System.nanoTime();
-        log.info("Source file processing started: source={} destination={} partition={} physicalRecords={} "
-                        + "deleteFiles={}", task.source().location(), task.destination(),
+        log.info("Source file processing started: source={} target={} partition={} physicalRecords={} "
+                        + "deleteFiles={}", task.source().location(), task.target(),
                 task.partitionPath().isEmpty() ? "<unpartitioned>" : task.partitionPath(),
                 task.source().recordCount(), task.source().deleteFileCount());
 
-        StagedUpload upload = blobStore.startUpload(task.destination());
+        StagedUpload upload = blobStore.startUpload(task.target());
         long physicalRowsRead = 0;
         long recordsWritten = 0;
         boolean published = false;
@@ -84,14 +84,14 @@ public class DataFileProcessor {
             published = true;
 
             Duration duration = Duration.ofNanos(System.nanoTime() - started);
-            log.info("Source file completed: source={} destination={} recordsWritten={} recordsDeleted={} "
-                            + "durationMs={}", task.source().location(), task.destination(), recordsWritten,
+            log.info("Source file completed: source={} target={} recordsWritten={} recordsDeleted={} "
+                            + "durationMs={}", task.source().location(), task.target(), recordsWritten,
                     physicalRowsRead - recordsWritten, duration.toMillis());
             return FileResult.succeeded(task, physicalRowsRead, recordsWritten, duration);
         } catch (Exception e) {
             Duration duration = Duration.ofNanos(System.nanoTime() - started);
-            log.error("Source file failed, nothing was published: source={} destination={} "
-                            + "recordsWrittenBeforeFailure={} reason={}", task.source().location(), task.destination(),
+            log.error("Source file failed, nothing was published: source={} target={} "
+                            + "recordsWrittenBeforeFailure={} reason={}", task.source().location(), task.target(),
                     recordsWritten, FileResult.describe(e), e);
             return FileResult.failed(task, physicalRowsRead, recordsWritten, duration, e);
         } finally {

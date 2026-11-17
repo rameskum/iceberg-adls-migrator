@@ -6,9 +6,9 @@
 
 CREATE TABLE IF NOT EXISTS ${control_table} (
     source_dataset_id      STRING    NOT NULL,
-    destination_dataset_id STRING    NOT NULL,
-    source_table_location  STRING    NOT NULL COMMENT 'Identifies the table migration, with destination_location',
-    destination_location   STRING    NOT NULL,
+    target_dataset_id STRING    NOT NULL,
+    source_table_location  STRING    NOT NULL COMMENT 'Identifies the table migration, with target_location',
+    target_location   STRING    NOT NULL,
     status                 STRING    NOT NULL COMMENT 'RUNNING, SUCCEEDED or FAILED',
     last_run_id            STRING    NOT NULL,
     format_version         INT       NOT NULL COMMENT 'Iceberg table format version',
@@ -31,19 +31,19 @@ CREATE TABLE IF NOT EXISTS ${control_table} (
     error                  STRING,
     updated_at             TIMESTAMP NOT NULL
 ) USING DELTA
-COMMENT 'One row per table migration (source table to destination), with the latest run'
+COMMENT 'One row per table migration (source table to target), with the latest run'
 TBLPROPERTIES ('delta.enableDeletionVectors' = 'true', 'delta.enableRowTracking' = 'true');
 
 CREATE TABLE IF NOT EXISTS ${run_table} (
     run_id                 STRING    NOT NULL COMMENT 'Run identifier, e.g. 20261117-103000-ab12cd',
     status                 STRING    NOT NULL COMMENT 'RUNNING, SUCCEEDED, FAILED or SUPERSEDED',
     source_dataset_id      STRING    NOT NULL,
-    destination_dataset_id STRING    NOT NULL,
+    target_dataset_id STRING    NOT NULL,
     source_table_location  STRING    NOT NULL,
-    destination_location   STRING    NOT NULL,
+    target_location   STRING    NOT NULL,
     snapshot_id            BIGINT             COMMENT 'Pinned source snapshot, NULL when the table was never written',
     source_schema_json     STRING    NOT NULL COMMENT 'Iceberg schema the source rows are read into',
-    output_schema_json     STRING    NOT NULL COMMENT 'Iceberg schema of every destination file',
+    output_schema_json     STRING    NOT NULL COMMENT 'Iceberg schema of every target file',
     total_partitions       BIGINT    NOT NULL,
     total_files            BIGINT    NOT NULL,
     total_records          BIGINT    NOT NULL COMMENT 'Physical source rows before deletes',
@@ -61,7 +61,7 @@ CREATE TABLE IF NOT EXISTS ${file_table} (
     source_path      STRING    NOT NULL,
     spec_id          INT       NOT NULL,
     partition_path   STRING    NOT NULL COMMENT 'Hive-style source partition, empty when unpartitioned',
-    destination_path STRING    NOT NULL COMMENT 'Blob name within the destination container',
+    target_path STRING    NOT NULL COMMENT 'Blob name within the target container',
     physical_records BIGINT    NOT NULL COMMENT 'Source rows before deletes',
     status           STRING    NOT NULL COMMENT 'PENDING, COMPLETED or FAILED',
     records_written  BIGINT,

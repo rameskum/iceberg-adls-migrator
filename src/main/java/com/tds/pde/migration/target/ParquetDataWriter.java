@@ -1,4 +1,4 @@
-package com.tds.pde.migration.destination;
+package com.tds.pde.migration.target;
 
 import com.tds.pde.migration.config.MigrationProperties;
 import java.io.IOException;
@@ -58,7 +58,7 @@ public class ParquetDataWriter {
 
     /**
      * Iceberg's writer creates no file at all when it receives no rows. A source file whose rows were all deleted
-     * must still produce its destination file, so the empty file is written directly.
+     * must still produce its target file, so the empty file is written directly.
      */
     private final class EmptyFileAwareAppender implements FileAppender<Record> {
 

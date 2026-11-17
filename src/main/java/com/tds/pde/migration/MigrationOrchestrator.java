@@ -4,12 +4,12 @@ import com.tds.pde.migration.config.MigrationProperties;
 import com.tds.pde.migration.dataset.DatasetClient;
 import com.tds.pde.migration.dataset.DatasetDescriptor;
 import com.tds.pde.migration.dataset.DatasetFormat;
-import com.tds.pde.migration.destination.BlobStore;
-import com.tds.pde.migration.destination.BlobStoreFactory;
-import com.tds.pde.migration.destination.LockUnavailableException;
-import com.tds.pde.migration.destination.ParquetDataWriter;
-import com.tds.pde.migration.destination.RunLock;
-import com.tds.pde.migration.destination.azure.AzureLocation;
+import com.tds.pde.migration.target.BlobStore;
+import com.tds.pde.migration.target.BlobStoreFactory;
+import com.tds.pde.migration.target.LockUnavailableException;
+import com.tds.pde.migration.target.ParquetDataWriter;
+import com.tds.pde.migration.target.RunLock;
+import com.tds.pde.migration.target.azure.AzureLocation;
 import com.tds.pde.migration.processing.DataFileProcessor;
 import com.tds.pde.migration.processing.FileResult;
 import com.tds.pde.migration.processing.FileTask;
@@ -38,7 +38,7 @@ import org.jspecify.annotations.Nullable;
 import org.springframework.stereotype.Component;
 
 /**
- * Coordinates one migration: resolve the datasets, lock the destination, start or resume the run, process its
+ * Coordinates one migration: resolve the datasets, lock the target, start or resume the run, process its
  * partitions file by file, and record how the run ended.
  */
 @Slf4j
@@ -61,32 +61,32 @@ public class MigrationOrchestrator {
      * @throws MigrationFailedException when the run does not complete successfully, with the cause attached
      */
     public void migrate() {
-        log.info("Migration started: sourceDataset={} destinationDataset={} runId={}",
+        log.info("Migration started: sourceDataset={} targetDataset={} runId={}",
                 properties.source().datasetId(),
-                properties.destination().datasetId(),
+                properties.target().datasetId(),
                 properties.runId() == null ? "<new or auto-resume>" : properties.runId());
         try {
             run();
         } catch (MigrationFailedException e) {
-            log.error("Migration failed: sourceDataset={} destinationDataset={} reason={}",
-                    properties.source().datasetId(), properties.destination().datasetId(), e.getMessage(), e);
+            log.error("Migration failed: sourceDataset={} targetDataset={} reason={}",
+                    properties.source().datasetId(), properties.target().datasetId(), e.getMessage(), e);
             throw e;
         } catch (RuntimeException e) {
-            log.error("Migration failed: sourceDataset={} destinationDataset={} reason={}",
-                    properties.source().datasetId(), properties.destination().datasetId(), e.getMessage(), e);
+            log.error("Migration failed: sourceDataset={} targetDataset={} reason={}",
+                    properties.source().datasetId(), properties.target().datasetId(), e.getMessage(), e);
             throw new MigrationFailedException("Migration failed: " + e.getMessage(), e);
         }
     }
 
     private void run() {
-        DatasetDescriptor source = dataset(properties.source().datasetId(), DatasetFormat.ICEBERG);
-        DatasetDescriptor destination = dataset(properties.destination().datasetId(), DatasetFormat.PARQUET);
-        AzureLocation location = location(destination);
+        DatasetDescriptor source = dataset(properties.source().datasetId().toString(), DatasetFormat.ICEBERG);
+        DatasetDescriptor target = dataset(properties.target().datasetId().toString(), DatasetFormat.PARQUET);
+        AzureLocation location = location(target);
         state.createTablesIfMissing();
 
         BlobStore blobStore = blobStoreFactory.open(location);
         try (RunLock lock = blobStore.acquireLock(location.blobName(RunStarter.BOOKKEEPING_FOLDER + "/lock"))) {
-            StartedRun run = runStarter.start(source, destination, location, blobStore);
+            StartedRun run = runStarter.start(source, target, location, blobStore);
             MigrationProgressTracker progress = new MigrationProgressTracker(properties.progress());
             progress.start(run.plan().totalRecords(), run.plan().totalFiles(), run.plan().totalPartitions());
             try {
@@ -108,10 +108,10 @@ public class MigrationOrchestrator {
                 : Map.of();
 
         log.info("Migration overview: runId={} resumed={} table={} snapshotId={}\n  Total partitions: {}\n"
-                        + "  Total data files: {}\n  Total records: {}\n  Delete files: {}\n  Destination: {}",
+                        + "  Total data files: {}\n  Total records: {}\n  Delete files: {}\n  Target: {}",
                 run.runId(), run.resumed(), run.plan().table().location(), run.plan().table().snapshotId(),
                 run.plan().totalPartitions(), run.plan().totalFiles(), run.plan().totalRecords(),
-                run.plan().totalDeleteFiles(), run.run().destinationLocation());
+                run.plan().totalDeleteFiles(), run.run().targetLocation());
         if (!published.isEmpty()) {
             log.info("Resuming after already published work:\n  {}", progress.summary());
         }
@@ -171,8 +171,8 @@ public class MigrationOrchestrator {
                 }
                 FileRecord stored = run.fileStates().get(fileKey);
                 if (stored == null || stored.status() != FileRecord.Status.COMPLETED) {
-                    log.info("Source file was already published; recording it as completed: source={} destination={}",
-                            task.source().location(), task.destination());
+                    log.info("Source file was already published; recording it as completed: source={} target={}",
+                            task.source().location(), task.target());
                     state.markFileCompleted(run.runId(), fileKey, counts.get().recordsWritten(),
                             counts.get().physicalRowsRead() - counts.get().recordsWritten());
                 }
@@ -204,8 +204,8 @@ public class MigrationOrchestrator {
         MigrationPlan plan = run.plan();
         SourceTable table = plan.table();
         RunRecord record = run.run();
-        state.saveControl(new ControlRecord(record.sourceDatasetId(), record.destinationDatasetId(),
-                record.sourceTableLocation(), record.destinationLocation(), status, record.runId(),
+        state.saveControl(new ControlRecord(record.sourceDatasetId(), record.targetDatasetId(),
+                record.sourceTableLocation(), record.targetLocation(), status, record.runId(),
                 table.formatVersion(), table.snapshotId(), table.snapshotTimestamp(), table.schema().schemaId(),
                 plan.partitionSpecs(), plan.totalPartitions(), plan.totalFiles(), plan.totalRecords(),
                 plan.totalDeleteFiles(), plan.totalBytes(), counts.completedPartitions(), counts.completedFiles(),
@@ -220,8 +220,8 @@ public class MigrationOrchestrator {
     private static String failureList(List<FileResult> failures) {
         StringBuilder list = new StringBuilder();
         failures.stream().limit(MAX_LISTED_FAILURES).forEach(failure -> list.append("    source=")
-                .append(failure.task().source().location()).append(" destination=")
-                .append(failure.task().destination()).append(" reason=").append(failure.failureReason())
+                .append(failure.task().source().location()).append(" target=")
+                .append(failure.task().target()).append(" reason=").append(failure.failureReason())
                 .append('\n'));
         if (failures.size() > MAX_LISTED_FAILURES) {
             list.append("    ... and ").append(failures.size() - MAX_LISTED_FAILURES)
@@ -239,11 +239,11 @@ public class MigrationOrchestrator {
         return descriptor;
     }
 
-    private static AzureLocation location(DatasetDescriptor destination) {
+    private static AzureLocation location(DatasetDescriptor target) {
         try {
-            return AzureLocation.parse(destination.location());
+            return AzureLocation.parse(target.location());
         } catch (IllegalArgumentException e) {
-            throw new MigrationFailedException("Dataset '" + destination.datasetId() + "': " + e.getMessage(), e);
+            throw new MigrationFailedException("Dataset '" + target.datasetId() + "': " + e.getMessage(), e);
         }
     }
 }

@@ -40,17 +40,17 @@ public class MigrationStateRepository {
     private static final int MAX_ERROR_LENGTH = 4000;
     private static final String DDL = "db/databricks/migration-state.sql";
 
-    private static final List<String> CONTROL_COLUMNS = List.of("source_dataset_id", "destination_dataset_id",
-            "source_table_location", "destination_location", "status", "last_run_id", "format_version", "snapshot_id",
+    private static final List<String> CONTROL_COLUMNS = List.of("source_dataset_id", "target_dataset_id",
+            "source_table_location", "target_location", "status", "last_run_id", "format_version", "snapshot_id",
             "snapshot_timestamp", "schema_id", "partition_specs", "total_partitions", "total_files", "total_records",
             "total_delete_files", "total_bytes", "completed_partitions", "completed_files", "failed_files",
             "records_written", "records_deleted", "started_at", "finished_at", "error", "updated_at");
     private static final List<String> RUN_COLUMNS = List.of("run_id", "status", "source_dataset_id",
-            "destination_dataset_id", "source_table_location", "destination_location", "snapshot_id",
+            "target_dataset_id", "source_table_location", "target_location", "snapshot_id",
             "source_schema_json", "output_schema_json", "total_partitions", "total_files", "total_records",
             "started_at", "finished_at", "error", "updated_at");
     private static final List<String> FILE_COLUMNS = List.of("run_id", "file_key", "source_path", "spec_id",
-            "partition_path", "destination_path", "physical_records", "status", "records_written", "records_deleted",
+            "partition_path", "target_path", "physical_records", "status", "records_written", "records_deleted",
             "attempts", "last_error", "updated_at");
 
     private final SqlExecutor sql;
@@ -95,30 +95,30 @@ public class MigrationStateRepository {
 
     // ---- control table ----------------------------------------------------------------------------------------
 
-    /** Writes the control row of this source and destination, creating it on the first run. */
+    /** Writes the control row of this source and target, creating it on the first run. */
     public void saveControl(ControlRecord control) {
         Map<String, Object> params = controlParams(control);
         String assignments = String.join(", ", CONTROL_COLUMNS.stream()
-                .filter(column -> !column.equals("source_table_location") && !column.equals("destination_location"))
+                .filter(column -> !column.equals("source_table_location") && !column.equals("target_location"))
                 .map(column -> column + " = :" + column)
                 .toList());
         long updated = retrying("update control row", () -> sql.update("UPDATE " + controlTable + " SET "
                 + assignments + " WHERE source_table_location = :source_table_location"
-                + " AND destination_location = :destination_location", params));
-        // The run lock guarantees one writer per destination, so update-then-insert cannot race.
+                + " AND target_location = :target_location", params));
+        // The run lock guarantees one writer per target, so update-then-insert cannot race.
         if (updated == 0 || updated < 0 && findControl(control.sourceTableLocation(),
-                control.destinationLocation()).isEmpty()) {
+                control.targetLocation()).isEmpty()) {
             retrying("insert control row", () -> sql.update("INSERT INTO " + controlTable + " ("
                     + String.join(", ", CONTROL_COLUMNS) + ") VALUES (:" + String.join(", :", CONTROL_COLUMNS) + ")",
                     params));
         }
     }
 
-    public Optional<ControlRecord> findControl(String sourceTableLocation, String destinationLocation) {
+    public Optional<ControlRecord> findControl(String sourceTableLocation, String targetLocation) {
         return retrying("read control row", () -> sql.query("SELECT " + String.join(", ", CONTROL_COLUMNS)
                         + " FROM " + controlTable + " WHERE source_table_location = :source"
-                        + " AND destination_location = :destination",
-                Map.of("source", sourceTableLocation, "destination", destinationLocation)))
+                        + " AND target_location = :target",
+                Map.of("source", sourceTableLocation, "target", targetLocation)))
                 .stream().findFirst().map(MigrationStateRepository::control);
     }
 
@@ -129,9 +129,9 @@ public class MigrationStateRepository {
         params.put("run_id", run.runId());
         params.put("status", run.status().name());
         params.put("source_dataset_id", run.sourceDatasetId());
-        params.put("destination_dataset_id", run.destinationDatasetId());
+        params.put("target_dataset_id", run.targetDatasetId());
         params.put("source_table_location", run.sourceTableLocation());
-        params.put("destination_location", run.destinationLocation());
+        params.put("target_location", run.targetLocation());
         params.put("snapshot_id", run.snapshotId());
         params.put("source_schema_json", run.sourceSchemaJson());
         params.put("output_schema_json", run.outputSchemaJson());
@@ -150,19 +150,19 @@ public class MigrationStateRepository {
         return firstRun("read run " + runId, "WHERE run_id = :run_id", Map.of("run_id", runId));
     }
 
-    /** The most recently started RUNNING or FAILED run copying this source to this destination. */
-    public Optional<RunRecord> findLatestUnfinishedRun(String sourceTableLocation, String destinationLocation) {
+    /** The most recently started RUNNING or FAILED run copying this source to this target. */
+    public Optional<RunRecord> findLatestUnfinishedRun(String sourceTableLocation, String targetLocation) {
         return firstRun("find unfinished run", "WHERE source_table_location = :source"
-                        + " AND destination_location = :destination AND status IN ('RUNNING', 'FAILED')"
+                        + " AND target_location = :target AND status IN ('RUNNING', 'FAILED')"
                         + " ORDER BY started_at DESC LIMIT 1",
-                Map.of("source", sourceTableLocation, "destination", destinationLocation));
+                Map.of("source", sourceTableLocation, "target", targetLocation));
     }
 
-    /** The most recently started run that still owns output at this destination. */
-    public Optional<RunRecord> findLatestRunForDestination(String destinationLocation) {
-        return firstRun("find run for destination", "WHERE destination_location = :destination"
+    /** The most recently started run that still owns output at this target. */
+    public Optional<RunRecord> findLatestRunForTarget(String targetLocation) {
+        return firstRun("find run for target", "WHERE target_location = :target"
                         + " AND status <> 'SUPERSEDED' ORDER BY started_at DESC LIMIT 1",
-                Map.of("destination", destinationLocation));
+                Map.of("target", targetLocation));
     }
 
     public void updateRunStatus(String runId, RunRecord.Status status, @Nullable Instant finishedAt,
@@ -177,12 +177,12 @@ public class MigrationStateRepository {
                 + " finished_at = :finished_at, error = :error, updated_at = :updated_at WHERE run_id = :run_id", params);
     }
 
-    /** Marks every other run that owns output at the destination as superseded by a clean start. */
-    public long supersedeRuns(String destinationLocation) {
+    /** Marks every other run that owns output at the target as superseded by a clean start. */
+    public long supersedeRuns(String targetLocation) {
         return retrying("supersede runs", () -> sql.update("UPDATE " + runTable + " SET status = 'SUPERSEDED',"
-                        + " updated_at = :updated_at WHERE destination_location = :destination"
+                        + " updated_at = :updated_at WHERE target_location = :target"
                         + " AND status <> 'SUPERSEDED'",
-                Map.of("updated_at", timestamp(Instant.now()), "destination", destinationLocation)));
+                Map.of("updated_at", timestamp(Instant.now()), "target", targetLocation)));
     }
 
     // ---- file table -------------------------------------------------------------------------------------------
@@ -201,7 +201,7 @@ public class MigrationStateRepository {
                 values.put("source_path", file.sourcePath());
                 values.put("spec_id", file.specId());
                 values.put("partition_path", file.partitionPath());
-                values.put("destination_path", file.destinationPath());
+                values.put("target_path", file.targetPath());
                 values.put("physical_records", file.physicalRecords());
                 values.put("status", file.status().name());
                 values.put("records_written", file.recordsWritten());
@@ -286,9 +286,9 @@ public class MigrationStateRepository {
     private static Map<String, Object> controlParams(ControlRecord control) {
         Map<String, Object> params = new HashMap<>();
         params.put("source_dataset_id", control.sourceDatasetId());
-        params.put("destination_dataset_id", control.destinationDatasetId());
+        params.put("target_dataset_id", control.targetDatasetId());
         params.put("source_table_location", control.sourceTableLocation());
-        params.put("destination_location", control.destinationLocation());
+        params.put("target_location", control.targetLocation());
         params.put("status", control.status().name());
         params.put("last_run_id", control.lastRunId());
         params.put("format_version", control.formatVersion());
@@ -314,8 +314,8 @@ public class MigrationStateRepository {
     }
 
     private static ControlRecord control(Map<String, Object> row) {
-        return new ControlRecord((String) row.get("source_dataset_id"), (String) row.get("destination_dataset_id"),
-                (String) row.get("source_table_location"), (String) row.get("destination_location"),
+        return new ControlRecord((String) row.get("source_dataset_id"), (String) row.get("target_dataset_id"),
+                (String) row.get("source_table_location"), (String) row.get("target_location"),
                 RunRecord.Status.valueOf((String) row.get("status")), (String) row.get("last_run_id"),
                 integer(row.get("format_version")), nullableLong(row.get("snapshot_id")),
                 instant(row.get("snapshot_timestamp")), nullableInteger(row.get("schema_id")),
@@ -330,8 +330,8 @@ public class MigrationStateRepository {
 
     private static RunRecord run(Map<String, Object> row) {
         return new RunRecord((String) row.get("run_id"), RunRecord.Status.valueOf((String) row.get("status")),
-                (String) row.get("source_dataset_id"), (String) row.get("destination_dataset_id"),
-                (String) row.get("source_table_location"), (String) row.get("destination_location"),
+                (String) row.get("source_dataset_id"), (String) row.get("target_dataset_id"),
+                (String) row.get("source_table_location"), (String) row.get("target_location"),
                 nullableLong(row.get("snapshot_id")), text(row.get("source_schema_json")),
                 text(row.get("output_schema_json")), number(row.get("total_partitions")),
                 number(row.get("total_files")), number(row.get("total_records")), instant(row.get("started_at")),
@@ -341,7 +341,7 @@ public class MigrationStateRepository {
     private static FileRecord file(Map<String, Object> row) {
         return new FileRecord((String) row.get("run_id"), (String) row.get("file_key"),
                 (String) row.get("source_path"), integer(row.get("spec_id")), (String) row.get("partition_path"),
-                (String) row.get("destination_path"), number(row.get("physical_records")),
+                (String) row.get("target_path"), number(row.get("physical_records")),
                 FileRecord.Status.valueOf((String) row.get("status")), nullableLong(row.get("records_written")),
                 nullableLong(row.get("records_deleted")), integer(row.get("attempts")),
                 (String) row.get("last_error"), instant(row.get("updated_at")));

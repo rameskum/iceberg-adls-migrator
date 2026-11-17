@@ -5,10 +5,10 @@ import org.jspecify.annotations.Nullable;
 
 /**
  * Outcome of one {@link FileTask}. A file counts as completed only when {@link #succeeded()} is true, which
- * means its destination blob was published.
+ * means its target blob was published.
  *
  * @param physicalRowsRead rows read from the source file before deletes
- * @param recordsWritten   live rows written to the destination file
+ * @param recordsWritten   live rows written to the target file
  * @param error            why the file failed; {@code null} when it succeeded
  */
 public record FileResult(FileTask task, boolean succeeded, long physicalRowsRead, long recordsWritten,

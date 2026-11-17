@@ -12,7 +12,7 @@ import org.jspecify.annotations.Nullable;
  * @param recordsDeleted  rows dropped by deletes; {@code null} until the file completes
  */
 public record FileRecord(String runId, String fileKey, String sourcePath, int specId, String partitionPath,
-                         String destinationPath, long physicalRecords, Status status, @Nullable Long recordsWritten,
+                         String targetPath, long physicalRecords, Status status, @Nullable Long recordsWritten,
                          @Nullable Long recordsDeleted, int attempts, @Nullable String lastError, Instant updatedAt) {
 
     /** Only outcomes are recorded: every state write is a Delta commit, and published blobs prove completion. */

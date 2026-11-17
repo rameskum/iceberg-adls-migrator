@@ -9,8 +9,7 @@ import com.azure.storage.blob.BlobServiceClientBuilder;
 import com.azure.storage.blob.models.BlobItem;
 import com.tds.pde.migration.state.MigrationStateRepository;
 import com.tds.pde.migration.state.RunRecord;
-import com.tds.pde.migration.testing.H2State;
-import com.tds.pde.migration.testing.H2StateStore;
+import com.tds.pde.migration.testing.InMemoryState;
 import com.tds.pde.migration.testing.IcebergTestTables;
 import com.tds.pde.migration.testing.ParquetOutput;
 import com.tds.pde.migration.testing.TestProperties;
@@ -48,13 +47,13 @@ class AzureEndToEndTest {
     Path tempDir;
 
     private final String connectionString = System.getenv("AZURE_STORAGE_TEST_CONNECTION_STRING");
-    private final H2StateStore stateStore = new H2StateStore();
+    private final InMemoryState.Store stateStore = new InMemoryState.Store();
     private BlobContainerClient container;
     private Path datasets;
 
     @BeforeEach
     void createSourceTableDatasetsAndContainer() throws IOException {
-        H2State.current = stateStore;
+        InMemoryState.current = stateStore;
         container = new BlobServiceClientBuilder().connectionString(connectionString).buildClient()
                 .createBlobContainer("migrator-e2e-" + UUID.randomUUID());
         Table table = IcebergTestTables.create(tempDir.resolve("orders"), SCHEMA,
@@ -62,11 +61,11 @@ class AzureEndToEndTest {
         IcebergTestTables.append(table, rows("EU", 0, 3000));
         IcebergTestTables.append(table, rows("US", 3000, 2000));
         datasets = Files.createDirectory(tempDir.resolve("datasets"));
-        Files.writeString(datasets.resolve("orders-src.json"), """
-                { "datasetId": "orders-src", "format": "ICEBERG", "location": "%s" }
+        Files.writeString(datasets.resolve("0e9c1a5e-4c55-4a3b-9f3e-1c2a7d8b6e01.json"), """
+                { "datasetId": "0e9c1a5e-4c55-4a3b-9f3e-1c2a7d8b6e01", "format": "ICEBERG", "location": "%s" }
                 """.formatted(table.location()));
-        Files.writeString(datasets.resolve("orders-adls.json"), """
-                { "datasetId": "orders-adls", "format": "PARQUET",
+        Files.writeString(datasets.resolve("5b2f7d3c-8a1e-4f6b-b2d4-9c0e3a7f1d02.json"), """
+                { "datasetId": "5b2f7d3c-8a1e-4f6b-b2d4-9c0e3a7f1d02", "format": "PARQUET",
                   "location": "abfss://%s@%s.dfs.core.windows.net/sales/orders" }
                 """.formatted(container.getBlobContainerName(), container.getAccountName()));
     }
@@ -88,7 +87,7 @@ class AzureEndToEndTest {
                         .standaloneRows().size())
                 .sum();
         assertThat(rows).isEqualTo(5000);
-        RunRecord run = repository().findLatestRunForDestination(
+        RunRecord run = repository().findLatestRunForTarget(
                 "abfss://" + container.getBlobContainerName() + "@" + container.getAccountName()
                         + ".dfs.core.windows.net/sales/orders").orElseThrow();
         assertThat(run.status()).isEqualTo(RunRecord.Status.SUCCEEDED);
@@ -104,20 +103,20 @@ class AzureEndToEndTest {
 
     private void migrate(String... extraArgs) {
         List<String> args = new java.util.ArrayList<>(List.of(
-                "--migration.source.dataset-id=orders-src",
-                "--migration.destination.dataset-id=orders-adls",
+                "--migration.source.dataset-id=0e9c1a5e-4c55-4a3b-9f3e-1c2a7d8b6e01",
+                "--migration.target.dataset-id=5b2f7d3c-8a1e-4f6b-b2d4-9c0e3a7f1d02",
                 "--migration.datasets.stub-directory=" + datasets,
-                "--migration.state.run-table=" + H2StateStore.RUN_TABLE,
-                "--migration.state.file-table=" + H2StateStore.FILE_TABLE,
+                "--migration.state.run-table=" + "migration_run",
+                "--migration.state.file-table=" + "migration_file",
                 "--migration.azure.auth.mode=CONNECTION_STRING",
                 "--migration.azure.auth.connection-string=" + connectionString,
-                "--migration.state.control-table=" + H2StateStore.CONTROL_TABLE));
+                "--migration.state.control-table=" + "migration_control"));
         args.addAll(List.of(extraArgs));
-        MigrationApplication.run(new SpringApplication(MigrationApplication.class, H2State.class), args.toArray(String[]::new));
+        MigrationApplication.run(new SpringApplication(MigrationApplication.class, InMemoryState.class), args.toArray(String[]::new));
     }
 
     private MigrationStateRepository repository() {
-        return new MigrationStateRepository(stateStore.executor(), TestProperties.defaults());
+        return stateStore;
     }
 
     private static List<Record> rows(String region, long firstId, int count) {

@@ -1,8 +1,8 @@
-package com.tds.pde.migration.destination.azure;
+package com.tds.pde.migration.target.azure;
 
 import com.azure.storage.blob.specialized.BlobLeaseClient;
-import com.tds.pde.migration.destination.LockUnavailableException;
-import com.tds.pde.migration.destination.RunLock;
+import com.tds.pde.migration.target.LockUnavailableException;
+import com.tds.pde.migration.target.RunLock;
 import java.time.Duration;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;

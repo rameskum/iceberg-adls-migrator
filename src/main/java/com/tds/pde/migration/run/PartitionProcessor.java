@@ -1,8 +1,8 @@
 package com.tds.pde.migration.run;
 
 import com.tds.pde.migration.config.MigrationProperties.Failure.OnFileFailure;
-import com.tds.pde.migration.destination.LockUnavailableException;
-import com.tds.pde.migration.destination.RunLock;
+import com.tds.pde.migration.target.LockUnavailableException;
+import com.tds.pde.migration.target.RunLock;
 import com.tds.pde.migration.processing.DataFileProcessor;
 import com.tds.pde.migration.processing.FileResult;
 import com.tds.pde.migration.processing.FileTask;
@@ -49,7 +49,7 @@ public final class PartitionProcessor {
             if (published.containsKey(fileKey)) {
                 continue;
             }
-            // Never write while another run may hold the destination.
+            // Never write while another run may hold the target.
             lock.ensureHeld();
             FileResult result = fileProcessor.process(run.context(), task, progress::onFileProgress);
             if (result.succeeded()) {

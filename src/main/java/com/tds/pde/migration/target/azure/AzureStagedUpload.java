@@ -1,11 +1,11 @@
-package com.tds.pde.migration.destination.azure;
+package com.tds.pde.migration.target.azure;
 
 import com.azure.core.util.BinaryData;
 import com.azure.core.util.Context;
 import com.azure.storage.blob.models.BlobHttpHeaders;
 import com.azure.storage.blob.options.BlockBlobCommitBlockListOptions;
 import com.azure.storage.blob.specialized.BlockBlobClient;
-import com.tds.pde.migration.destination.StagedUpload;
+import com.tds.pde.migration.target.StagedUpload;
 import java.io.IOException;
 import java.io.OutputStream;
 import java.nio.ByteBuffer;
@@ -123,7 +123,7 @@ final class AzureStagedUpload implements StagedUpload {
         private void stageBufferedBlock() throws IOException {
             if (blockIds.size() == MAX_BLOCKS) {
                 throw new IOException(blobName() + " would exceed Azure's " + MAX_BLOCKS
-                        + " blocks per blob; increase migration.destination.block-size");
+                        + " blocks per blob; increase migration.target.block-size");
             }
             String blockId = nextBlockId();
             try {

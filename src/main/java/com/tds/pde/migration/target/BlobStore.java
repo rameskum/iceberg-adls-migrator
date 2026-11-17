@@ -1,11 +1,11 @@
-package com.tds.pde.migration.destination;
+package com.tds.pde.migration.target;
 
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 
 /**
- * Destination object storage, addressed by blob name within the destination container.
+ * Target object storage, addressed by blob name within the target container.
  */
 public interface BlobStore {
 

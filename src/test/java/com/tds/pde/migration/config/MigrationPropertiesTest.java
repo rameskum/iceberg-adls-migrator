@@ -24,8 +24,8 @@ class MigrationPropertiesTest {
 
     private static Map<String, String> required() {
         Map<String, String> values = new HashMap<>();
-        values.put("migration.source.dataset-id", "orders-src");
-        values.put("migration.destination.dataset-id", "orders-adls");
+        values.put("migration.source.dataset-id", "0e9c1a5e-4c55-4a3b-9f3e-1c2a7d8b6e01");
+        values.put("migration.target.dataset-id", "5b2f7d3c-8a1e-4f6b-b2d4-9c0e3a7f1d02");
         values.put("migration.datasets.stub-directory", "/tmp/datasets");
         values.put("migration.state.control-table", "main.migration.migration_control");
         values.put("migration.state.run-table", "main.migration.migration_run");
@@ -45,8 +45,8 @@ class MigrationPropertiesTest {
         assertThat(properties.runId()).isNull();
         assertThat(properties.source().snapshotId()).isNull();
         assertThat(properties.source().hadoop()).isEmpty();
-        assertThat(properties.destination().clean()).isFalse();
-        assertThat(properties.destination().blockSize()).isEqualTo(DataSize.ofMegabytes(8));
+        assertThat(properties.target().clean()).isFalse();
+        assertThat(properties.target().blockSize()).isEqualTo(DataSize.ofMegabytes(8));
         assertThat(properties.datasets().stubDirectory()).isEqualTo(Path.of("/tmp/datasets"));
         assertThat(properties.azure().auth().mode()).isEqualTo(AuthMode.MANAGED_IDENTITY);
         assertThat(properties.azure().auth().clientId()).isNull();
@@ -125,12 +125,12 @@ class MigrationPropertiesTest {
     @Test
     void rejectsBlockSizeAboveAzureLimit() {
         Map<String, String> values = required();
-        values.put("migration.destination.block-size", "5GB");
+        values.put("migration.target.block-size", "5GB");
 
         assertThatThrownBy(() -> bind(values))
                 .isInstanceOf(BindException.class)
                 .rootCause()
-                .hasMessageContaining("migration.destination.block-size");
+                .hasMessageContaining("migration.target.block-size");
     }
 
     @Test
@@ -155,9 +155,9 @@ class MigrationPropertiesTest {
                 .bindOrCreate("migration", MigrationProperties.class);
 
         assertThat(properties.runId()).isNull();
-        assertThat(properties.source().datasetId()).isEqualTo("orders-src");
+        assertThat(properties.source().datasetId()).isEqualTo(java.util.UUID.fromString("0e9c1a5e-4c55-4a3b-9f3e-1c2a7d8b6e01"));
         assertThat(properties.source().hadoop()).containsEntry("fs.defaultFS", "hdfs://namenode:8020");
-        assertThat(properties.destination().datasetId()).isEqualTo("orders-adls");
+        assertThat(properties.target().datasetId()).isEqualTo(java.util.UUID.fromString("5b2f7d3c-8a1e-4f6b-b2d4-9c0e3a7f1d02"));
         assertThat(properties.state().controlTable()).isEqualTo("main.migration.migration_control");
         assertThat(properties.state().runTable()).isEqualTo("main.migration.migration_run");
         assertThat(properties.state().fileTable()).isEqualTo("main.migration.migration_file");

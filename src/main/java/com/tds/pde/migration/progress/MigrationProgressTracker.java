@@ -10,7 +10,7 @@ import lombok.extern.slf4j.Slf4j;
  * Keeps and reports the three independent progress measures of a run: records, data files and partitions.
  *
  * <p>Counts only become final ("committed") when the work behind them is: records and files once their
- * destination file is published, partitions once all their files are. Rows of the file being processed are
+ * target file is published, partitions once all their files are. Rows of the file being processed are
  * reported separately as in flight and are dropped if that file fails.
  *
  * <p>Record totals are physical source rows (before deletes), the only total Iceberg metadata gives exactly

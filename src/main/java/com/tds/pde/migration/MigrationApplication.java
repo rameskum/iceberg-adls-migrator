@@ -21,9 +21,23 @@ public class MigrationApplication {
     }
 
     static void run(SpringApplication application, String... args) {
+        requireKnownOptions(args);
         application.setRegisterShutdownHook(false);
         try (ConfigurableApplicationContext context = application.run(args)) {
             context.getBean(MigrationOrchestrator.class).migrate();
+        }
+    }
+
+    /**
+     * Spring Boot silently ignores arguments it does not bind, so a mistyped job parameter would quietly change what
+     * runs. Unknown keys under {@code migration.} are rejected by the configuration binding; this rejects the rest.
+     */
+    private static void requireKnownOptions(String... args) {
+        for (String arg : args) {
+            if (!arg.matches("--(migration|spring|logging)\\.[^=\\s]+=.*")) {
+                throw new IllegalArgumentException("Unknown job parameter '" + arg + "': expected --migration.<name>=<value>"
+                        + " (or --spring.* / --logging.*), e.g. --migration.source.dataset-id=<uuid>");
+            }
         }
     }
 }

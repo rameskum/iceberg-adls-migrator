@@ -1,4 +1,4 @@
-package com.tds.pde.migration.destination.azure;
+package com.tds.pde.migration.target.azure;
 
 import static org.apache.iceberg.types.Types.NestedField.required;
 import static org.assertj.core.api.Assertions.assertThat;
@@ -7,12 +7,12 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import com.azure.storage.blob.BlobContainerClient;
 import com.azure.storage.blob.BlobServiceClientBuilder;
 import com.azure.storage.blob.specialized.BlobLeaseClientBuilder;
-import com.tds.pde.migration.destination.BlobStore;
-import com.tds.pde.migration.destination.DestinationPathResolver;
-import com.tds.pde.migration.destination.LockUnavailableException;
-import com.tds.pde.migration.destination.ParquetDataWriter;
-import com.tds.pde.migration.destination.RunLock;
-import com.tds.pde.migration.destination.StagedUpload;
+import com.tds.pde.migration.target.BlobStore;
+import com.tds.pde.migration.target.TargetPathResolver;
+import com.tds.pde.migration.target.LockUnavailableException;
+import com.tds.pde.migration.target.ParquetDataWriter;
+import com.tds.pde.migration.target.RunLock;
+import com.tds.pde.migration.target.StagedUpload;
 import com.tds.pde.migration.processing.DataFileProcessor;
 import com.tds.pde.migration.processing.FileProgressListener;
 import com.tds.pde.migration.processing.FileResult;
@@ -75,7 +75,7 @@ class AzureBlobStoreTest {
         factory = new AzureBlobStoreFactory(TestProperties.bind(Map.of(
                 "migration.azure.auth.mode", "CONNECTION_STRING",
                 "migration.azure.auth.connection-string", connectionString,
-                "migration.destination.block-size", BLOCK_SIZE + "B")), null);
+                "migration.target.block-size", BLOCK_SIZE + "B")), null);
     }
 
     @AfterEach
@@ -204,7 +204,7 @@ class AzureBlobStoreTest {
         }).toList());
         MigrationPlan plan = new IcebergMetadataReader(new Configuration()).plan(table.location(), null);
         SourceFile source = plan.partitions().getFirst().files().getFirst();
-        FileTask task = new FileTask(source, "", new DestinationPathResolver().resolve(location.prefix(), "",
+        FileTask task = new FileTask(source, "", new TargetPathResolver().resolve(location.prefix(), "",
                 source.location()));
         BlobStore store = factory.open(location);
         DataFileProcessor processor = new DataFileProcessor(
@@ -214,8 +214,8 @@ class AzureBlobStoreTest {
                 FileProgressListener.NONE);
 
         assertThat(result.succeeded()).isTrue();
-        assertThat(store.metadata(task.destination()).orElseThrow()).containsEntry("records_written", "5000");
-        ParquetOutput output = ParquetOutput.of(container.getBlobClient(task.destination()).downloadContent().toBytes(),
+        assertThat(store.metadata(task.target()).orElseThrow()).containsEntry("records_written", "5000");
+        ParquetOutput output = ParquetOutput.of(container.getBlobClient(task.target()).downloadContent().toBytes(),
                 tempDir);
         assertThat(output.standaloneRows()).hasSize(5000);
         assertThat(output.records(schema).getLast().getField("note")).isEqualTo("order-4999");

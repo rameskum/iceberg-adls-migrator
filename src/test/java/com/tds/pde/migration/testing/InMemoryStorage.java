@@ -1,6 +1,6 @@
 package com.tds.pde.migration.testing;
 
-import com.tds.pde.migration.destination.BlobStoreFactory;
+import com.tds.pde.migration.target.BlobStoreFactory;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Primary;
 

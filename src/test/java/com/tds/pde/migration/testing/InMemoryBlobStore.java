@@ -1,9 +1,9 @@
 package com.tds.pde.migration.testing;
 
-import com.tds.pde.migration.destination.BlobStore;
-import com.tds.pde.migration.destination.LockUnavailableException;
-import com.tds.pde.migration.destination.RunLock;
-import com.tds.pde.migration.destination.StagedUpload;
+import com.tds.pde.migration.target.BlobStore;
+import com.tds.pde.migration.target.LockUnavailableException;
+import com.tds.pde.migration.target.RunLock;
+import com.tds.pde.migration.target.StagedUpload;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.OutputStream;

@@ -1,15 +1,15 @@
-package com.tds.pde.migration.destination;
+package com.tds.pde.migration.target;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
 import org.junit.jupiter.api.Test;
 
-class DestinationPathResolverTest {
+class TargetPathResolverTest {
 
     private static final String SOURCE =
             "hdfs://nn/warehouse/orders/data/region=EU/00000-5-a1b2c3d4-0001-00001.parquet";
 
-    private final DestinationPathResolver resolver = new DestinationPathResolver();
+    private final TargetPathResolver resolver = new TargetPathResolver();
 
     @Test
     void encodesThePartitionAndSourceFileInAFlatFileName() {
@@ -50,7 +50,7 @@ class DestinationPathResolverTest {
         String name = resolver.resolve("p", longPartition, SOURCE);
 
         String fileName = name.substring("p/".length());
-        assertThat(fileName).hasSize(DestinationPathResolver.MAX_FILE_NAME_LENGTH);
+        assertThat(fileName).hasSize(TargetPathResolver.MAX_FILE_NAME_LENGTH);
         assertThat(fileName).startsWith("comment=xxx").contains("__00000-5-a1b2c3d4-0001-00001-").endsWith(".parquet");
     }
 

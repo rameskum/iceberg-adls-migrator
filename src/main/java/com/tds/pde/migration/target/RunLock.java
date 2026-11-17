@@ -1,7 +1,7 @@
-package com.tds.pde.migration.destination;
+package com.tds.pde.migration.target;
 
 /**
- * Exclusive lock guaranteeing a single active run per destination. It renews itself while held and expires on
+ * Exclusive lock guaranteeing a single active run per target. It renews itself while held and expires on
  * its own if the holder dies, so a crashed run never blocks the next one for long.
  */
 public interface RunLock extends AutoCloseable {

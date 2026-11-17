@@ -1,4 +1,4 @@
-package com.tds.pde.migration.destination;
+package com.tds.pde.migration.target;
 
 public class LockUnavailableException extends RuntimeException {
 

@@ -17,41 +17,41 @@ import org.springframework.stereotype.Component;
 
 /**
  * Decides the output schema: the source schema unchanged, except top-level uuid or time columns that the
- * destination dataset declares as {@code string}. Any other difference fails the run before anything is written.
+ * target dataset declares as {@code string}. Any other difference fails the run before anything is written.
  */
 @Slf4j
 @Component
-public class DestinationSchemaValidator {
+public class TargetSchemaValidator {
 
-    public OutputSchema resolve(Schema source, @Nullable DatasetSchema destination) {
-        OutputSchema output = destination == null
+    public OutputSchema resolve(Schema source, @Nullable DatasetSchema target) {
+        OutputSchema output = target == null
                 ? OutputSchema.unchanged(source)
-                : validate(source, destination);
+                : validate(source, target);
         warnAboutSparkUnreadableColumns(output.schema());
         return output;
     }
 
-    private static OutputSchema validate(Schema source, DatasetSchema destination) {
+    private static OutputSchema validate(Schema source, DatasetSchema target) {
         List<String> problems = new ArrayList<>();
         Map<String, DatasetSchema.Field> declared = new LinkedHashMap<>();
-        for (DatasetSchema.Field field : destination.fields()) {
+        for (DatasetSchema.Field field : target.fields()) {
             if (declared.putIfAbsent(field.name(), field) != null) {
-                problems.add("destination declares column '" + field.name() + "' more than once");
+                problems.add("target declares column '" + field.name() + "' more than once");
             }
         }
 
         List<Types.NestedField> outputColumns = new ArrayList<>();
         Set<Integer> conversions = new HashSet<>();
         for (Types.NestedField column : source.columns()) {
-            DatasetSchema.Field target = declared.remove(column.name());
-            if (target == null) {
-                problems.add("column '" + column.name() + "' is missing from the destination schema");
+            DatasetSchema.Field declaredColumn = declared.remove(column.name());
+            if (declaredColumn == null) {
+                problems.add("column '" + column.name() + "' is missing from the target schema");
                 continue;
             }
             String sourceType = SparkTypes.render(column.type());
             String targetType;
             try {
-                targetType = SparkTypes.normalize(target.type());
+                targetType = SparkTypes.normalize(declaredColumn.type());
             } catch (IllegalArgumentException e) {
                 problems.add("column '" + column.name() + "': " + e.getMessage());
                 continue;
@@ -65,22 +65,22 @@ public class DestinationSchemaValidator {
                         Types.StringType.get(), column.doc()));
             } else {
                 problems.add("column '" + column.name() + "' is " + sourceType + " in the source but "
-                        + targetType + " in the destination");
+                        + targetType + " in the target");
             }
 
-            if (column.isOptional() && !target.nullable()) {
-                problems.add("column '" + column.name() + "' is nullable in the source but not in the destination");
+            if (column.isOptional() && !declaredColumn.nullable()) {
+                problems.add("column '" + column.name() + "' is nullable in the source but not in the target");
             }
         }
         declared.keySet().forEach(name ->
-                problems.add("destination column '" + name + "' does not exist in the source"));
+                problems.add("target column '" + name + "' does not exist in the source"));
 
         if (!problems.isEmpty()) {
-            throw new MigrationFailedException("Destination schema does not match the source schema; nothing was "
+            throw new MigrationFailedException("Target schema does not match the source schema; nothing was "
                     + "written:\n  " + String.join("\n  ", problems));
         }
         if (!conversions.isEmpty()) {
-            log.info("Columns converted to string as the destination schema declares: columns={}",
+            log.info("Columns converted to string as the target schema declares: columns={}",
                     conversions.stream().map(id -> source.findColumnName(id)).sorted().toList());
         }
         return new OutputSchema(new Schema(outputColumns, source.identifierFieldIds()), conversions);
@@ -96,7 +96,7 @@ public class DestinationSchemaValidator {
                 .map(column -> column.name() + ":" + column.type())
                 .toList();
         if (!unreadable.isEmpty()) {
-            log.warn("Output columns Databricks/Spark cannot read; declare them as string in the destination schema "
+            log.warn("Output columns Databricks/Spark cannot read; declare them as string in the target schema "
                     + "to convert them: columns={}", unreadable);
         }
     }

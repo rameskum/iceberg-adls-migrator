@@ -13,12 +13,12 @@ import org.apache.iceberg.Schema;
 import org.apache.iceberg.types.Types;
 import org.junit.jupiter.api.Test;
 
-class DestinationSchemaValidatorTest {
+class TargetSchemaValidatorTest {
 
-    private final DestinationSchemaValidator validator = new DestinationSchemaValidator();
+    private final TargetSchemaValidator validator = new TargetSchemaValidator();
 
     @Test
-    void keepsTheSourceSchemaWhenTheDestinationDeclaresNone() {
+    void keepsTheSourceSchemaWhenTheTargetDeclaresNone() {
         Schema source = new Schema(required(1, "id", Types.UUIDType.get()));
 
         OutputSchema output = validator.resolve(source, null);
@@ -67,7 +67,7 @@ class DestinationSchemaValidatorTest {
     }
 
     @Test
-    void convertsUuidAndTimeColumnsTheDestinationDeclaresAsString() {
+    void convertsUuidAndTimeColumnsTheTargetDeclaresAsString() {
         Schema source = new Schema(
                 required(1, "id", Types.UUIDType.get()),
                 optional(2, "opened_at", Types.TimeType.get()),
@@ -102,10 +102,10 @@ class DestinationSchemaValidatorTest {
                 new Field("extra", "string", true))))
                 .isInstanceOf(MigrationFailedException.class)
                 .hasMessageContaining("nothing was written")
-                .hasMessageContaining("column 'id' is bigint in the source but int in the destination")
-                .hasMessageContaining("column 'region' is nullable in the source but not in the destination")
-                .hasMessageContaining("column 'note' is missing from the destination schema")
-                .hasMessageContaining("destination column 'extra' does not exist in the source");
+                .hasMessageContaining("column 'id' is bigint in the source but int in the target")
+                .hasMessageContaining("column 'region' is nullable in the source but not in the target")
+                .hasMessageContaining("column 'note' is missing from the target schema")
+                .hasMessageContaining("target column 'extra' does not exist in the source");
     }
 
     @Test
@@ -114,7 +114,7 @@ class DestinationSchemaValidatorTest {
 
         assertThatThrownBy(() -> validator.resolve(source, schema(new Field("id", "string", false))))
                 .isInstanceOf(MigrationFailedException.class)
-                .hasMessageContaining("column 'id' is bigint in the source but string in the destination");
+                .hasMessageContaining("column 'id' is bigint in the source but string in the target");
     }
 
     @Test
@@ -141,7 +141,7 @@ class DestinationSchemaValidatorTest {
         assertThatThrownBy(() -> validator.resolve(source, schema(
                 new Field("id", "bigint", false), new Field("id", "bigint", false))))
                 .isInstanceOf(MigrationFailedException.class)
-                .hasMessageContaining("destination declares column 'id' more than once");
+                .hasMessageContaining("target declares column 'id' more than once");
     }
 
     private static DatasetSchema schema(Field... fields) {

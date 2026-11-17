@@ -1,4 +1,4 @@
-package com.tds.pde.migration.destination;
+package com.tds.pde.migration.target;
 
 import com.tds.pde.migration.schema.OutputSchema;
 import java.time.LocalTime;
@@ -12,7 +12,7 @@ import org.apache.iceberg.types.Types;
 
 /**
  * Turns rows as read (which may carry extra columns needed to apply deletes) into rows of the output schema,
- * converting the columns the destination declares as string.
+ * converting the columns the target declares as string.
  *
  * <p>Reuses one output record: the Parquet writer copies each value as soon as a row is added.
  */

@@ -21,7 +21,7 @@ import org.apache.parquet.hadoop.metadata.ParquetMetadata;
 import org.apache.parquet.hadoop.util.HadoopInputFile;
 import org.apache.parquet.schema.MessageType;
 
-/** Reads a destination file back, both through Iceberg and through plain parquet-hadoop with no Iceberg. */
+/** Reads a target file back, both through Iceberg and through plain parquet-hadoop with no Iceberg. */
 public final class ParquetOutput {
 
     private final Path file;

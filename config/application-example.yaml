@@ -2,18 +2,18 @@
 #   --spring.config.additional-location=/Volumes/<catalog>/<schema>/<volume>/iceberg-adls-migrator/application.yaml
 # Secrets never go in this file: they come from environment variables backed by {{secrets/<scope>/<key>}}.
 migration:
-  # Empty: start a new run, or auto-resume the latest unfinished run for the same source and destination.
+  # Empty: start a new run, or auto-resume the latest unfinished run for the same source and target.
   run-id:
   source:
-    dataset-id: orders-src
+    dataset-id: 0e9c1a5e-4c55-4a3b-9f3e-1c2a7d8b6e01
     # Optional: migrate this snapshot instead of the current one.
     snapshot-id:
     # Copied verbatim into the Hadoop Configuration. Quote dotted keys so their case is kept.
     hadoop:
       "[fs.defaultFS]": hdfs://namenode:8020
-  destination:
-    dataset-id: orders-adls
-    # true: delete everything under the destination location and start a fresh run.
+  target:
+    dataset-id: 5b2f7d3c-8a1e-4f6b-b2d4-9c0e3a7f1d02
+    # true: delete everything under the target location and start a fresh run.
     clean: false
     block-size: 8MB
   datasets:

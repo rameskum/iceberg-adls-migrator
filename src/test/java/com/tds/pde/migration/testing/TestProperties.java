@@ -14,12 +14,12 @@ public final class TestProperties {
 
     public static MigrationProperties bind(Map<String, String> overrides) {
         Map<String, String> values = new HashMap<>();
-        values.put("migration.source.dataset-id", "orders-src");
-        values.put("migration.destination.dataset-id", "orders-adls");
+        values.put("migration.source.dataset-id", "0e9c1a5e-4c55-4a3b-9f3e-1c2a7d8b6e01");
+        values.put("migration.target.dataset-id", "5b2f7d3c-8a1e-4f6b-b2d4-9c0e3a7f1d02");
         values.put("migration.datasets.stub-directory", "/tmp/datasets");
-        values.put("migration.state.control-table", H2StateStore.CONTROL_TABLE);
-        values.put("migration.state.run-table", H2StateStore.RUN_TABLE);
-        values.put("migration.state.file-table", H2StateStore.FILE_TABLE);
+        values.put("migration.state.control-table", "migration_control");
+        values.put("migration.state.run-table", "migration_run");
+        values.put("migration.state.file-table", "migration_file");
         values.putAll(overrides);
         return new Binder(new MapConfigurationPropertySource(values))
                 .bindOrCreate("migration", MigrationProperties.class);

@@ -6,13 +6,12 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.assertj.core.api.Assertions.tuple;
 
-import com.tds.pde.migration.destination.BlobStore;
+import com.tds.pde.migration.target.BlobStore;
 import com.tds.pde.migration.state.ControlRecord;
 import com.tds.pde.migration.state.FileRecord;
 import com.tds.pde.migration.state.MigrationStateRepository;
 import com.tds.pde.migration.state.RunRecord;
-import com.tds.pde.migration.testing.H2State;
-import com.tds.pde.migration.testing.H2StateStore;
+import com.tds.pde.migration.testing.InMemoryState;
 import com.tds.pde.migration.testing.IcebergTestTables;
 import com.tds.pde.migration.testing.InMemoryBlobStore;
 import com.tds.pde.migration.testing.InMemoryStorage;
@@ -48,7 +47,7 @@ import org.springframework.boot.test.system.CapturedOutput;
 import org.springframework.boot.test.system.OutputCaptureExtension;
 
 /**
- * Runs the whole application, as the Databricks launcher does, against real Iceberg tables, an H2 state store
+ * Runs the whole application, as the Databricks launcher does, against real Iceberg tables, an in-memory state store
  * and the in-memory blob store.
  */
 @ExtendWith(OutputCaptureExtension.class)
@@ -65,22 +64,22 @@ class MigrationEndToEndTest {
     @TempDir
     Path tempDir;
 
-    private final H2StateStore stateStore = new H2StateStore();
+    private final InMemoryState.Store stateStore = new InMemoryState.Store();
     private Table table;
     private Path datasets;
 
     @BeforeEach
     void createSourceTableAndDatasets() throws IOException {
         InMemoryStorage.current = blobStore;
-        H2State.current = stateStore;
+        InMemoryState.current = stateStore;
         table = IcebergTestTables.create(tempDir.resolve("orders"), SCHEMA,
                 PartitionSpec.builderFor(SCHEMA).identity("region").build());
         datasets = Files.createDirectory(tempDir.resolve("datasets"));
-        Files.writeString(datasets.resolve("orders-src.json"), """
-                { "datasetId": "orders-src", "format": "ICEBERG", "location": "%s" }
+        Files.writeString(datasets.resolve("0e9c1a5e-4c55-4a3b-9f3e-1c2a7d8b6e01.json"), """
+                { "datasetId": "0e9c1a5e-4c55-4a3b-9f3e-1c2a7d8b6e01", "format": "ICEBERG", "location": "%s" }
                 """.formatted(table.location()));
-        Files.writeString(datasets.resolve("orders-adls.json"), """
-                { "datasetId": "orders-adls", "format": "PARQUET",
+        Files.writeString(datasets.resolve("5b2f7d3c-8a1e-4f6b-b2d4-9c0e3a7f1d02.json"), """
+                { "datasetId": "5b2f7d3c-8a1e-4f6b-b2d4-9c0e3a7f1d02", "format": "PARQUET",
                   "location": "abfss://data@salesacct.dfs.core.windows.net/%s",
                   "schema": { "fields": [ { "name": "id", "type": "long", "nullable": false },
                                           { "name": "region", "type": "string" } ] } }
@@ -229,14 +228,17 @@ class MigrationEndToEndTest {
         blobStore.failWritesTo(name -> name.contains("region=EU"));
         assertThatThrownBy(this::migrate).isInstanceOf(MigrationFailedException.class);
         String apacBlob = dataBlobs().getFirst();
-        stateStore.jdbc().sql("UPDATE migration_file SET status = 'PENDING', records_written = NULL "
-                + "WHERE destination_path = ?").param(apacBlob).update();
+        FileRecord apac = files(onlyRun()).stream().filter(file -> file.targetPath().equals(apacBlob))
+                .findFirst().orElseThrow();
+        stateStore.replaceFile(new FileRecord(apac.runId(), apac.fileKey(), apac.sourcePath(), apac.specId(),
+                apac.partitionPath(), apac.targetPath(), apac.physicalRecords(), FileRecord.Status.PENDING, null,
+                null, apac.attempts(), null, apac.updatedAt()));
         blobStore.stopFailing();
 
         migrate();
 
         assertThat(blobStore.uploadsStarted(apacBlob)).isEqualTo(1);
-        assertThat(files(onlyRun())).filteredOn(file -> file.destinationPath().equals(apacBlob)).singleElement()
+        assertThat(files(onlyRun())).filteredOn(file -> file.targetPath().equals(apacBlob)).singleElement()
                 .satisfies(file -> {
                     assertThat(file.status()).isEqualTo(FileRecord.Status.COMPLETED);
                     assertThat(file.recordsWritten()).isEqualTo(1);
@@ -244,7 +246,7 @@ class MigrationEndToEndTest {
     }
 
     @Test
-    void refusesToRunWhileAnotherRunHoldsTheDestination() {
+    void refusesToRunWhileAnotherRunHoldsTheTarget() {
         appendFiles();
         blobStore.acquireLock(LOCK);
 
@@ -287,7 +289,7 @@ class MigrationEndToEndTest {
     }
 
     @Test
-    void refusesANewRunIntoADestinationThatAlreadyHoldsOutput() {
+    void refusesANewRunIntoATargetThatAlreadyHoldsOutput() {
         appendFiles();
         migrate();
 
@@ -303,7 +305,7 @@ class MigrationEndToEndTest {
         String firstRun = onlyRun().runId();
         IcebergTestTables.append(table, rows("US", 500, 2));
 
-        migrate("--migration.destination.clean=true");
+        migrate("--migration.target.clean=true");
 
         assertThat(runs()).extracting(RunRecord::runId, RunRecord::status).contains(
                 tuple(firstRun, RunRecord.Status.SUPERSEDED));
@@ -314,14 +316,14 @@ class MigrationEndToEndTest {
 
     private void migrate(String... extraArgs) {
         List<String> args = new ArrayList<>(List.of(
-                "--migration.source.dataset-id=orders-src",
-                "--migration.destination.dataset-id=orders-adls",
+                "--migration.source.dataset-id=0e9c1a5e-4c55-4a3b-9f3e-1c2a7d8b6e01",
+                "--migration.target.dataset-id=5b2f7d3c-8a1e-4f6b-b2d4-9c0e3a7f1d02",
                 "--migration.datasets.stub-directory=" + datasets,
-                "--migration.state.run-table=" + H2StateStore.RUN_TABLE,
-                "--migration.state.file-table=" + H2StateStore.FILE_TABLE,
-                "--migration.state.control-table=" + H2StateStore.CONTROL_TABLE));
+                "--migration.state.run-table=" + "migration_run",
+                "--migration.state.file-table=" + "migration_file",
+                "--migration.state.control-table=" + "migration_control"));
         args.addAll(List.of(extraArgs));
-        MigrationApplication.run(new SpringApplication(MigrationApplication.class, InMemoryStorage.class, H2State.class),
+        MigrationApplication.run(new SpringApplication(MigrationApplication.class, InMemoryStorage.class, InMemoryState.class),
                 args.toArray(String[]::new));
     }
 
@@ -352,8 +354,7 @@ class MigrationEndToEndTest {
     }
 
     private List<RunRecord> runs() {
-        return stateStore.jdbc().sql("SELECT run_id FROM migration_run").query(String.class).list().stream()
-                .map(id -> repository().findRun(id).orElseThrow()).toList();
+        return stateStore.runs();
     }
 
     private RunRecord onlyRun() {
@@ -379,7 +380,7 @@ class MigrationEndToEndTest {
     }
 
     private MigrationStateRepository repository() {
-        return new MigrationStateRepository(stateStore.executor(), TestProperties.defaults());
+        return stateStore;
     }
 
     private List<String> dataBlobs() {

@@ -3,12 +3,12 @@ package com.tds.pde.migration.run;
 import com.tds.pde.migration.MigrationFailedException;
 import com.tds.pde.migration.config.MigrationProperties;
 import com.tds.pde.migration.dataset.DatasetDescriptor;
-import com.tds.pde.migration.destination.BlobStore;
-import com.tds.pde.migration.destination.DestinationPathResolver;
-import com.tds.pde.migration.destination.azure.AzureLocation;
+import com.tds.pde.migration.target.BlobStore;
+import com.tds.pde.migration.target.TargetPathResolver;
+import com.tds.pde.migration.target.azure.AzureLocation;
 import com.tds.pde.migration.processing.FileTask;
 import com.tds.pde.migration.processing.RunContext;
-import com.tds.pde.migration.schema.DestinationSchemaValidator;
+import com.tds.pde.migration.schema.TargetSchemaValidator;
 import com.tds.pde.migration.schema.OutputSchema;
 import com.tds.pde.migration.source.IcebergMetadataReader;
 import com.tds.pde.migration.source.MigrationPlan;
@@ -39,18 +39,18 @@ import org.springframework.stereotype.Component;
  * Decides which run to execute and records it before any file is processed:
  * <ul>
  *   <li>{@code migration.run-id} set: resume that run;</li>
- *   <li>{@code migration.destination.clean=true}: delete the destination, supersede earlier runs, start fresh;</li>
- *   <li>otherwise: resume the latest unfinished run for this source and destination, or start a new run into an
- *       empty destination.</li>
+ *   <li>{@code migration.target.clean=true}: delete the target, supersede earlier runs, start fresh;</li>
+ *   <li>otherwise: resume the latest unfinished run for this source and target, or start a new run into an
+ *       empty target.</li>
  * </ul>
- * The caller must hold the destination's run lock.
+ * The caller must hold the target's run lock.
  */
 @Slf4j
 @Component
 @RequiredArgsConstructor
 public class RunStarter {
 
-    /** Folder under the destination prefix holding migration bookkeeping; Spark ignores names starting with '_'. */
+    /** Folder under the target prefix holding migration bookkeeping; Spark ignores names starting with '_'. */
     public static final String BOOKKEEPING_FOLDER = "_migration";
 
     private static final DateTimeFormatter RUN_ID_TIME =
@@ -61,50 +61,50 @@ public class RunStarter {
     private final MigrationProperties properties;
     private final MigrationStateRepository state;
     private final IcebergMetadataReader metadataReader;
-    private final DestinationSchemaValidator schemaValidator;
-    private final DestinationPathResolver pathResolver;
+    private final TargetSchemaValidator schemaValidator;
+    private final TargetPathResolver pathResolver;
 
-    public StartedRun start(DatasetDescriptor source, DatasetDescriptor destination, AzureLocation location,
+    public StartedRun start(DatasetDescriptor source, DatasetDescriptor target, AzureLocation location,
                             BlobStore blobStore) {
         String runId = properties.runId();
-        boolean clean = properties.destination().clean();
+        boolean clean = properties.target().clean();
         if (clean && runId != null) {
-            throw new MigrationFailedException("migration.destination.clean starts a new run and cannot be combined "
+            throw new MigrationFailedException("migration.target.clean starts a new run and cannot be combined "
                     + "with migration.run-id=" + runId);
         }
 
         if (runId != null) {
             RunRecord run = state.findRun(runId)
                     .orElseThrow(() -> new MigrationFailedException("Run " + runId + " does not exist"));
-            requireSameDatasets(run, source, destination);
+            requireSameDatasets(run, source, target);
             if (run.status() == RunRecord.Status.SUPERSEDED) {
                 throw new MigrationFailedException("Run " + runId + " was superseded by a clean start; its output "
                         + "is gone. Start a new run instead.");
             }
-            return resume(run, source, destination, location);
+            return resume(run, source, target, location);
         }
         if (clean) {
-            clean(location, blobStore, destination.location());
-            return startNew(source, destination, location);
+            clean(location, blobStore, target.location());
+            return startNew(source, target, location);
         }
-        Optional<RunRecord> unfinished = state.findLatestUnfinishedRun(source.location(), destination.location());
+        Optional<RunRecord> unfinished = state.findLatestUnfinishedRun(source.location(), target.location());
         if (unfinished.isPresent()) {
-            log.info("Resuming the latest unfinished run for this source and destination: runId={} status={} "
+            log.info("Resuming the latest unfinished run for this source and target: runId={} status={} "
                     + "startedAt={}", unfinished.get().runId(), unfinished.get().status(), unfinished.get().startedAt());
-            return resume(unfinished.get(), source, destination, location);
+            return resume(unfinished.get(), source, target, location);
         }
-        requireEmptyDestination(location, blobStore, destination.location());
-        return startNew(source, destination, location);
+        requireEmptyTarget(location, blobStore, target.location());
+        return startNew(source, target, location);
     }
 
-    private StartedRun startNew(DatasetDescriptor source, DatasetDescriptor destination, AzureLocation location) {
+    private StartedRun startNew(DatasetDescriptor source, DatasetDescriptor target, AzureLocation location) {
         MigrationPlan plan = metadataReader.plan(source.location(), properties.source().snapshotId());
-        OutputSchema outputSchema = schemaValidator.resolve(plan.table().schema(), destination.schema());
+        OutputSchema outputSchema = schemaValidator.resolve(plan.table().schema(), target.schema());
         String runId = newRunId();
         List<PartitionTasks> partitions = tasks(plan, location);
 
-        RunRecord run = new RunRecord(runId, RunRecord.Status.RUNNING, source.datasetId(), destination.datasetId(),
-                source.location(), destination.location(), plan.table().snapshotId(),
+        RunRecord run = new RunRecord(runId, RunRecord.Status.RUNNING, source.datasetId(), target.datasetId(),
+                source.location(), target.location(), plan.table().snapshotId(),
                 SchemaParser.toJson(plan.table().schema()), SchemaParser.toJson(outputSchema.schema()),
                 plan.totalPartitions(), plan.totalFiles(), plan.totalRecords(), Instant.now(), null, null);
         state.insertRun(run);
@@ -116,7 +116,7 @@ public class RunStarter {
                 files.stream().collect(Collectors.toMap(FileRecord::fileKey, Function.identity())), false);
     }
 
-    private StartedRun resume(RunRecord run, DatasetDescriptor source, DatasetDescriptor destination,
+    private StartedRun resume(RunRecord run, DatasetDescriptor source, DatasetDescriptor target,
                               AzureLocation location) {
         Long configuredSnapshot = properties.source().snapshotId();
         if (configuredSnapshot != null && !configuredSnapshot.equals(run.snapshotId())) {
@@ -126,17 +126,17 @@ public class RunStarter {
         MigrationPlan plan = metadataReader.plan(source.location(), run.snapshotId());
         if (!Objects.equals(plan.table().snapshotId(), run.snapshotId())) {
             throw new MigrationFailedException("Run " + run.runId() + " started on a table that had never been "
-                    + "written; it has been written since. Start over with migration.destination.clean=true.");
+                    + "written; it has been written since. Start over with migration.target.clean=true.");
         }
 
         // Read and write with exactly the schemas the run started with, so every file of the run looks the same.
         Schema readSchema = SchemaParser.fromJson(run.sourceSchemaJson());
         plan = plan.withTable(plan.table().withSchema(readSchema));
-        OutputSchema outputSchema = schemaValidator.resolve(readSchema, destination.schema());
+        OutputSchema outputSchema = schemaValidator.resolve(readSchema, target.schema());
         if (!outputSchema.schema().sameSchema(SchemaParser.fromJson(run.outputSchemaJson()))) {
-            throw new MigrationFailedException("The destination schema changed since run " + run.runId()
+            throw new MigrationFailedException("The target schema changed since run " + run.runId()
                     + " started, so resuming would mix file schemas. Restore it, or start over with "
-                    + "migration.destination.clean=true.");
+                    + "migration.target.clean=true.");
         }
 
         List<PartitionTasks> partitions = tasks(plan, location);
@@ -150,18 +150,18 @@ public class RunStarter {
                 run.snapshotId(), run.status(), completed, stored.size());
 
         RunRecord running = new RunRecord(run.runId(), RunRecord.Status.RUNNING, run.sourceDatasetId(),
-                run.destinationDatasetId(), run.sourceTableLocation(), run.destinationLocation(), run.snapshotId(),
+                run.targetDatasetId(), run.sourceTableLocation(), run.targetLocation(), run.snapshotId(),
                 run.sourceSchemaJson(), run.outputSchemaJson(), run.totalPartitions(), run.totalFiles(),
                 run.totalRecords(), run.startedAt(), null, null);
         return new StartedRun(running, new RunContext(run.runId(), plan.table(), outputSchema), plan, partitions,
                 stored, true);
     }
 
-    private static void requireSameDatasets(RunRecord run, DatasetDescriptor source, DatasetDescriptor destination) {
+    private static void requireSameDatasets(RunRecord run, DatasetDescriptor source, DatasetDescriptor target) {
         if (!run.sourceTableLocation().equals(source.location())
-                || !run.destinationLocation().equals(destination.location())) {
+                || !run.targetLocation().equals(target.location())) {
             throw new MigrationFailedException("Run " + run.runId() + " copies " + run.sourceTableLocation() + " to "
-                    + run.destinationLocation() + ", not " + source.location() + " to " + destination.location());
+                    + run.targetLocation() + ", not " + source.location() + " to " + target.location());
         }
     }
 
@@ -176,7 +176,7 @@ public class RunStarter {
                 FileRecord record = stored.get(task.source().key());
                 if (record == null) {
                     mismatches.add("not recorded: " + task.source().location());
-                } else if (!record.destinationPath().equals(task.destination())
+                } else if (!record.targetPath().equals(task.target())
                         || record.physicalRecords() != task.source().recordCount()) {
                     mismatches.add("changed: " + task.source().location());
                 }
@@ -187,40 +187,40 @@ public class RunStarter {
         }
         if (!mismatches.isEmpty()) {
             throw new MigrationFailedException("Snapshot " + run.snapshotId() + " no longer yields the files run "
-                    + run.runId() + " recorded; start over with migration.destination.clean=true:\n  "
+                    + run.runId() + " recorded; start over with migration.target.clean=true:\n  "
                     + String.join("\n  ", mismatches.subList(0, Math.min(mismatches.size(), MAX_LISTED_MISMATCHES))));
         }
     }
 
-    private void requireEmptyDestination(AzureLocation location, BlobStore blobStore, String destinationLocation) {
+    private void requireEmptyTarget(AzureLocation location, BlobStore blobStore, String targetLocation) {
         List<BlobStore.BlobInfo> existing = outputBlobs(location, blobStore);
         if (existing.isEmpty()) {
             return;
         }
-        String owner = state.findLatestRunForDestination(destinationLocation)
+        String owner = state.findLatestRunForTarget(targetLocation)
                 .map(run -> " written by run " + run.runId() + " (" + run.status() + ")")
                 .orElse("");
-        throw new MigrationFailedException("Destination " + location + " already holds " + existing.size()
+        throw new MigrationFailedException("Target " + location + " already holds " + existing.size()
                 + " files" + owner + ". Resume that run with migration.run-id, or start over with "
-                + "migration.destination.clean=true; nothing was written.");
+                + "migration.target.clean=true; nothing was written.");
     }
 
-    private void clean(AzureLocation location, BlobStore blobStore, String destinationLocation) {
+    private void clean(AzureLocation location, BlobStore blobStore, String targetLocation) {
         if (location.isContainerRoot()) {
             throw new MigrationFailedException("Refusing to clean " + location
-                    + ": it is a whole container. Point the destination at a folder within it.");
+                    + ": it is a whole container. Point the target at a folder within it.");
         }
         List<BlobStore.BlobInfo> blobs = outputBlobs(location, blobStore);
         long bytes = blobs.stream().mapToLong(BlobStore.BlobInfo::size).sum();
-        log.warn("Cleaning destination before a fresh run: destination={} blobs={} bytes={}", location, blobs.size(),
+        log.warn("Cleaning target before a fresh run: target={} blobs={} bytes={}", location, blobs.size(),
                 bytes);
         blobs.forEach(blob -> blobStore.delete(blob.name()));
-        long superseded = state.supersedeRuns(destinationLocation);
-        log.info("Destination cleaned: destination={} deletedBlobs={} supersededRuns={}", location, blobs.size(),
+        long superseded = state.supersedeRuns(targetLocation);
+        log.info("Target cleaned: target={} deletedBlobs={} supersededRuns={}", location, blobs.size(),
                 superseded);
     }
 
-    /** Everything under the destination prefix except the migration's own bookkeeping, such as the lock. */
+    /** Everything under the target prefix except the migration's own bookkeeping, such as the lock. */
     private static List<BlobStore.BlobInfo> outputBlobs(AzureLocation location, BlobStore blobStore) {
         String prefix = location.isContainerRoot() ? "" : location.prefix() + "/";
         String bookkeeping = prefix + BOOKKEEPING_FOLDER + "/";
@@ -246,7 +246,7 @@ public class RunStarter {
         for (PartitionTasks partition : partitions) {
             for (FileTask task : partition.files()) {
                 files.add(new FileRecord(runId, task.source().key(), task.source().location(),
-                        partition.partition().specId(), partition.partition().path(), task.destination(),
+                        partition.partition().specId(), partition.partition().path(), task.target(),
                         task.source().recordCount(), FileRecord.Status.PENDING, null, null, 0, null, now));
             }
         }
