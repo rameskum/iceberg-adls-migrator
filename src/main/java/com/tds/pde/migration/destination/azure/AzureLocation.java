@@ -11,9 +11,10 @@ import java.util.regex.Pattern;
  * <p>Without hierarchical namespace the account is plain Blob Storage, so the data is written through the
  * {@code blob} endpoint rather than {@code dfs}.
  *
- * @param prefix path within the container, without leading or trailing slash; empty for the container root
+ * @param prefix   path within the container, without leading or trailing slash; empty for the container root
+ * @param location the location as given, for messages
  */
-public record AzureLocation(String account, String container, String prefix, String blobEndpoint) {
+public record AzureLocation(String account, String container, String prefix, String blobEndpoint, String location) {
 
     private static final Pattern HOST = Pattern.compile("([a-z0-9]{3,24})\\.dfs\\.(.+)");
 
@@ -46,7 +47,7 @@ public record AzureLocation(String account, String container, String prefix, Str
         }
         String account = matcher.group(1);
         return new AzureLocation(account, container, prefix,
-                "https://" + account + ".blob." + matcher.group(2));
+                "https://" + account + ".blob." + matcher.group(2), location);
     }
 
     public boolean isContainerRoot() {
@@ -60,6 +61,6 @@ public record AzureLocation(String account, String container, String prefix, Str
 
     @Override
     public String toString() {
-        return blobEndpoint + "/" + container + (prefix.isEmpty() ? "" : "/" + prefix);
+        return location;
     }
 }

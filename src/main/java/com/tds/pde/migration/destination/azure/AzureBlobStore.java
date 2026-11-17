@@ -73,7 +73,11 @@ public final class AzureBlobStore implements BlobStore {
         } catch (BlobStorageException e) {
             // Already there from an earlier run, possibly leased right now; the lease decides.
             if (e.getStatusCode() != 409) {
-                throw e;
+                // The first request of a run: turn configuration and permission problems into a readable message.
+                throw new IllegalStateException("Cannot write to container '" + container.getBlobContainerName()
+                        + "' of " + container.getAccountUrl() + ": " + e.getStatusCode() + " " + e.getErrorCode()
+                        + (e.getErrorCode() == BlobErrorCode.CONTAINER_NOT_FOUND
+                        ? " (create the container first)" : ""), e);
             }
         }
         BlobLeaseClient lease = new BlobLeaseClientBuilder().blobClient(blob).buildClient();

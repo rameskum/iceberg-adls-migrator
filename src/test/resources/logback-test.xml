@@ -9,6 +9,10 @@
     <logger name="org.apache.hadoop.util.NativeCodeLoader" level="ERROR"/>
     <logger name="org.apache.iceberg.formats.FormatModelRegistry" level="WARN"/>
     <logger name="com.azure.core.http.jdk.httpclient.JdkHttpClient" level="ERROR"/>
+    <logger name="org.apache.iceberg.hadoop.HadoopTables" level="WARN"/>
+    <logger name="org.apache.iceberg.SnapshotScan" level="WARN"/>
+    <logger name="org.apache.iceberg.metrics.LoggingMetricsReporter" level="WARN"/>
+    <logger name="org.apache.hadoop.io.compress.CodecPool" level="WARN"/>
 
     <root level="INFO">
         <appender-ref ref="CONSOLE"/>

@@ -5,18 +5,18 @@ import com.azure.storage.blob.BlobServiceClient;
 import com.azure.storage.blob.BlobServiceClientBuilder;
 import com.tds.pde.migration.config.MigrationProperties;
 import com.tds.pde.migration.destination.BlobStore;
+import com.tds.pde.migration.destination.BlobStoreFactory;
 import java.time.Duration;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.stereotype.Component;
 
 /**
- * Opens the {@link BlobStore} for a destination location, which is only known once the destination dataset has
- * been looked up.
+ * Opens Azure Blob Storage for a destination location.
  */
 @Slf4j
 @Component
-public class AzureBlobStoreFactory {
+public class AzureBlobStoreFactory implements BlobStoreFactory {
 
     private final MigrationProperties.Azure.Auth auth;
     private final int blockSize;
@@ -28,6 +28,7 @@ public class AzureBlobStoreFactory {
         this.credential = credential;
     }
 
+    @Override
     public BlobStore open(AzureLocation location) {
         return open(location, LeaseRunLock.RENEW_INTERVAL);
     }

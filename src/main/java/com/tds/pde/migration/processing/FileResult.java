@@ -27,4 +27,17 @@ public record FileResult(FileTask task, boolean succeeded, long physicalRowsRead
     public long recordsDeleted() {
         return physicalRowsRead - recordsWritten;
     }
+
+    /** Why the file failed, including the root cause that library wrappers tend to hide; {@code null} if it did not. */
+    public @Nullable String failureReason() {
+        return error == null ? null : describe(error);
+    }
+
+    static String describe(Throwable error) {
+        Throwable root = error;
+        while (root.getCause() != null && root.getCause() != root) {
+            root = root.getCause();
+        }
+        return root == error ? String.valueOf(error.getMessage()) : error.getMessage() + " (caused by " + root + ")";
+    }
 }

@@ -5,7 +5,10 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import com.tds.pde.migration.dataset.DatasetLookupException;
+import com.tds.pde.migration.testing.H2StateStore;
 import com.tds.pde.migration.testing.IcebergTestTables;
+import com.tds.pde.migration.testing.InMemoryBlobStore;
+import com.tds.pde.migration.testing.InMemoryStorage;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -20,15 +23,18 @@ import org.junit.jupiter.api.io.TempDir;
 import org.springframework.boot.SpringApplication;
 import org.springframework.context.event.ContextClosedEvent;
 
+/** The application lifecycle the Databricks launcher relies on: the context always closes and failures propagate. */
 class MigrationApplicationTest {
 
     @TempDir
     Path tempDir;
 
+    private final H2StateStore stateStore = new H2StateStore();
     private Path datasets;
 
     @BeforeEach
     void createSourceTableAndDescriptors() throws IOException {
+        InMemoryStorage.current = new InMemoryBlobStore();
         Table table = IcebergTestTables.create(tempDir.resolve("orders"),
                 new Schema(required(1, "id", Types.LongType.get())), PartitionSpec.unpartitioned());
         datasets = Files.createDirectory(tempDir.resolve("datasets"));
@@ -46,19 +52,19 @@ class MigrationApplicationTest {
                 "--migration.source.dataset-id=" + sourceDatasetId,
                 "--migration.destination.dataset-id=orders-adls",
                 "--migration.datasets.stub-directory=" + datasets,
-                "--migration.state.run-table=migration_run",
-                "--migration.state.file-table=migration_file",
-                "--spring.datasource.url=jdbc:h2:mem:application-test",
+                "--migration.state.run-table=" + H2StateStore.RUN_TABLE,
+                "--migration.state.file-table=" + H2StateStore.FILE_TABLE,
+                "--spring.datasource.url=" + stateStore.url(),
                 "--spring.datasource.driver-class-name=org.h2.Driver",
+                "--spring.datasource.username=sa",
         };
     }
 
     @Test
     void closesTheContextAfterASuccessfulMigration() {
         AtomicBoolean closed = new AtomicBoolean();
-        SpringApplication application = applicationTrackingClose(closed);
 
-        MigrationApplication.run(application, args("orders-src"));
+        MigrationApplication.run(applicationTrackingClose(closed), args("orders-src"));
 
         assertThat(closed).isTrue();
     }
@@ -66,9 +72,8 @@ class MigrationApplicationTest {
     @Test
     void closesTheContextAndRethrowsWhenTheMigrationFails() {
         AtomicBoolean closed = new AtomicBoolean();
-        SpringApplication application = applicationTrackingClose(closed);
 
-        assertThatThrownBy(() -> MigrationApplication.run(application, args("unknown-dataset")))
+        assertThatThrownBy(() -> MigrationApplication.run(applicationTrackingClose(closed), args("unknown-dataset")))
                 .isInstanceOf(MigrationFailedException.class)
                 .hasCauseInstanceOf(DatasetLookupException.class)
                 .hasMessageContaining("Dataset 'unknown-dataset' not found");
@@ -84,7 +89,7 @@ class MigrationApplicationTest {
     }
 
     private static SpringApplication applicationTrackingClose(AtomicBoolean closed) {
-        SpringApplication application = new SpringApplication(MigrationApplication.class);
+        SpringApplication application = new SpringApplication(MigrationApplication.class, InMemoryStorage.class);
         application.addListeners(event -> {
             if (event instanceof ContextClosedEvent) {
                 closed.set(true);

@@ -14,6 +14,7 @@ import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.function.Predicate;
 
 /**
  * Blob store fake with the same rules as Azure block blobs: staged bytes are invisible until a commit, a commit
@@ -28,12 +29,30 @@ public final class InMemoryBlobStore implements BlobStore {
     private final List<String> aborted = new CopyOnWriteArrayList<>();
     private final Set<String> locks = ConcurrentHashMap.newKeySet();
     private final Set<String> lostLocks = ConcurrentHashMap.newKeySet();
+    private final Map<String, Integer> uploadsStarted = new ConcurrentHashMap<>();
     private volatile long failWritesAfterBytes = -1;
+    private volatile Predicate<String> failWritesTo = name -> false;
     private volatile boolean failNextCommit;
 
     /** Makes every upload throw once it has received more than {@code bytes} bytes. */
     public void failWritesAfter(long bytes) {
         this.failWritesAfterBytes = bytes;
+    }
+
+    /** Makes uploads to matching blob names throw on their first write. */
+    public void failWritesTo(Predicate<String> blobNames) {
+        this.failWritesTo = blobNames;
+    }
+
+    public void stopFailing() {
+        this.failWritesAfterBytes = -1;
+        this.failWritesTo = name -> false;
+        this.failNextCommit = false;
+    }
+
+    /** How many uploads were started for the blob, committed or not. */
+    public int uploadsStarted(String blobName) {
+        return uploadsStarted.getOrDefault(blobName, 0);
     }
 
     public void failNextCommit() {
@@ -54,6 +73,7 @@ public final class InMemoryBlobStore implements BlobStore {
 
     @Override
     public StagedUpload startUpload(String blobName) {
+        uploadsStarted.merge(blobName, 1, Integer::sum);
         return new Upload(blobName);
     }
 
@@ -136,7 +156,8 @@ public final class InMemoryBlobStore implements BlobStore {
 
                 @Override
                 public void write(byte[] b, int off, int len) throws IOException {
-                    if (failWritesAfterBytes >= 0 && staged.size() + len > failWritesAfterBytes) {
+                    if (failWritesTo.test(blobName)
+                            || failWritesAfterBytes >= 0 && staged.size() + len > failWritesAfterBytes) {
                         throw new IOException("injected write failure for " + blobName);
                     }
                     staged.write(b, off, len);

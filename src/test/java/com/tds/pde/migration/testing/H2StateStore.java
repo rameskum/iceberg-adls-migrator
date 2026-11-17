@@ -16,12 +16,17 @@ public final class H2StateStore {
     public static final String RUN_TABLE = "migration_run";
     public static final String FILE_TABLE = "migration_file";
 
+    private final String url = "jdbc:h2:mem:" + UUID.randomUUID() + ";DB_CLOSE_DELAY=-1";
     private final DataSource dataSource;
 
     public H2StateStore() {
-        this.dataSource = new DriverManagerDataSource(
-                "jdbc:h2:mem:" + UUID.randomUUID() + ";DB_CLOSE_DELAY=-1", "sa", "");
+        this.dataSource = new DriverManagerDataSource(url, "sa", "");
         createTables(JdbcClient.create(dataSource));
+    }
+
+    /** JDBC URL of this database, for an application context to connect to the same tables. */
+    public String url() {
+        return url;
     }
 
     public DataSource dataSource() {

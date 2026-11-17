@@ -63,22 +63,23 @@ public class DataFileProcessor {
                 }
                 physicalRowsRead = rows.physicalRowsRead();
             }
+            // Still in flight: the rows only count once the file is published.
+            listener.onProgress(physicalRowsRead, recordsWritten);
             verify(task, physicalRowsRead, recordsWritten, appender.metrics().recordCount());
 
             upload.commit(PublishedFile.metadata(run, task, physicalRowsRead, recordsWritten));
             published = true;
-            listener.onProgress(physicalRowsRead, recordsWritten);
 
             Duration duration = Duration.ofNanos(System.nanoTime() - started);
             log.info("Source file completed: source={} destination={} recordsWritten={} recordsDeleted={} "
-                            + "duration={}", task.source().location(), task.destination(), recordsWritten,
-                    physicalRowsRead - recordsWritten, duration);
+                            + "durationMs={}", task.source().location(), task.destination(), recordsWritten,
+                    physicalRowsRead - recordsWritten, duration.toMillis());
             return FileResult.succeeded(task, physicalRowsRead, recordsWritten, duration);
         } catch (Exception e) {
             Duration duration = Duration.ofNanos(System.nanoTime() - started);
             log.error("Source file failed, nothing was published: source={} destination={} "
                             + "recordsWrittenBeforeFailure={} reason={}", task.source().location(), task.destination(),
-                    recordsWritten, describe(e), e);
+                    recordsWritten, FileResult.describe(e), e);
             return FileResult.failed(task, physicalRowsRead, recordsWritten, duration, e);
         } finally {
             if (!published) {
@@ -100,15 +101,6 @@ public class DataFileProcessor {
             throw new IllegalStateException("Wrote " + recordsWritten + " rows but the finished file holds "
                     + recordsInFile);
         }
-    }
-
-    /** The message plus the root cause's, since library wrappers often hide the actual reason. */
-    private static String describe(Exception e) {
-        Throwable root = e;
-        while (root.getCause() != null && root.getCause() != root) {
-            root = root.getCause();
-        }
-        return root == e ? String.valueOf(e.getMessage()) : e.getMessage() + " (caused by " + root + ")";
     }
 
     private static Map<String, String> footerMetadata(RunContext run, FileTask task) {

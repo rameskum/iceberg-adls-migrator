@@ -23,3 +23,8 @@ logging:
     org.apache.iceberg.formats.FormatModelRegistry: warn
     # Warns on every request that it leaves Content-Length to java.net.http, which sets it from the body anyway
     com.azure.core.http.jdk.httpclient.JdkHttpClient: error
+    # Per-scan and per-file chatter that repeats what the migration's own log lines already say
+    org.apache.iceberg.hadoop.HadoopTables: warn
+    org.apache.iceberg.SnapshotScan: warn
+    org.apache.iceberg.metrics.LoggingMetricsReporter: warn
+    org.apache.hadoop.io.compress.CodecPool: warn
