@@ -13,6 +13,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.TreeMap;
+import java.util.stream.Collectors;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.hadoop.conf.Configuration;
@@ -75,7 +76,7 @@ public class IcebergMetadataReader {
         if (snapshot == null) {
             log.info("Source table identified: table={} formatVersion={} snapshotId=none (table has never been written)",
                     tableLocation, formatVersion);
-            return MigrationPlan.empty(new SourceTable(tableLocation, formatVersion, null, table.schema(),
+            return MigrationPlan.empty(new SourceTable(tableLocation, formatVersion, null, null, table.schema(),
                     table.schema(), table.io(), nameMapping));
         }
 
@@ -89,8 +90,8 @@ public class IcebergMetadataReader {
                 tableLocation, formatVersion, snapshot.snapshotId(), Instant.ofEpochMilli(snapshot.timestampMillis()),
                 snapshot.operation(), schema.schemaId(), schema.columns().size(), nameMapping != null);
 
-        SourceTable source = new SourceTable(tableLocation, formatVersion, snapshot.snapshotId(), schema,
-                table.schema(), table.io(), nameMapping);
+        SourceTable source = new SourceTable(tableLocation, formatVersion, snapshot.snapshotId(),
+                Instant.ofEpochMilli(snapshot.timestampMillis()), schema, table.schema(), table.io(), nameMapping);
         return planFiles(table, scan, source);
     }
 
@@ -121,6 +122,7 @@ public class IcebergMetadataReader {
         Set<String> deleteFiles = new HashSet<>();
         long totalRecords = 0;
         long totalFiles = 0;
+        long totalBytes = 0;
 
         // planFiles (unlike planTasks) yields exactly one task per data file, never split.
         try (CloseableIterable<FileScanTask> tasks = scan.planFiles()) {
@@ -143,6 +145,7 @@ public class IcebergMetadataReader {
                                 key -> new ArrayList<>())
                         .add(new SourceFile(task));
                 totalRecords += file.recordCount();
+                totalBytes += file.fileSizeInBytes();
                 totalFiles++;
             }
         } catch (IOException e) {
@@ -161,14 +164,17 @@ public class IcebergMetadataReader {
             partitions.add(new PlannedPartition(key.specId(), key.path(), files));
         });
 
-        filesByPartition.keySet().stream().map(PartitionKey::specId).distinct().forEach(specId ->
-                log.info("Partition spec in use: specId={} fields={}", specId, table.specs().get(specId).fields()));
+        String partitionSpecs = filesByPartition.keySet().stream().map(PartitionKey::specId).distinct()
+                .map(specId -> specId + ":" + table.specs().get(specId).fields())
+                .collect(Collectors.joining(" "));
+        log.info("Partition specs in use: {}", partitionSpecs);
         if (!deleteFiles.isEmpty()) {
             log.warn("Source snapshot has row-level deletes; they are applied while copying: snapshotId={} "
                     + "deleteFiles={}", source.snapshotId(), deleteFiles.size());
         }
 
-        return new MigrationPlan(source, partitions, totalRecords, totalFiles, deleteFiles.size());
+        return new MigrationPlan(source, partitions, totalRecords, totalFiles, deleteFiles.size(), totalBytes,
+                partitionSpecs);
     }
 
     /** Partitions are told apart by spec as well as values: the same path under two specs is two partitions. */

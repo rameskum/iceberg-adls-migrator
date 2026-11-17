@@ -5,6 +5,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import com.tds.pde.migration.dataset.DatasetLookupException;
+import com.tds.pde.migration.testing.H2State;
 import com.tds.pde.migration.testing.H2StateStore;
 import com.tds.pde.migration.testing.IcebergTestTables;
 import com.tds.pde.migration.testing.InMemoryBlobStore;
@@ -35,6 +36,7 @@ class MigrationApplicationTest {
     @BeforeEach
     void createSourceTableAndDescriptors() throws IOException {
         InMemoryStorage.current = new InMemoryBlobStore();
+        H2State.current = stateStore;
         Table table = IcebergTestTables.create(tempDir.resolve("orders"),
                 new Schema(required(1, "id", Types.LongType.get())), PartitionSpec.unpartitioned());
         datasets = Files.createDirectory(tempDir.resolve("datasets"));
@@ -54,9 +56,7 @@ class MigrationApplicationTest {
                 "--migration.datasets.stub-directory=" + datasets,
                 "--migration.state.run-table=" + H2StateStore.RUN_TABLE,
                 "--migration.state.file-table=" + H2StateStore.FILE_TABLE,
-                "--spring.datasource.url=" + stateStore.url(),
-                "--spring.datasource.driver-class-name=org.h2.Driver",
-                "--spring.datasource.username=sa",
+                "--migration.state.control-table=" + H2StateStore.CONTROL_TABLE,
         };
     }
 
@@ -89,7 +89,7 @@ class MigrationApplicationTest {
     }
 
     private static SpringApplication applicationTrackingClose(AtomicBoolean closed) {
-        SpringApplication application = new SpringApplication(MigrationApplication.class, InMemoryStorage.class);
+        SpringApplication application = new SpringApplication(MigrationApplication.class, InMemoryStorage.class, H2State.class);
         application.addListeners(event -> {
             if (event instanceof ContextClosedEvent) {
                 closed.set(true);

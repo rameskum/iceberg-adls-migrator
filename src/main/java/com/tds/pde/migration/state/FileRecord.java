@@ -15,9 +15,9 @@ public record FileRecord(String runId, String fileKey, String sourcePath, int sp
                          String destinationPath, long physicalRecords, Status status, @Nullable Long recordsWritten,
                          @Nullable Long recordsDeleted, int attempts, @Nullable String lastError, Instant updatedAt) {
 
+    /** Only outcomes are recorded: every state write is a Delta commit, and published blobs prove completion. */
     public enum Status {
         PENDING,
-        IN_PROGRESS,
         COMPLETED,
         FAILED
     }

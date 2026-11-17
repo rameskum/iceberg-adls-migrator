@@ -17,8 +17,9 @@ public final class TestProperties {
         values.put("migration.source.dataset-id", "orders-src");
         values.put("migration.destination.dataset-id", "orders-adls");
         values.put("migration.datasets.stub-directory", "/tmp/datasets");
-        values.put("migration.state.run-table", "migration_run");
-        values.put("migration.state.file-table", "migration_file");
+        values.put("migration.state.control-table", H2StateStore.CONTROL_TABLE);
+        values.put("migration.state.run-table", H2StateStore.RUN_TABLE);
+        values.put("migration.state.file-table", H2StateStore.FILE_TABLE);
         values.putAll(overrides);
         return new Binder(new MapConfigurationPropertySource(values))
                 .bindOrCreate("migration", MigrationProperties.class);

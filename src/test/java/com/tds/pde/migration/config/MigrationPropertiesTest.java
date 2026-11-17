@@ -27,6 +27,7 @@ class MigrationPropertiesTest {
         values.put("migration.source.dataset-id", "orders-src");
         values.put("migration.destination.dataset-id", "orders-adls");
         values.put("migration.datasets.stub-directory", "/tmp/datasets");
+        values.put("migration.state.control-table", "main.migration.migration_control");
         values.put("migration.state.run-table", "main.migration.migration_run");
         values.put("migration.state.file-table", "main.migration.migration_file");
         return values;
@@ -54,8 +55,7 @@ class MigrationPropertiesTest {
         assertThat(properties.progress().logEveryRecords()).isEqualTo(100_000);
         assertThat(properties.progress().logEvery()).isEqualTo(Duration.ofSeconds(30));
         assertThat(properties.failure().onFileFailure()).isEqualTo(OnFileFailure.FAIL_FAST);
-        assertThat(properties.state().createTables()).isFalse();
-        assertThat(properties.state().writeRetries()).isEqualTo(3);
+        assertThat(properties.state().writeRetries()).isEqualTo(5);
     }
 
     @Test
@@ -158,6 +158,7 @@ class MigrationPropertiesTest {
         assertThat(properties.source().datasetId()).isEqualTo("orders-src");
         assertThat(properties.source().hadoop()).containsEntry("fs.defaultFS", "hdfs://namenode:8020");
         assertThat(properties.destination().datasetId()).isEqualTo("orders-adls");
+        assertThat(properties.state().controlTable()).isEqualTo("main.migration.migration_control");
         assertThat(properties.state().runTable()).isEqualTo("main.migration.migration_run");
         assertThat(properties.state().fileTable()).isEqualTo("main.migration.migration_file");
     }

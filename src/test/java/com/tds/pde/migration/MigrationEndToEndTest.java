@@ -7,9 +7,11 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.assertj.core.api.Assertions.tuple;
 
 import com.tds.pde.migration.destination.BlobStore;
+import com.tds.pde.migration.state.ControlRecord;
 import com.tds.pde.migration.state.FileRecord;
 import com.tds.pde.migration.state.MigrationStateRepository;
 import com.tds.pde.migration.state.RunRecord;
+import com.tds.pde.migration.testing.H2State;
 import com.tds.pde.migration.testing.H2StateStore;
 import com.tds.pde.migration.testing.IcebergTestTables;
 import com.tds.pde.migration.testing.InMemoryBlobStore;
@@ -70,6 +72,7 @@ class MigrationEndToEndTest {
     @BeforeEach
     void createSourceTableAndDatasets() throws IOException {
         InMemoryStorage.current = blobStore;
+        H2State.current = stateStore;
         table = IcebergTestTables.create(tempDir.resolve("orders"), SCHEMA,
                 PartitionSpec.builderFor(SCHEMA).identity("region").build());
         datasets = Files.createDirectory(tempDir.resolve("datasets"));
@@ -117,6 +120,26 @@ class MigrationEndToEndTest {
                 .sum();
         assertThat(rowsInOutput).isEqualTo(7);
         assertThat(blobStore.isLocked(LOCK)).isFalse();
+
+        ControlRecord control = control();
+        assertThat(control.status()).isEqualTo(RunRecord.Status.SUCCEEDED);
+        assertThat(control.lastRunId()).isEqualTo(run.runId());
+        assertThat(control.snapshotId()).isEqualTo(table.currentSnapshot().snapshotId());
+        assertThat(control.snapshotTimestamp()).isNotNull();
+        assertThat(control.formatVersion()).isEqualTo(2);
+        assertThat(control.partitionSpecs()).isEqualTo("0:[1000: region: identity(2)]");
+        assertThat(control.totalPartitions()).isEqualTo(3);
+        assertThat(control.totalFiles()).isEqualTo(4);
+        assertThat(control.totalRecords()).isEqualTo(9);
+        assertThat(control.totalDeleteFiles()).isEqualTo(1);
+        assertThat(control.totalBytes()).isPositive();
+        assertThat(control.completedPartitions()).isEqualTo(3);
+        assertThat(control.completedFiles()).isEqualTo(4);
+        assertThat(control.failedFiles()).isZero();
+        assertThat(control.recordsWritten()).isEqualTo(7);
+        assertThat(control.recordsDeleted()).isEqualTo(2);
+        assertThat(control.finishedAt()).isNotNull();
+        assertThat(control.error()).isNull();
     }
 
     @Test
@@ -149,6 +172,13 @@ class MigrationEndToEndTest {
         assertThat(files(run)).filteredOn(file -> file.status() == FileRecord.Status.FAILED).singleElement()
                 .satisfies(file -> assertThat(file.lastError()).contains("injected write failure"));
         assertThat(dataBlobs()).hasSize(1);
+        assertThat(control()).satisfies(control -> {
+            assertThat(control.status()).isEqualTo(RunRecord.Status.FAILED);
+            assertThat(control.error()).isEqualTo("1 of 3 files failed");
+            assertThat(control.completedFiles()).isEqualTo(1);
+            assertThat(control.failedFiles()).isEqualTo(1);
+            assertThat(control.completedPartitions()).isEqualTo(1);
+        });
     }
 
     @Test
@@ -184,6 +214,13 @@ class MigrationEndToEndTest {
         assertThat(blobStore.uploadsStarted(apacBlob)).isEqualTo(1);
         assertThat(files(run)).allSatisfy(file -> assertThat(file.status()).isEqualTo(FileRecord.Status.COMPLETED));
         assertThat(files(run)).extracting(FileRecord::attempts).containsExactlyInAnyOrder(1, 2, 1);
+        assertThat(control()).satisfies(control -> {
+            assertThat(control.status()).isEqualTo(RunRecord.Status.SUCCEEDED);
+            assertThat(control.lastRunId()).isEqualTo(run.runId());
+            assertThat(control.completedFiles()).isEqualTo(3);
+            assertThat(control.failedFiles()).isZero();
+            assertThat(control.error()).isNull();
+        });
     }
 
     @Test
@@ -192,7 +229,7 @@ class MigrationEndToEndTest {
         blobStore.failWritesTo(name -> name.contains("region=EU"));
         assertThatThrownBy(this::migrate).isInstanceOf(MigrationFailedException.class);
         String apacBlob = dataBlobs().getFirst();
-        stateStore.jdbc().sql("UPDATE migration_file SET status = 'IN_PROGRESS', records_written = NULL "
+        stateStore.jdbc().sql("UPDATE migration_file SET status = 'PENDING', records_written = NULL "
                 + "WHERE destination_path = ?").param(apacBlob).update();
         blobStore.stopFailing();
 
@@ -228,8 +265,25 @@ class MigrationEndToEndTest {
                 .isInstanceOf(MigrationFailedException.class)
                 .hasMessageContaining("Lost the run lock");
 
-        assertThat(onlyRun().status()).isEqualTo(RunRecord.Status.FAILED);
+        // The run's state is left to whichever run took the lock over.
+        assertThat(onlyRun().status()).isEqualTo(RunRecord.Status.RUNNING);
         assertThat(dataBlobs()).isEmpty();
+    }
+
+    @Test
+    void publishesNothingWhenTheLockIsLostWhileAFileIsBeingWritten() {
+        appendFiles();
+        // The check before the first file passes; the check just before publishing it fails.
+        blobStore.loseLockAfter(LOCK, 1);
+
+        assertThatThrownBy(this::migrate)
+                .isInstanceOf(MigrationFailedException.class)
+                .hasMessageContaining("Lost the run lock");
+
+        assertThat(dataBlobs()).isEmpty();
+        assertThat(blobStore.aborted()).hasSize(1);
+        assertThat(files(onlyRun())).extracting(FileRecord::status)
+                .containsOnly(FileRecord.Status.PENDING);
     }
 
     @Test
@@ -265,11 +319,9 @@ class MigrationEndToEndTest {
                 "--migration.datasets.stub-directory=" + datasets,
                 "--migration.state.run-table=" + H2StateStore.RUN_TABLE,
                 "--migration.state.file-table=" + H2StateStore.FILE_TABLE,
-                "--spring.datasource.url=" + stateStore.url(),
-                "--spring.datasource.driver-class-name=org.h2.Driver",
-                "--spring.datasource.username=sa"));
+                "--migration.state.control-table=" + H2StateStore.CONTROL_TABLE));
         args.addAll(List.of(extraArgs));
-        MigrationApplication.run(new SpringApplication(MigrationApplication.class, InMemoryStorage.class),
+        MigrationApplication.run(new SpringApplication(MigrationApplication.class, InMemoryStorage.class, H2State.class),
                 args.toArray(String[]::new));
     }
 
@@ -310,6 +362,11 @@ class MigrationEndToEndTest {
         return runs.getFirst();
     }
 
+    private ControlRecord control() {
+        return repository().findControl(table.location(),
+                "abfss://data@salesacct.dfs.core.windows.net/" + PREFIX).orElseThrow();
+    }
+
     private List<FileRecord> files(RunRecord run) {
         return repository().findFiles(run.runId());
     }
@@ -322,7 +379,7 @@ class MigrationEndToEndTest {
     }
 
     private MigrationStateRepository repository() {
-        return new MigrationStateRepository(stateStore.jdbc(), TestProperties.defaults());
+        return new MigrationStateRepository(stateStore.executor(), TestProperties.defaults());
     }
 
     private List<String> dataBlobs() {

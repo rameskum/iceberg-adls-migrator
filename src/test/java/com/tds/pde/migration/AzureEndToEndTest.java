@@ -9,6 +9,7 @@ import com.azure.storage.blob.BlobServiceClientBuilder;
 import com.azure.storage.blob.models.BlobItem;
 import com.tds.pde.migration.state.MigrationStateRepository;
 import com.tds.pde.migration.state.RunRecord;
+import com.tds.pde.migration.testing.H2State;
 import com.tds.pde.migration.testing.H2StateStore;
 import com.tds.pde.migration.testing.IcebergTestTables;
 import com.tds.pde.migration.testing.ParquetOutput;
@@ -53,6 +54,7 @@ class AzureEndToEndTest {
 
     @BeforeEach
     void createSourceTableDatasetsAndContainer() throws IOException {
+        H2State.current = stateStore;
         container = new BlobServiceClientBuilder().connectionString(connectionString).buildClient()
                 .createBlobContainer("migrator-e2e-" + UUID.randomUUID());
         Table table = IcebergTestTables.create(tempDir.resolve("orders"), SCHEMA,
@@ -109,15 +111,13 @@ class AzureEndToEndTest {
                 "--migration.state.file-table=" + H2StateStore.FILE_TABLE,
                 "--migration.azure.auth.mode=CONNECTION_STRING",
                 "--migration.azure.auth.connection-string=" + connectionString,
-                "--spring.datasource.url=" + stateStore.url(),
-                "--spring.datasource.driver-class-name=org.h2.Driver",
-                "--spring.datasource.username=sa"));
+                "--migration.state.control-table=" + H2StateStore.CONTROL_TABLE));
         args.addAll(List.of(extraArgs));
-        MigrationApplication.run(new SpringApplication(MigrationApplication.class), args.toArray(String[]::new));
+        MigrationApplication.run(new SpringApplication(MigrationApplication.class, H2State.class), args.toArray(String[]::new));
     }
 
     private MigrationStateRepository repository() {
-        return new MigrationStateRepository(stateStore.jdbc(), TestProperties.defaults());
+        return new MigrationStateRepository(stateStore.executor(), TestProperties.defaults());
     }
 
     private static List<Record> rows(String region, long firstId, int count) {

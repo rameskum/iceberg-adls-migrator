@@ -6,6 +6,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 
 import com.tds.pde.migration.state.MigrationStateRepository;
 import com.tds.pde.migration.state.RunRecord;
+import com.tds.pde.migration.testing.H2State;
 import com.tds.pde.migration.testing.H2StateStore;
 import com.tds.pde.migration.testing.InMemoryBlobStore;
 import com.tds.pde.migration.testing.InMemoryStorage;
@@ -83,6 +84,7 @@ class HdfsEndToEndTest {
         InMemoryBlobStore blobStore = new InMemoryBlobStore();
         InMemoryStorage.current = blobStore;
         H2StateStore stateStore = new H2StateStore();
+        H2State.current = stateStore;
         Path datasets = Files.createDirectory(tempDir.resolve("datasets"));
         Files.writeString(datasets.resolve("orders-src.json"), """
                 { "datasetId": "orders-src", "format": "ICEBERG", "location": "%s" }
@@ -92,18 +94,16 @@ class HdfsEndToEndTest {
                   "location": "abfss://data@salesacct.dfs.core.windows.net/sales/orders" }
                 """);
 
-        MigrationApplication.run(new SpringApplication(MigrationApplication.class, InMemoryStorage.class),
+        MigrationApplication.run(new SpringApplication(MigrationApplication.class, InMemoryStorage.class, H2State.class),
                 "--migration.source.dataset-id=orders-src",
                 "--migration.destination.dataset-id=orders-adls",
                 "--migration.source.hadoop[fs.defaultFS]=" + nameNode,
                 "--migration.datasets.stub-directory=" + datasets,
                 "--migration.state.run-table=" + H2StateStore.RUN_TABLE,
                 "--migration.state.file-table=" + H2StateStore.FILE_TABLE,
-                "--spring.datasource.url=" + stateStore.url(),
-                "--spring.datasource.driver-class-name=org.h2.Driver",
-                "--spring.datasource.username=sa");
+                "--migration.state.control-table=" + H2StateStore.CONTROL_TABLE);
 
-        RunRecord run = new MigrationStateRepository(stateStore.jdbc(), TestProperties.defaults())
+        RunRecord run = new MigrationStateRepository(stateStore.executor(), TestProperties.defaults())
                 .findLatestRunForDestination("abfss://data@salesacct.dfs.core.windows.net/sales/orders")
                 .orElseThrow();
         assertThat(run.status()).isEqualTo(RunRecord.Status.SUCCEEDED);

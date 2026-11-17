@@ -51,7 +51,7 @@ class RunStarterTest {
 
     private final H2StateStore stateStore = new H2StateStore();
     private final MigrationStateRepository state =
-            new MigrationStateRepository(stateStore.jdbc(), TestProperties.defaults());
+            new MigrationStateRepository(stateStore.executor(), TestProperties.defaults());
     private final InMemoryBlobStore blobStore = new InMemoryBlobStore();
     private Table table;
     private DatasetDescriptor source;

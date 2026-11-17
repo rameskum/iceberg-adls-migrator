@@ -1,11 +1,6 @@
 # Example environment configuration. Copy to a Unity Catalog Volume and pass it with
 #   --spring.config.additional-location=/Volumes/<catalog>/<schema>/<volume>/iceberg-adls-migrator/application.yaml
 # Secrets never go in this file: they come from environment variables backed by {{secrets/<scope>/<key>}}.
-spring:
-  datasource:
-    url: jdbc:databricks://<workspace-host>:443;httpPath=/sql/1.0/warehouses/<warehouse-id>;AuthMech=3;UID=token
-    password: ${DATABRICKS_SQL_TOKEN}
-
 migration:
   # Empty: start a new run, or auto-resume the latest unfinished run for the same source and destination.
   run-id:
@@ -39,8 +34,9 @@ migration:
   failure:
     # FAIL_FAST or CONTINUE
     on-file-failure: FAIL_FAST
+  # Delta tables shared by every migration job, created at startup through the cluster's Spark session.
   state:
+    control-table: main.migration.migration_control
     run-table: main.migration.migration_run
     file-table: main.migration.migration_file
-    create-tables: false
-    write-retries: 3
+    write-retries: 5

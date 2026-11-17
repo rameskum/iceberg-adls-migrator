@@ -3,15 +3,13 @@ package com.tds.pde.migration.dataset;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
-import com.tds.pde.migration.config.MigrationProperties;
+import com.tds.pde.migration.testing.TestProperties;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.Map;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
-import org.springframework.boot.context.properties.bind.Binder;
-import org.springframework.boot.context.properties.source.MapConfigurationPropertySource;
 
 class StubDatasetClientTest {
 
@@ -19,14 +17,8 @@ class StubDatasetClientTest {
     Path directory;
 
     private StubDatasetClient client() {
-        MigrationProperties properties = new Binder(new MapConfigurationPropertySource(Map.of(
-                "migration.source.dataset-id", "orders-src",
-                "migration.destination.dataset-id", "orders-adls",
-                "migration.datasets.stub-directory", directory.toString(),
-                "migration.state.run-table", "migration_run",
-                "migration.state.file-table", "migration_file")))
-                .bindOrCreate("migration", MigrationProperties.class);
-        return new StubDatasetClient(properties);
+        return new StubDatasetClient(
+                TestProperties.bind(Map.of("migration.datasets.stub-directory", directory.toString())));
     }
 
     @Test

@@ -8,7 +8,8 @@ account without hierarchical namespace). The destination is plain Parquet: no Ic
 - Rows are streamed one at a time; memory stays bounded however large the table is.
 - A file becomes visible at its destination only once it is complete and verified, so a failed or interrupted
   write can never be mistaken for a finished file.
-- Runs are recorded per file in a state store and can be resumed.
+- Every table migration, run and file is tracked in Delta tables written through the cluster's own Spark session,
+  and runs can be resumed.
 
 It runs on Databricks (DBR 18, Java 21) through the team's isolated launcher, and reads HDFS with the plain
 Iceberg and Hadoop Java clients, not with Spark.
@@ -39,7 +40,8 @@ Databricks job ──app_args──▶ team launcher (isolated class loader) ─
 | `IcebergDataReader` | Streams the live rows of one data file, the way Iceberg's generic reader does |
 | `ParquetDataWriter` | Writes Parquet with Iceberg's writer (exact type mapping), including empty files |
 | `AzureBlobStore` | Staged block upload and atomic commit, metadata, listing, deletes, lease lock |
-| `MigrationStateRepository` | Run and file state over JDBC (Databricks SQL), with retries |
+| `MigrationStateRepository` | Control, run and file tables, with retries |
+| `SparkSqlExecutor` | Runs the state SQL through the cluster's Spark session |
 | `MigrationProgressTracker` | Record, file and partition progress, committed and in flight |
 
 ## Build
@@ -80,14 +82,16 @@ cause of an `InvocationTargetException`, which fails the task.
 | `main_class_name` | `com.tds.pde.migration.MigrationApplication` |
 | `app_args` | `--spring.config.additional-location=/Volumes/<catalog>/<schema>/<volume>/iceberg-adls-migrator/application.yaml` plus any overrides, e.g. `--migration.run-id=...` |
 
-**Secrets** come from environment variables set on the cluster with secret references, never from the YAML file,
-for example `DATABRICKS_SQL_TOKEN={{secrets/<scope>/<key>}}`.
+**Secrets**, if any, come from environment variables set on the cluster with secret references
+(`{{secrets/<scope>/<key>}}`), never from the YAML file. The state tables need none: they are written through the
+cluster's Spark session as the job's identity.
 
 **Before the first run:**
 - create the destination container (the app never creates it);
 - grant the identity *Storage Blob Data Contributor* on it;
-- create the state tables from [`src/main/resources/db/databricks/migration-state.sql`](src/main/resources/db/databricks/migration-state.sql),
-  or run once with `migration.state.create-tables=true`.
+- grant the job's identity `USE CATALOG`, `USE SCHEMA`, `CREATE TABLE`, and `SELECT` and `MODIFY` on the schema
+  holding the state tables. The app creates them at startup from
+  [`src/main/resources/db/databricks/migration-state.sql`](src/main/resources/db/databricks/migration-state.sql).
 
 ## Configuration
 
@@ -114,11 +118,10 @@ complete example. Invalid values stop the app before any data is touched.
 | `migration.progress.log-every-records` | `100000` | Log record progress at least this often (in records) |
 | `migration.progress.log-every` | `30s` | ...and at least this often (in time) |
 | `migration.failure.on-file-failure` | `FAIL_FAST` | Or `CONTINUE` with the remaining files |
+| `migration.state.control-table` | required | e.g. `main.migration.migration_control` |
 | `migration.state.run-table` | required | e.g. `main.migration.migration_run` |
 | `migration.state.file-table` | required | e.g. `main.migration.migration_file` |
-| `migration.state.create-tables` | `false` | Run the bundled Delta DDL at startup |
-| `migration.state.write-retries` | `3` | Attempts per state store call before the run stops |
-| `spring.datasource.url`, `.password` | none | Databricks SQL warehouse JDBC URL and token |
+| `migration.state.write-retries` | `5` | Attempts per state table call before the run stops |
 
 **Authentication.** The `TokenCredential` bean in `AzureConfig` is the single place to plug in a different
 sign-in mechanism. The default is the cluster's managed identity.
@@ -139,6 +142,29 @@ sign-in mechanism. The default is the cluster's managed identity.
 
 Types are Spark SQL type strings. `schema` is optional; for the source it is ignored, because the Iceberg metadata
 is authoritative.
+
+## State tables
+
+Three Delta tables, shared by every migration job and created at startup with `CREATE TABLE IF NOT EXISTS`:
+
+| Table | One row per | Holds |
+|---|---|---|
+| control (`migration_control`) | table migration: a source table and its destination | Source metadata at the pinned snapshot (format version, snapshot id and time, schema id, partition specs, total partitions, files, records, delete files and bytes), the latest run id and status, completed and failed counts, records written and deleted, start, finish, error |
+| run (`migration_run`) | run | Pinned snapshot, read and output schemas, totals, status, start, finish, error |
+| file (`migration_file`) | source data file of a run | Source and destination paths, physical records, status (`PENDING`, `COMPLETED`, `FAILED`), records written and deleted, attempts, last error |
+
+The control row is written when a run starts, after each partition completes and when the run ends, so it shows a
+migration's progress while it runs:
+
+```sql
+SELECT source_dataset_id, status, completed_files, total_files, records_written, total_records, last_run_id, error
+FROM main.migration.migration_control;
+```
+
+**Writes.** The SQL runs through the cluster's `SparkSession`, reached by reflection because the launcher's isolated
+class loader hides the runtime's classes. Every statement is a Delta commit, so a file costs one write: its outcome.
+Parallel jobs migrating *different* tables share the tables safely: deletion vectors and row tracking give
+row-level concurrency, and the rare conflicting commit is retried with jittered backoff.
 
 ## Runs and resume
 
@@ -163,8 +189,10 @@ snapshot expiry removed a file).
 markers is a finished file even if recording it in the state store failed; it is recorded and not written again.
 
 **One run per destination.** A run holds a 60-second blob lease on `<prefix>/_migration/lock`, renewed every
-20 seconds. A second run fails at once. If a run dies, its lease lapses within a minute. A run that loses its lease
-stops before the next file.
+20 seconds. A second run fails at once. If a run dies, its lease lapses within a minute. The lease is checked before
+each file and again immediately before each file is published, so a run that loses it publishes nothing more and
+stops without touching the run's state, which then belongs to whichever run took the lease over. Setting the
+Databricks job's *Maximum concurrent runs* to 1 adds a second guard.
 
 ## Progress reporting
 
@@ -208,8 +236,8 @@ Migration completed: runId=20261117-204240-0fef7d
   the run id to resume.
 - **Checked before anything is written:** non-Parquet data files, unreadable delete files, format versions above 3,
   schema mismatches, a non-empty destination for a new run, another active run.
-- **State store failures** are retried with backoff (1s, then 2s, ...); if they persist the run stops, and the next
-  resume recognises published files by their blob metadata.
+- **State table failures** are retried with jittered backoff (about 1s, then 2s, ...); if they persist the run stops,
+  and the next resume recognises published files by their blob metadata.
 
 ## Output
 
@@ -249,12 +277,14 @@ Migration completed: runId=20261117-204240-0fef7d
 
   Azurite's account key is published in its documentation.
 
-The state store tests run on H2; the SQL is plain `INSERT`, `UPDATE` and `SELECT`, the same statements used on
-Databricks SQL.
+Spark and Delta do not run in the tests: the state table SQL (plain `INSERT`, `UPDATE` and `SELECT` with named
+parameters) runs on H2 instead, and the Spark bridge is tested against stand-in classes with Spark's API shape. H2
+and Spring JDBC are test-only dependencies; nothing JDBC ships in the dist.
 
 ## Not yet verified outside tests
 
-- Managed identity sign-in, the Databricks SQL JDBC driver and the Delta DDL: these need the Databricks workspace.
+- Managed identity sign-in, the Spark bridge against a real Databricks `SparkSession`, and the Delta DDL and
+  statements on Unity Catalog: these need the Databricks workspace.
 - A production HDFS cluster (tests use an in-process one).
 - Equality deletes are loaded into memory per data file; memory then grows with the size of the equality delete
   files, not the data files. Tables here are append-only, so none are expected.

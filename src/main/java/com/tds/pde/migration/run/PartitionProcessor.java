@@ -1,6 +1,7 @@
 package com.tds.pde.migration.run;
 
 import com.tds.pde.migration.config.MigrationProperties.Failure.OnFileFailure;
+import com.tds.pde.migration.destination.LockUnavailableException;
 import com.tds.pde.migration.destination.RunLock;
 import com.tds.pde.migration.processing.DataFileProcessor;
 import com.tds.pde.migration.processing.FileResult;
@@ -13,8 +14,8 @@ import java.util.List;
 import java.util.Map;
 
 /**
- * Runs the files of one partition at a time through the file-level checkpoint: record the file as in progress,
- * process it, record the outcome, and count it. One instance serves one run.
+ * Runs the files of one partition at a time through the file-level checkpoint: check the run lock, process the
+ * file, record the outcome, and count it. One instance serves one run.
  */
 public final class PartitionProcessor {
 
@@ -50,11 +51,13 @@ public final class PartitionProcessor {
             }
             // Never write while another run may hold the destination.
             lock.ensureHeld();
-            state.markFileInProgress(run.runId(), fileKey);
             FileResult result = fileProcessor.process(run.context(), task, progress::onFileProgress);
             if (result.succeeded()) {
                 state.markFileCompleted(run.runId(), fileKey, result.recordsWritten(), result.recordsDeleted());
                 progress.fileCompleted(result.physicalRowsRead(), result.recordsWritten());
+            } else if (result.error() instanceof LockUnavailableException lockLost) {
+                // Another run may own this run's state now: stop without writing to it.
+                throw lockLost;
             } else {
                 progress.fileFailed();
                 state.markFileFailed(run.runId(), fileKey, result.failureReason());

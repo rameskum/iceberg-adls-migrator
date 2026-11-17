@@ -215,7 +215,7 @@ public class RunStarter {
         log.warn("Cleaning destination before a fresh run: destination={} blobs={} bytes={}", location, blobs.size(),
                 bytes);
         blobs.forEach(blob -> blobStore.delete(blob.name()));
-        int superseded = state.supersedeRuns(destinationLocation);
+        long superseded = state.supersedeRuns(destinationLocation);
         log.info("Destination cleaned: destination={} deletedBlobs={} supersededRuns={}", location, blobs.size(),
                 superseded);
     }

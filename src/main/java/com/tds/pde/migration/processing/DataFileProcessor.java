@@ -26,11 +26,23 @@ public class DataFileProcessor {
     private final IcebergDataReader reader;
     private final ParquetDataWriter writer;
     private final BlobStore blobStore;
+    private final Runnable beforePublish;
 
     public DataFileProcessor(IcebergDataReader reader, ParquetDataWriter writer, BlobStore blobStore) {
+        this(reader, writer, blobStore, () -> {
+        });
+    }
+
+    /**
+     * @param beforePublish runs immediately before each publish and throws to prevent it, e.g. when the run lock
+     *                      was lost while the file was being written
+     */
+    public DataFileProcessor(IcebergDataReader reader, ParquetDataWriter writer, BlobStore blobStore,
+                             Runnable beforePublish) {
         this.reader = reader;
         this.writer = writer;
         this.blobStore = blobStore;
+        this.beforePublish = beforePublish;
     }
 
     /**
@@ -67,6 +79,7 @@ public class DataFileProcessor {
             listener.onProgress(physicalRowsRead, recordsWritten);
             verify(task, physicalRowsRead, recordsWritten, appender.metrics().recordCount());
 
+            beforePublish.run();
             upload.commit(PublishedFile.metadata(run, task, physicalRowsRead, recordsWritten));
             published = true;
 

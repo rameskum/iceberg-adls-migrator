@@ -144,19 +144,23 @@ public record MigrationProperties(
     }
 
     /**
+     * The state tables, shared by every migration job; created at startup when missing.
+     *
+     * @param controlTable fully qualified control table, e.g. {@code main.migration.migration_control}
      * @param runTable     fully qualified run table, e.g. {@code main.migration.migration_run}
      * @param fileTable    fully qualified file table, e.g. {@code main.migration.migration_file}
-     * @param createTables create the state tables at startup when they do not exist
      * @param writeRetries attempts for each state write before the run is stopped
      */
-    public record State(String runTable, String fileTable, @DefaultValue("false") boolean createTables,
-                        @DefaultValue("3") int writeRetries) {
+    public record State(String controlTable, String runTable, String fileTable,
+                        @DefaultValue("5") int writeRetries) {
 
-        // Table names are spliced into SQL because JDBC cannot bind identifiers, so only plain identifiers pass.
+        // Table names are spliced into SQL because identifiers cannot be bound as parameters, so only plain
+        // identifiers pass.
         private static final Pattern TABLE_NAME =
                 Pattern.compile("[A-Za-z_][A-Za-z0-9_]*(\\.[A-Za-z_][A-Za-z0-9_]*){0,2}");
 
         public State {
+            requireTableName(controlTable, "migration.state.control-table");
             requireTableName(runTable, "migration.state.run-table");
             requireTableName(fileTable, "migration.state.file-table");
             if (writeRetries < 1) {

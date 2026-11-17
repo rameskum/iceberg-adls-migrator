@@ -29,6 +29,7 @@ public final class InMemoryBlobStore implements BlobStore {
     private final List<String> aborted = new CopyOnWriteArrayList<>();
     private final Set<String> locks = ConcurrentHashMap.newKeySet();
     private final Set<String> lostLocks = ConcurrentHashMap.newKeySet();
+    private final Map<String, Integer> heldChecksBeforeLoss = new ConcurrentHashMap<>();
     private final Map<String, Integer> uploadsStarted = new ConcurrentHashMap<>();
     private volatile long failWritesAfterBytes = -1;
     private volatile Predicate<String> failWritesTo = name -> false;
@@ -105,7 +106,8 @@ public final class InMemoryBlobStore implements BlobStore {
         return new RunLock() {
             @Override
             public void ensureHeld() {
-                if (lostLocks.contains(blobName)) {
+                Integer checksLeft = heldChecksBeforeLoss.computeIfPresent(blobName, (name, left) -> left - 1);
+                if (lostLocks.contains(blobName) || checksLeft != null && checksLeft < 0) {
                     throw new LockUnavailableException("Lost the run lock " + blobName);
                 }
             }
@@ -120,6 +122,11 @@ public final class InMemoryBlobStore implements BlobStore {
     /** Simulates another run taking over: the current holder's next {@link RunLock#ensureHeld} fails. */
     public void loseLock(String blobName) {
         lostLocks.add(blobName);
+    }
+
+    /** Lets {@link RunLock#ensureHeld} pass {@code checks} more times, then fail as if another run took over. */
+    public void loseLockAfter(String blobName, int checks) {
+        heldChecksBeforeLoss.put(blobName, checks);
     }
 
     public boolean isLocked(String blobName) {
