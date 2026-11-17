@@ -30,6 +30,15 @@ public final class ParquetOutput {
         this.file = file;
     }
 
+    public static ParquetOutput of(Path file) {
+        return new ParquetOutput(file);
+    }
+
+    /** Rows according to the footer, without reading any data. */
+    public long rowCount() {
+        return footer().getBlocks().stream().mapToLong(block -> block.getRowCount()).sum();
+    }
+
     public static ParquetOutput of(byte[] content, Path directory) {
         try {
             return new ParquetOutput(Files.write(Files.createTempFile(directory, "output", ".parquet"), content));

@@ -150,6 +150,13 @@
             <artifactId>h2</artifactId>
             <scope>test</scope>
         </dependency>
+        <!-- In-process HDFS for end-to-end tests of the source side -->
+        <dependency>
+            <groupId>org.apache.hadoop</groupId>
+            <artifactId>hadoop-client-minicluster</artifactId>
+            <version>${hadoop.version}</version>
+            <scope>test</scope>
+        </dependency>
     </dependencies>
 
     <build>
@@ -166,6 +173,28 @@
                         </path>
                     </annotationProcessorPaths>
                 </configuration>
+            </plugin>
+
+            <!-- Tests tagged "memory" prove bounded memory, so they run separately in a JVM with a deliberately small heap -->
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-surefire-plugin</artifactId>
+                <configuration>
+                    <excludedGroups>memory</excludedGroups>
+                </configuration>
+                <executions>
+                    <execution>
+                        <id>bounded-memory</id>
+                        <goals>
+                            <goal>test</goal>
+                        </goals>
+                        <configuration>
+                            <groups>memory</groups>
+                            <excludedGroups combine.self="override"/>
+                            <argLine>-Xmx128m</argLine>
+                        </configuration>
+                    </execution>
+                </executions>
             </plugin>
 
             <!-- The team launcher loads every jar in one lib/ folder in arbitrary order, so no class may exist twice -->

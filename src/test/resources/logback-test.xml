@@ -13,6 +13,11 @@
     <logger name="org.apache.iceberg.SnapshotScan" level="WARN"/>
     <logger name="org.apache.iceberg.metrics.LoggingMetricsReporter" level="WARN"/>
     <logger name="org.apache.hadoop.io.compress.CodecPool" level="WARN"/>
+    <!-- The in-process HDFS cluster logs every RPC at INFO, and warns about test-cluster setup details -->
+    <logger name="org.apache.hadoop" level="WARN"/>
+    <logger name="org.apache.hadoop.hdfs.server" level="ERROR"/>
+    <logger name="org.apache.hadoop.security.authentication.server" level="ERROR"/>
+    <logger name="org.apache.hadoop.fs.CachingGetSpaceUsed" level="ERROR"/>
 
     <root level="INFO">
         <appender-ref ref="CONSOLE"/>
