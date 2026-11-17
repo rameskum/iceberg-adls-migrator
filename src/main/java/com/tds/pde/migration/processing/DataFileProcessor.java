@@ -1,0 +1,132 @@
+package com.tds.pde.migration.processing;
+
+import com.tds.pde.migration.destination.BlobStore;
+import com.tds.pde.migration.destination.OutputRecordMapper;
+import com.tds.pde.migration.destination.ParquetDataWriter;
+import com.tds.pde.migration.destination.StagedUpload;
+import com.tds.pde.migration.source.IcebergDataReader;
+import com.tds.pde.migration.source.SourceRecords;
+import java.net.URLEncoder;
+import java.nio.charset.StandardCharsets;
+import java.time.Duration;
+import java.util.Map;
+import lombok.extern.slf4j.Slf4j;
+import org.apache.iceberg.data.Record;
+import org.apache.iceberg.io.FileAppender;
+
+/**
+ * Copies one source data file to one destination Parquet file: streams its live rows, writes them, verifies the
+ * written file, and only then publishes it. Knows nothing about runs, progress totals or state persistence, so
+ * it can be wrapped by checkpointing or parallel execution unchanged.
+ */
+@Slf4j
+public class DataFileProcessor {
+
+    /** How often, in rows, in-flight progress is reported. */
+    static final int PROGRESS_INTERVAL = 1024;
+
+    private final IcebergDataReader reader;
+    private final ParquetDataWriter writer;
+    private final BlobStore blobStore;
+
+    public DataFileProcessor(IcebergDataReader reader, ParquetDataWriter writer, BlobStore blobStore) {
+        this.reader = reader;
+        this.writer = writer;
+        this.blobStore = blobStore;
+    }
+
+    /**
+     * Never throws for a failure of this file: the failure is logged with its source and destination and returned.
+     */
+    public FileResult process(RunContext run, FileTask task, FileProgressListener listener) {
+        long started = System.nanoTime();
+        log.info("Source file processing started: source={} destination={} partition={} physicalRecords={} "
+                        + "deleteFiles={}", task.source().location(), task.destination(),
+                task.partitionPath().isEmpty() ? "<unpartitioned>" : task.partitionPath(),
+                task.source().recordCount(), task.source().deleteFileCount());
+
+        StagedUpload upload = blobStore.startUpload(task.destination());
+        long physicalRowsRead = 0;
+        long recordsWritten = 0;
+        boolean published = false;
+        try {
+            FileAppender<Record> appender;
+            try (SourceRecords rows = reader.open(run.source(), task.source().task())) {
+                appender = writer.open(upload, run.outputSchema().schema(), footerMetadata(run, task));
+                try (appender) {
+                    OutputRecordMapper mapper = new OutputRecordMapper(rows.schema(), run.outputSchema());
+                    for (Record row : rows) {
+                        appender.add(mapper.map(row));
+                        recordsWritten++;
+                        if (recordsWritten % PROGRESS_INTERVAL == 0) {
+                            listener.onProgress(rows.physicalRowsRead(), recordsWritten);
+                        }
+                    }
+                }
+                physicalRowsRead = rows.physicalRowsRead();
+            }
+            verify(task, physicalRowsRead, recordsWritten, appender.metrics().recordCount());
+
+            upload.commit(blobMetadata(run, task, physicalRowsRead, recordsWritten));
+            published = true;
+            listener.onProgress(physicalRowsRead, recordsWritten);
+
+            Duration duration = Duration.ofNanos(System.nanoTime() - started);
+            log.info("Source file completed: source={} destination={} recordsWritten={} recordsDeleted={} "
+                            + "duration={}", task.source().location(), task.destination(), recordsWritten,
+                    physicalRowsRead - recordsWritten, duration);
+            return FileResult.succeeded(task, physicalRowsRead, recordsWritten, duration);
+        } catch (Exception e) {
+            Duration duration = Duration.ofNanos(System.nanoTime() - started);
+            log.error("Source file failed, nothing was published: source={} destination={} "
+                            + "recordsWrittenBeforeFailure={} reason={}", task.source().location(), task.destination(),
+                    recordsWritten, describe(e), e);
+            return FileResult.failed(task, physicalRowsRead, recordsWritten, duration, e);
+        } finally {
+            if (!published) {
+                upload.abort();
+            }
+        }
+    }
+
+    /**
+     * Guards against silent data loss: every physical row must have been read, and the closed writer must hold
+     * exactly the rows handed to it.
+     */
+    private static void verify(FileTask task, long physicalRowsRead, long recordsWritten, long recordsInFile) {
+        if (physicalRowsRead != task.source().recordCount()) {
+            throw new IllegalStateException("Read " + physicalRowsRead + " rows but the source metadata records "
+                    + task.source().recordCount());
+        }
+        if (recordsInFile != recordsWritten) {
+            throw new IllegalStateException("Wrote " + recordsWritten + " rows but the finished file holds "
+                    + recordsInFile);
+        }
+    }
+
+    /** The message plus the root cause's, since library wrappers often hide the actual reason. */
+    private static String describe(Exception e) {
+        Throwable root = e;
+        while (root.getCause() != null && root.getCause() != root) {
+            root = root.getCause();
+        }
+        return root == e ? String.valueOf(e.getMessage()) : e.getMessage() + " (caused by " + root + ")";
+    }
+
+    private static Map<String, String> footerMetadata(RunContext run, FileTask task) {
+        return Map.of(
+                "migration.source-file", task.source().location(),
+                "migration.source-snapshot-id", String.valueOf(run.source().snapshotId()));
+    }
+
+    /** Blob metadata names must be C# identifiers and values ASCII, so locations are URL-encoded. */
+    private static Map<String, String> blobMetadata(RunContext run, FileTask task, long physicalRowsRead,
+                                                    long recordsWritten) {
+        return Map.of(
+                "source_file", URLEncoder.encode(task.source().location(), StandardCharsets.UTF_8),
+                "source_partition", URLEncoder.encode(task.partitionPath(), StandardCharsets.UTF_8),
+                "source_snapshot_id", String.valueOf(run.source().snapshotId()),
+                "physical_records", String.valueOf(physicalRowsRead),
+                "records_written", String.valueOf(recordsWritten));
+    }
+}

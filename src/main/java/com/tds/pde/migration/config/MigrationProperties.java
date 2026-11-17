@@ -102,7 +102,15 @@ public record MigrationProperties(
         }
     }
 
-    public record Parquet(@DefaultValue("128MB") DataSize rowGroupSize, @DefaultValue("1MB") DataSize pageSize) {
+    public record Parquet(@DefaultValue("128MB") DataSize rowGroupSize, @DefaultValue("1MB") DataSize pageSize,
+                          @DefaultValue("ZSTD") Compression compression) {
+
+        public enum Compression {
+            ZSTD,
+            SNAPPY,
+            GZIP,
+            UNCOMPRESSED
+        }
 
         public Parquet {
             requirePositive(rowGroupSize, "migration.parquet.row-group-size");

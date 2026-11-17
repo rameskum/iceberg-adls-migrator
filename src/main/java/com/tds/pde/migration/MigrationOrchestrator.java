@@ -51,11 +51,11 @@ public class MigrationOrchestrator {
         DatasetDescriptor destination = dataset(properties.destination().datasetId(), DatasetFormat.PARQUET);
 
         MigrationPlan plan = metadataReader.plan(source.location(), properties.source().snapshotId());
-        OutputSchema outputSchema = schemaValidator.resolve(plan.schema(), destination.schema());
+        OutputSchema outputSchema = schemaValidator.resolve(plan.table().schema(), destination.schema());
 
         log.info("Migration overview: table={} snapshotId={} totalPartitions={} totalDataFiles={} "
                         + "totalRecords={} deleteFiles={} outputColumns={} destination={}",
-                plan.tableLocation(), plan.snapshotId(), plan.totalPartitions(), plan.totalFiles(),
+                plan.table().location(), plan.table().snapshotId(), plan.totalPartitions(), plan.totalFiles(),
                 plan.totalRecords(), plan.totalDeleteFiles(), outputSchema.schema().columns().size(),
                 destination.location());
     }

@@ -50,8 +50,8 @@ class IcebergMetadataReaderTest {
 
         MigrationPlan plan = reader.plan(table.location(), null);
 
-        assertThat(plan.snapshotId()).isEqualTo(table.currentSnapshot().snapshotId());
-        assertThat(plan.formatVersion()).isEqualTo(2);
+        assertThat(plan.table().snapshotId()).isEqualTo(table.currentSnapshot().snapshotId());
+        assertThat(plan.table().formatVersion()).isEqualTo(2);
         assertThat(plan.totalPartitions()).isEqualTo(2);
         assertThat(plan.totalFiles()).isEqualTo(3);
         assertThat(plan.totalRecords()).isEqualTo(6);
@@ -70,11 +70,11 @@ class IcebergMetadataReaderTest {
 
         MigrationPlan plan = reader.plan(table.location(), null);
 
-        assertThat(plan.snapshotId()).isNull();
+        assertThat(plan.table().snapshotId()).isNull();
         assertThat(plan.partitions()).isEmpty();
         assertThat(plan.totalFiles()).isZero();
         assertThat(plan.totalRecords()).isZero();
-        assertThat(plan.schema().sameSchema(SCHEMA)).isTrue();
+        assertThat(plan.table().schema().sameSchema(SCHEMA)).isTrue();
     }
 
     @Test
@@ -86,22 +86,34 @@ class IcebergMetadataReaderTest {
 
         MigrationPlan plan = reader.plan(table.location(), firstSnapshot);
 
-        assertThat(plan.snapshotId()).isEqualTo(firstSnapshot);
+        assertThat(plan.table().snapshotId()).isEqualTo(firstSnapshot);
         assertThat(plan.totalFiles()).isEqualTo(1);
         assertThat(plan.totalRecords()).isEqualTo(2);
         assertThat(plan.partitions().getFirst().files().getFirst().location()).isEqualTo(first.location());
     }
 
     @Test
-    void usesTheSchemaThePinnedSnapshotWasWrittenWith() {
+    void readsTheCurrentSnapshotWithSchemaChangesMadeAfterTheLastWrite() {
+        Table table = IcebergTestTables.create(tempDir.resolve("orders"), SCHEMA, PartitionSpec.unpartitioned());
+        IcebergTestTables.append(table, records("EU", 1));
+        table.updateSchema().renameColumn("region", "market").commit();
+
+        Schema schema = reader.plan(table.location(), null).table().schema();
+
+        assertThat(schema.findField("market")).isNotNull();
+        assertThat(schema.findField("region")).isNull();
+    }
+
+    @Test
+    void usesTheSchemaAnExplicitlyRequestedSnapshotWasWrittenWith() {
         Table table = IcebergTestTables.create(tempDir.resolve("orders"), SCHEMA, PartitionSpec.unpartitioned());
         IcebergTestTables.append(table, records("EU", 1));
         long beforeSchemaChange = table.currentSnapshot().snapshotId();
         table.updateSchema().addColumn("note", Types.StringType.get()).commit();
         IcebergTestTables.append(table, records(table.schema(), "EU", 2));
 
-        assertThat(reader.plan(table.location(), beforeSchemaChange).schema().findField("note")).isNull();
-        assertThat(reader.plan(table.location(), null).schema().findField("note")).isNotNull();
+        assertThat(reader.plan(table.location(), beforeSchemaChange).table().schema().findField("note")).isNull();
+        assertThat(reader.plan(table.location(), null).table().schema().findField("note")).isNotNull();
     }
 
     @Test
@@ -177,7 +189,7 @@ class IcebergMetadataReaderTest {
         Table table = IcebergTestTables.create(tempDir.resolve("orders"), SCHEMA, PartitionSpec.unpartitioned(), 3);
         IcebergTestTables.append(table, records("EU", 1));
 
-        assertThat(reader.plan(table.location(), null).formatVersion()).isEqualTo(3);
+        assertThat(reader.plan(table.location(), null).table().formatVersion()).isEqualTo(3);
     }
 
     @Test

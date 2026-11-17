@@ -25,9 +25,12 @@ import org.apache.iceberg.PartitionSpec;
 import org.apache.iceberg.Schema;
 import org.apache.iceberg.Snapshot;
 import org.apache.iceberg.Table;
+import org.apache.iceberg.TableProperties;
 import org.apache.iceberg.TableScan;
 import org.apache.iceberg.hadoop.HadoopTables;
 import org.apache.iceberg.io.CloseableIterable;
+import org.apache.iceberg.mapping.NameMapping;
+import org.apache.iceberg.mapping.NameMappingParser;
 import org.jspecify.annotations.Nullable;
 import org.springframework.stereotype.Component;
 
@@ -65,22 +68,30 @@ public class IcebergMetadataReader {
                     + formatVersion + "; at most " + MAX_FORMAT_VERSION + " is supported");
         }
 
+        String nameMappingJson = table.properties().get(TableProperties.DEFAULT_NAME_MAPPING);
+        NameMapping nameMapping = nameMappingJson == null ? null : NameMappingParser.fromJson(nameMappingJson);
+
         Snapshot snapshot = resolveSnapshot(table, snapshotId);
         if (snapshot == null) {
             log.info("Source table identified: table={} formatVersion={} snapshotId=none (table has never been written)",
                     tableLocation, formatVersion);
-            return MigrationPlan.empty(tableLocation, formatVersion, null, table.schema());
+            return MigrationPlan.empty(new SourceTable(tableLocation, formatVersion, null, table.schema(),
+                    table.schema(), table.io(), nameMapping));
         }
 
-        // Pinning the scan to the snapshot also pins the schema to the one that snapshot was written with.
         TableScan scan = table.newScan().useSnapshot(snapshot.snapshotId());
-        Schema schema = scan.schema();
+        // Like a plain read, the current snapshot is read with the current schema, which includes schema changes
+        // made after the last write. Like time travel, an explicitly requested snapshot keeps the schema it was
+        // written with.
+        Schema schema = snapshotId == null ? table.schema() : scan.schema();
         log.info("Source table and snapshot identified: table={} formatVersion={} snapshotId={} "
-                        + "snapshotTimestamp={} operation={} schemaId={} columns={}",
+                        + "snapshotTimestamp={} operation={} schemaId={} columns={} nameMapping={}",
                 tableLocation, formatVersion, snapshot.snapshotId(), Instant.ofEpochMilli(snapshot.timestampMillis()),
-                snapshot.operation(), schema.schemaId(), schema.columns().size());
+                snapshot.operation(), schema.schemaId(), schema.columns().size(), nameMapping != null);
 
-        return planFiles(table, scan, tableLocation, formatVersion, snapshot.snapshotId(), schema);
+        SourceTable source = new SourceTable(tableLocation, formatVersion, snapshot.snapshotId(), schema,
+                table.schema(), table.io(), nameMapping);
+        return planFiles(table, scan, source);
     }
 
     private Table load(String tableLocation) {
@@ -103,8 +114,8 @@ public class IcebergMetadataReader {
         return snapshot;
     }
 
-    private static MigrationPlan planFiles(Table table, TableScan scan, String tableLocation, int formatVersion,
-                                           long snapshotId, Schema schema) {
+    private static MigrationPlan planFiles(Table table, TableScan scan, SourceTable source) {
+        String tableLocation = source.location();
         Map<PartitionKey, List<SourceFile>> filesByPartition = new TreeMap<>(PARTITION_ORDER);
         Set<String> problems = new LinkedHashSet<>();
         Set<String> deleteFiles = new HashSet<>();
@@ -154,11 +165,10 @@ public class IcebergMetadataReader {
                 log.info("Partition spec in use: specId={} fields={}", specId, table.specs().get(specId).fields()));
         if (!deleteFiles.isEmpty()) {
             log.warn("Source snapshot has row-level deletes; they are applied while copying: snapshotId={} "
-                    + "deleteFiles={}", snapshotId, deleteFiles.size());
+                    + "deleteFiles={}", source.snapshotId(), deleteFiles.size());
         }
 
-        return new MigrationPlan(tableLocation, formatVersion, snapshotId, schema, partitions, totalRecords,
-                totalFiles, deleteFiles.size());
+        return new MigrationPlan(source, partitions, totalRecords, totalFiles, deleteFiles.size());
     }
 
     /** Partitions are told apart by spec as well as values: the same path under two specs is two partitions. */

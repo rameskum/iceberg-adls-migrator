@@ -31,6 +31,8 @@ migration:
   parquet:
     row-group-size: 128MB
     page-size: 1MB
+    # ZSTD, SNAPPY, GZIP or UNCOMPRESSED
+    compression: ZSTD
   progress:
     log-every-records: 100000
     log-every: 30s

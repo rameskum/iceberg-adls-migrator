@@ -19,3 +19,5 @@ logging:
   level:
     # Native Hadoop libraries are optional; their absence is expected and not worth a warning on every run
     org.apache.hadoop.util.NativeCodeLoader: error
+    # Reports, at INFO, every engine integration (Spark, Flink, Arrow) that is absent by design
+    org.apache.iceberg.formats.FormatModelRegistry: warn
