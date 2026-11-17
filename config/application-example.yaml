@@ -1,0 +1,44 @@
+# Example environment configuration. Copy to a Unity Catalog Volume and pass it with
+#   --spring.config.additional-location=/Volumes/<catalog>/<schema>/<volume>/iceberg-adls-migrator/application.yaml
+# Secrets never go in this file: they come from environment variables backed by {{secrets/<scope>/<key>}}.
+spring:
+  datasource:
+    url: jdbc:databricks://<workspace-host>:443;httpPath=/sql/1.0/warehouses/<warehouse-id>;AuthMech=3;UID=token
+    password: ${DATABRICKS_SQL_TOKEN}
+
+migration:
+  # Empty: start a new run, or auto-resume the latest unfinished run for the same source and destination.
+  run-id:
+  source:
+    dataset-id: orders-src
+    # Optional: migrate this snapshot instead of the current one.
+    snapshot-id:
+    # Copied verbatim into the Hadoop Configuration. Quote dotted keys so their case is kept.
+    hadoop:
+      "[fs.defaultFS]": hdfs://namenode:8020
+  destination:
+    dataset-id: orders-adls
+    # true: delete everything under the destination location and start a fresh run.
+    clean: false
+    block-size: 8MB
+  datasets:
+    stub-directory: /Volumes/<catalog>/<schema>/<volume>/iceberg-adls-migrator/datasets
+  azure:
+    auth:
+      mode: MANAGED_IDENTITY
+      # Client id of a user-assigned managed identity; leave empty for system-assigned.
+      client-id:
+  parquet:
+    row-group-size: 128MB
+    page-size: 1MB
+  progress:
+    log-every-records: 100000
+    log-every: 30s
+  failure:
+    # FAIL_FAST or CONTINUE
+    on-file-failure: FAIL_FAST
+  state:
+    run-table: main.migration.migration_run
+    file-table: main.migration.migration_file
+    create-tables: false
+    write-retries: 3

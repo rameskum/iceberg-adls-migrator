@@ -1,0 +1,16 @@
+# Built-in defaults. Environment-specific values come from the file passed with
+# --spring.config.additional-location (see config/application-example.yaml).
+spring:
+  application:
+    name: iceberg-adls-migrator
+  main:
+    web-application-type: none
+    banner-mode: off
+  datasource:
+    # Spring Boot cannot infer the Databricks driver from a jdbc:databricks: URL
+    driver-class-name: com.databricks.client.jdbc.Driver
+    hikari:
+      # Single writer: one connection for state writes, one spare
+      maximum-pool-size: 2
+      # Milliseconds (5 minutes): a stopped Databricks SQL warehouse can take minutes to start
+      connection-timeout: 300000
