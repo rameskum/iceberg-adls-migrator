@@ -304,6 +304,21 @@ class DataFileProcessorTest {
         assertThat(reports.getLast()[0]).isEqualTo(2500);
     }
 
+    @Test
+    void recognisesAFilePublishedByTheSameRun() {
+        Table table = IcebergTestTables.create(tempDir.resolve("orders"), ORDERS, PartitionSpec.unpartitioned());
+        IcebergTestTables.append(table, orders("EU", 1, 2));
+        Run run = plan(table, null);
+        assertThat(PublishedFile.find(blobStore, run.context(), run.task(0))).isEmpty();
+
+        processor.process(run.context(), run.task(0), FileProgressListener.NONE);
+
+        assertThat(PublishedFile.find(blobStore, run.context(), run.task(0)))
+                .contains(new PublishedFile.Counts(2, 2));
+        RunContext otherRun = new RunContext("run-2", run.context().source(), run.context().outputSchema());
+        assertThat(PublishedFile.find(blobStore, otherRun, run.task(0))).isEmpty();
+    }
+
     private FileResult processOnlyFile(Table table) {
         Run run = plan(table, null);
         return processor.process(run.context(), run.task(0), FileProgressListener.NONE);
@@ -311,7 +326,7 @@ class DataFileProcessorTest {
 
     private Run plan(Table table, OutputSchema outputSchema) {
         MigrationPlan plan = metadataReader.plan(table.location(), null);
-        RunContext context = new RunContext(plan.table(),
+        RunContext context = new RunContext("run-1", plan.table(),
                 outputSchema == null ? OutputSchema.unchanged(plan.table().schema()) : outputSchema);
         DestinationPathResolver paths = new DestinationPathResolver();
         List<FileTask> tasks = new ArrayList<>();

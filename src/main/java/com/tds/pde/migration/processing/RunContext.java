@@ -6,5 +6,5 @@ import com.tds.pde.migration.source.SourceTable;
 /**
  * Inputs shared by every file of one migration run.
  */
-public record RunContext(SourceTable source, OutputSchema outputSchema) {
+public record RunContext(String runId, SourceTable source, OutputSchema outputSchema) {
 }

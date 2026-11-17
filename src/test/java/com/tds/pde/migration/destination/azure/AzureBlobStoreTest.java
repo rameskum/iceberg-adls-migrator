@@ -210,7 +210,7 @@ class AzureBlobStoreTest {
         DataFileProcessor processor = new DataFileProcessor(
                 new IcebergDataReader(), new ParquetDataWriter(TestProperties.defaults()), store);
 
-        FileResult result = processor.process(new RunContext(plan.table(), OutputSchema.unchanged(schema)), task,
+        FileResult result = processor.process(new RunContext("run-1", plan.table(), OutputSchema.unchanged(schema)), task,
                 FileProgressListener.NONE);
 
         assertThat(result.succeeded()).isTrue();

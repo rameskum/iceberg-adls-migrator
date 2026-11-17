@@ -1,5 +1,9 @@
 package com.tds.pde.migration.source;
 
+import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
+import java.util.HexFormat;
 import org.apache.iceberg.FileScanTask;
 
 /**
@@ -11,6 +15,11 @@ public record SourceFile(FileScanTask task) {
         return task.file().location();
     }
 
+    /** Stable identifier of this file across runs and resumes: the SHA-256 of its location, in hex. */
+    public String key() {
+        return keyOf(location());
+    }
+
     /** Physical rows in the data file, before deletes are applied. */
     public long recordCount() {
         return task.file().recordCount();
@@ -18,5 +27,14 @@ public record SourceFile(FileScanTask task) {
 
     public int deleteFileCount() {
         return task.deletes().size();
+    }
+
+    public static String keyOf(String location) {
+        try {
+            return HexFormat.of().formatHex(
+                    MessageDigest.getInstance("SHA-256").digest(location.getBytes(StandardCharsets.UTF_8)));
+        } catch (NoSuchAlgorithmException e) {
+            throw new IllegalStateException("SHA-256 is required by every Java platform", e);
+        }
     }
 }

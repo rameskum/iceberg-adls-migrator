@@ -6,8 +6,6 @@ import com.tds.pde.migration.destination.ParquetDataWriter;
 import com.tds.pde.migration.destination.StagedUpload;
 import com.tds.pde.migration.source.IcebergDataReader;
 import com.tds.pde.migration.source.SourceRecords;
-import java.net.URLEncoder;
-import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.Map;
 import lombok.extern.slf4j.Slf4j;
@@ -67,7 +65,7 @@ public class DataFileProcessor {
             }
             verify(task, physicalRowsRead, recordsWritten, appender.metrics().recordCount());
 
-            upload.commit(blobMetadata(run, task, physicalRowsRead, recordsWritten));
+            upload.commit(PublishedFile.metadata(run, task, physicalRowsRead, recordsWritten));
             published = true;
             listener.onProgress(physicalRowsRead, recordsWritten);
 
@@ -115,18 +113,8 @@ public class DataFileProcessor {
 
     private static Map<String, String> footerMetadata(RunContext run, FileTask task) {
         return Map.of(
+                "migration.run-id", run.runId(),
                 "migration.source-file", task.source().location(),
                 "migration.source-snapshot-id", String.valueOf(run.source().snapshotId()));
-    }
-
-    /** Blob metadata names must be C# identifiers and values ASCII, so locations are URL-encoded. */
-    private static Map<String, String> blobMetadata(RunContext run, FileTask task, long physicalRowsRead,
-                                                    long recordsWritten) {
-        return Map.of(
-                "source_file", URLEncoder.encode(task.source().location(), StandardCharsets.UTF_8),
-                "source_partition", URLEncoder.encode(task.partitionPath(), StandardCharsets.UTF_8),
-                "source_snapshot_id", String.valueOf(run.source().snapshotId()),
-                "physical_records", String.valueOf(physicalRowsRead),
-                "records_written", String.valueOf(recordsWritten));
     }
 }
