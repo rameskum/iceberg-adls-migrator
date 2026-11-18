@@ -109,9 +109,10 @@ class MigrationEndToEndTest {
         List<FileRecord> files = files(run);
         assertThat(files).hasSize(4).allSatisfy(file -> {
             assertThat(file.status()).isEqualTo(FileRecord.Status.COMPLETED);
-            assertThat(file.attempts()).isEqualTo(1);
+            assertThat(file.error()).isNull();
         });
-        assertThat(files).extracting(FileRecord::recordsDeleted).containsExactlyInAnyOrder(0L, 0L, 0L, 2L);
+        assertThat(files).extracting(file -> file.physicalRecords() - file.recordsWritten())
+                .as("deleted rows").containsExactlyInAnyOrder(0L, 0L, 0L, 2L);
         assertThat(dataBlobs()).hasSize(4);
         long rowsInOutput = dataBlobs().stream()
                 .mapToLong(name -> ParquetOutput.of(blobStore.blob(name).orElseThrow().content(), tempDir)
@@ -123,22 +124,12 @@ class MigrationEndToEndTest {
         ControlRecord control = control();
         assertThat(control.status()).isEqualTo(RunRecord.Status.SUCCEEDED);
         assertThat(control.lastRunId()).isEqualTo(run.runId());
+        assertThat(run.sourceDatasetId()).as("run links to its migration").isEqualTo(control.sourceDatasetId());
+        assertThat(run.targetDatasetId()).isEqualTo(control.targetDatasetId());
         assertThat(control.snapshotId()).isEqualTo(table.currentSnapshot().snapshotId());
-        assertThat(control.snapshotTimestamp()).isNotNull();
-        assertThat(control.formatVersion()).isEqualTo(2);
-        assertThat(control.partitionSpecs()).isEqualTo("0:[1000: region: identity(2)]");
-        assertThat(control.totalPartitions()).isEqualTo(3);
         assertThat(control.totalFiles()).isEqualTo(4);
         assertThat(control.totalRecords()).isEqualTo(9);
-        assertThat(control.totalDeleteFiles()).isEqualTo(1);
-        assertThat(control.totalBytes()).isPositive();
-        assertThat(control.completedPartitions()).isEqualTo(3);
-        assertThat(control.completedFiles()).isEqualTo(4);
-        assertThat(control.failedFiles()).isZero();
-        assertThat(control.recordsWritten()).isEqualTo(7);
-        assertThat(control.recordsDeleted()).isEqualTo(2);
-        assertThat(control.finishedAt()).isNotNull();
-        assertThat(control.error()).isNull();
+        assertThat(files.stream().mapToLong(FileRecord::recordsWritten).sum()).as("records written").isEqualTo(7);
     }
 
     @Test
@@ -169,14 +160,11 @@ class MigrationEndToEndTest {
                 "region=EU", List.of(FileRecord.Status.FAILED, FileRecord.Status.PENDING)));
         // Only two partitions exist; with fail-fast the second EU file was never attempted.
         assertThat(files(run)).filteredOn(file -> file.status() == FileRecord.Status.FAILED).singleElement()
-                .satisfies(file -> assertThat(file.lastError()).contains("injected write failure"));
+                .satisfies(file -> assertThat(file.error()).contains("injected write failure"));
         assertThat(dataBlobs()).hasSize(1);
         assertThat(control()).satisfies(control -> {
             assertThat(control.status()).isEqualTo(RunRecord.Status.FAILED);
-            assertThat(control.error()).isEqualTo("1 of 3 files failed");
-            assertThat(control.completedFiles()).isEqualTo(1);
-            assertThat(control.failedFiles()).isEqualTo(1);
-            assertThat(control.completedPartitions()).isEqualTo(1);
+            assertThat(control.lastRunId()).isEqualTo(run.runId());
         });
     }
 
@@ -212,13 +200,10 @@ class MigrationEndToEndTest {
         assertThat(run.status()).isEqualTo(RunRecord.Status.SUCCEEDED);
         assertThat(blobStore.uploadsStarted(apacBlob)).isEqualTo(1);
         assertThat(files(run)).allSatisfy(file -> assertThat(file.status()).isEqualTo(FileRecord.Status.COMPLETED));
-        assertThat(files(run)).extracting(FileRecord::attempts).containsExactlyInAnyOrder(1, 2, 1);
+        assertThat(files(run)).allSatisfy(file -> assertThat(file.error()).isNull());
         assertThat(control()).satisfies(control -> {
             assertThat(control.status()).isEqualTo(RunRecord.Status.SUCCEEDED);
             assertThat(control.lastRunId()).isEqualTo(run.runId());
-            assertThat(control.completedFiles()).isEqualTo(3);
-            assertThat(control.failedFiles()).isZero();
-            assertThat(control.error()).isNull();
         });
     }
 
@@ -230,9 +215,8 @@ class MigrationEndToEndTest {
         String apacBlob = dataBlobs().getFirst();
         FileRecord apac = files(onlyRun()).stream().filter(file -> file.targetPath().equals(apacBlob))
                 .findFirst().orElseThrow();
-        stateStore.replaceFile(new FileRecord(apac.runId(), apac.fileKey(), apac.sourcePath(), apac.specId(),
-                apac.partitionPath(), apac.targetPath(), apac.physicalRecords(), FileRecord.Status.PENDING, null,
-                null, apac.attempts(), null, apac.updatedAt()));
+        stateStore.replaceFile(new FileRecord(apac.runId(), apac.sourcePath(), apac.targetPath(),
+                apac.physicalRecords(), FileRecord.Status.PENDING, null, null));
         blobStore.stopFailing();
 
         migrate();
@@ -310,7 +294,7 @@ class MigrationEndToEndTest {
         assertThat(runs()).extracting(RunRecord::runId, RunRecord::status).contains(
                 tuple(firstRun, RunRecord.Status.SUPERSEDED));
         assertThat(runs()).filteredOn(run -> run.status() == RunRecord.Status.SUCCEEDED).singleElement()
-                .satisfies(run -> assertThat(run.totalFiles()).isEqualTo(4));
+                .satisfies(run -> assertThat(files(run)).hasSize(4));
         assertThat(dataBlobs()).hasSize(4);
     }
 
@@ -364,8 +348,8 @@ class MigrationEndToEndTest {
     }
 
     private ControlRecord control() {
-        return repository().findControl(table.location(),
-                "abfss://data@salesacct.dfs.core.windows.net/" + PREFIX).orElseThrow();
+        return repository().findControl("0e9c1a5e-4c55-4a3b-9f3e-1c2a7d8b6e01",
+                "5b2f7d3c-8a1e-4f6b-b2d4-9c0e3a7f1d02").orElseThrow();
     }
 
     private List<FileRecord> files(RunRecord run) {
@@ -375,7 +359,8 @@ class MigrationEndToEndTest {
     private Map<String, List<FileRecord.Status>> statusByPartition(RunRecord run) {
         return files(run).stream()
                 .sorted(Comparator.comparing(FileRecord::sourcePath))
-                .collect(Collectors.groupingBy(FileRecord::partitionPath, TreeMap::new,
+                .collect(Collectors.groupingBy(file -> file.sourcePath().replaceAll(".*/(region=[^/]+)/.*", "$1"),
+                        TreeMap::new,
                         Collectors.mapping(FileRecord::status, Collectors.toList())));
     }
 

@@ -39,28 +39,28 @@ public final class PartitionProcessor {
     }
 
     /**
-     * @param published files this run had already published, by file key; they are skipped
+     * @param published files this run had already published, by source path; they are skipped
      * @return whether every file of the partition is now published
      */
     public boolean process(PartitionTasks partition, Map<String, PublishedFile.Counts> published) {
         boolean allPublished = true;
         for (FileTask task : partition.files()) {
-            String fileKey = task.source().key();
-            if (published.containsKey(fileKey)) {
+            String sourcePath = task.source().location();
+            if (published.containsKey(sourcePath)) {
                 continue;
             }
             // Never write while another run may hold the target.
             lock.ensureHeld();
             FileResult result = fileProcessor.process(run.context(), task, progress::onFileProgress);
             if (result.succeeded()) {
-                state.markFileCompleted(run.runId(), fileKey, result.recordsWritten(), result.recordsDeleted());
+                state.markFileCompleted(run.runId(), sourcePath, result.recordsWritten());
                 progress.fileCompleted(result.physicalRowsRead(), result.recordsWritten());
             } else if (result.error() instanceof LockUnavailableException lockLost) {
                 // Another run may own this run's state now: stop without writing to it.
                 throw lockLost;
             } else {
                 progress.fileFailed();
-                state.markFileFailed(run.runId(), fileKey, result.failureReason());
+                state.markFileFailed(run.runId(), sourcePath, result.failureReason());
                 failures.add(result);
                 allPublished = false;
                 if (onFileFailure == OnFileFailure.FAIL_FAST) {

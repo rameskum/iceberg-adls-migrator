@@ -11,6 +11,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.function.Function;
 import org.jspecify.annotations.Nullable;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Primary;
@@ -42,6 +43,11 @@ public class InMemoryState {
             public List<Map<String, Object>> query(String sql, Map<String, ?> params) {
                 throw new UnsupportedOperationException();
             }
+
+            @Override
+            public <T> T withRows(String schema, List<Object[]> rows, Function<String, T> body) {
+                throw new UnsupportedOperationException();
+            }
         };
 
         private final Map<String, ControlRecord> controls = new LinkedHashMap<>();
@@ -58,7 +64,7 @@ public class InMemoryState {
 
         /** Replaces a file row as if the state table had been changed behind the run's back. */
         public void replaceFile(FileRecord file) {
-            files.put(file.runId() + "/" + file.fileKey(), file);
+            files.put(file.runId() + "/" + file.sourcePath(), file);
         }
 
         @Override
@@ -67,12 +73,12 @@ public class InMemoryState {
 
         @Override
         public void saveControl(ControlRecord control) {
-            controls.put(control.sourceTableLocation() + " -> " + control.targetLocation(), control);
+            controls.put(control.sourceDatasetId() + " -> " + control.targetDatasetId(), control);
         }
 
         @Override
-        public Optional<ControlRecord> findControl(String sourceTableLocation, String targetLocation) {
-            return Optional.ofNullable(controls.get(sourceTableLocation + " -> " + targetLocation));
+        public Optional<ControlRecord> findControl(String sourceDatasetId, String targetDatasetId) {
+            return Optional.ofNullable(controls.get(sourceDatasetId + " -> " + targetDatasetId));
         }
 
         @Override
@@ -86,9 +92,9 @@ public class InMemoryState {
         }
 
         @Override
-        public Optional<RunRecord> findLatestUnfinishedRun(String sourceTableLocation, String targetLocation) {
+        public Optional<RunRecord> findLatestUnfinishedRun(String sourceLocation, String targetLocation) {
             return runs.values().stream()
-                    .filter(run -> run.sourceTableLocation().equals(sourceTableLocation)
+                    .filter(run -> run.sourceLocation().equals(sourceLocation)
                             && run.targetLocation().equals(targetLocation) && run.isUnfinished())
                     .max(Comparator.comparing(RunRecord::startedAt));
         }
@@ -106,9 +112,8 @@ public class InMemoryState {
                                     @Nullable String error) {
             RunRecord run = runs.get(runId);
             runs.put(runId, new RunRecord(run.runId(), status, run.sourceDatasetId(), run.targetDatasetId(),
-                    run.sourceTableLocation(), run.targetLocation(), run.snapshotId(), run.sourceSchemaJson(),
-                    run.outputSchemaJson(), run.totalPartitions(), run.totalFiles(), run.totalRecords(),
-                    run.startedAt(), finishedAt, error));
+                    run.sourceLocation(), run.targetLocation(), run.snapshotId(), run.sourceSchemaJson(),
+                    run.outputSchemaJson(), run.startedAt(), finishedAt, error));
         }
 
         @Override
@@ -133,25 +138,23 @@ public class InMemoryState {
         }
 
         @Override
-        public void markFileCompleted(String runId, String fileKey, long recordsWritten, long recordsDeleted) {
-            FileRecord file = file(runId, fileKey);
-            replaceFile(new FileRecord(runId, fileKey, file.sourcePath(), file.specId(), file.partitionPath(),
-                    file.targetPath(), file.physicalRecords(), FileRecord.Status.COMPLETED, recordsWritten,
-                    recordsDeleted, file.attempts() + 1, null, Instant.now()));
+        public void markFileCompleted(String runId, String sourcePath, long recordsWritten) {
+            FileRecord file = file(runId, sourcePath);
+            replaceFile(new FileRecord(runId, sourcePath, file.targetPath(), file.physicalRecords(),
+                    FileRecord.Status.COMPLETED, recordsWritten, null));
         }
 
         @Override
-        public void markFileFailed(String runId, String fileKey, String error) {
-            FileRecord file = file(runId, fileKey);
-            replaceFile(new FileRecord(runId, fileKey, file.sourcePath(), file.specId(), file.partitionPath(),
-                    file.targetPath(), file.physicalRecords(), FileRecord.Status.FAILED, file.recordsWritten(),
-                    file.recordsDeleted(), file.attempts() + 1, error, Instant.now()));
+        public void markFileFailed(String runId, String sourcePath, String error) {
+            FileRecord file = file(runId, sourcePath);
+            replaceFile(new FileRecord(runId, sourcePath, file.targetPath(), file.physicalRecords(),
+                    FileRecord.Status.FAILED, file.recordsWritten(), error));
         }
 
-        private FileRecord file(String runId, String fileKey) {
-            FileRecord file = files.get(runId + "/" + fileKey);
+        private FileRecord file(String runId, String sourcePath) {
+            FileRecord file = files.get(runId + "/" + sourcePath);
             if (file == null) {
-                throw new IllegalStateException("file " + fileKey + " of run " + runId + " is not recorded");
+                throw new IllegalStateException("file " + sourcePath + " of run " + runId + " is not recorded");
             }
             return file;
         }

@@ -24,6 +24,8 @@ class SparkSqlExecutorTest {
     void reset() {
         SparkSession.statements.clear();
         SparkSession.parameters.clear();
+        SparkSession.views.clear();
+        SparkSession.contextLoaders.clear();
         SparkSession.nextResult = List.of();
     }
 
@@ -54,6 +56,50 @@ class SparkSqlExecutorTest {
     @Test
     void reportsUnknownWhenTheEngineDoesNotSayHowManyRowsChanged() {
         assertThat(executor.update("CREATE TABLE IF NOT EXISTS runs (run_id STRING)", Map.of())).isEqualTo(-1);
+    }
+
+    @Test
+    void exposesTypedRowsAsATemporaryViewForTheDurationOfTheBody() {
+        List<Object[]> rows = List.<Object[]>of(new Object[] {"run-1", 3L}, new Object[] {"run-2", null});
+
+        List<String> seen = executor.withRows("run_id STRING, total_files BIGINT", rows, view -> {
+            assertThat(SparkSession.views).containsOnlyKeys(view);
+            List<Row> viewRows = SparkSession.views.get(view);
+            assertThat(viewRows).hasSize(2);
+            assertThat(viewRows.getFirst().schema().fieldNames()).containsExactly("run_id", "total_files");
+            assertThat(viewRows.get(1).get(1)).isNull();
+            return List.of(view);
+        });
+
+        assertThat(seen.getFirst()).matches("migration_rows_[0-9a-f]{32}");
+        assertThat(SparkSession.views).as("dropped afterwards").isEmpty();
+    }
+
+    @Test
+    void dropsTheViewWhenTheBodyFails() {
+        assertThatThrownBy(() -> executor.withRows("run_id STRING", List.<Object[]>of(new Object[] {"run-1"}),
+                view -> {
+                    throw new SqlExecutionException("merge conflict", null);
+                }))
+                .hasMessage("merge conflict");
+
+        assertThat(SparkSession.views).isEmpty();
+    }
+
+    @Test
+    void callsSparkWithSparksLoaderAsTheContextClassLoaderAndRestoresTheApplications() {
+        ClassLoader sparkLoader = getClass().getClassLoader();
+        ClassLoader original = Thread.currentThread().getContextClassLoader();
+        ClassLoader applicationLoader = new URLClassLoader(new URL[0], null);
+        Thread.currentThread().setContextClassLoader(applicationLoader);
+        try {
+            executor.query("SELECT 1", Map.of());
+
+            assertThat(SparkSession.contextLoaders).containsExactly(sparkLoader);
+            assertThat(Thread.currentThread().getContextClassLoader()).isSameAs(applicationLoader);
+        } finally {
+            Thread.currentThread().setContextClassLoader(original);
+        }
     }
 
     @Test

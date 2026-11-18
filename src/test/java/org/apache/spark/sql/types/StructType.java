@@ -1,5 +1,7 @@
 package org.apache.spark.sql.types;
 
+import java.util.Arrays;
+
 /** Test stand-in for Spark's {@code StructType}; see {@code org.apache.spark.sql.SparkSession}. */
 public class StructType {
 
@@ -7,6 +9,12 @@ public class StructType {
 
     public StructType(String[] fieldNames) {
         this.fieldNames = fieldNames;
+    }
+
+    /** Reads only the field names of {@code name TYPE, ...}. */
+    public static StructType fromDDL(String ddl) {
+        return new StructType(Arrays.stream(ddl.split(",")).map(field -> field.strip().split(" ")[0])
+                .toArray(String[]::new));
     }
 
     public String[] fieldNames() {

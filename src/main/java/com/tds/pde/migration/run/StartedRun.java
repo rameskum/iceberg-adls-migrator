@@ -11,7 +11,7 @@ import java.util.Map;
  * A run that is recorded in the state store and ready to process: new, or resumed with its pinned snapshot,
  * schemas and file list.
  *
- * @param fileStates stored state of every file by file key; all PENDING for a new run
+ * @param fileStates stored state of every file by source path; all PENDING for a new run
  */
 public record StartedRun(RunRecord run, RunContext context, MigrationPlan plan, List<PartitionTasks> partitions,
                          Map<String, FileRecord> fileStates, boolean resumed) {

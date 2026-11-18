@@ -73,8 +73,6 @@ class RunStarterTest {
         RunRecord run = state.findRun(started.runId()).orElseThrow();
         assertThat(run.status()).isEqualTo(RunRecord.Status.RUNNING);
         assertThat(run.snapshotId()).isEqualTo(table.currentSnapshot().snapshotId());
-        assertThat(run.totalFiles()).isEqualTo(3);
-        assertThat(run.totalRecords()).isEqualTo(6);
         assertThat(state.findFiles(started.runId())).hasSize(3)
                 .allSatisfy(file -> {
                     assertThat(file.status()).isEqualTo(FileRecord.Status.PENDING);
@@ -176,9 +174,7 @@ class RunStarterTest {
         StartedRun first = starter(Map.of()).start(source, target(null), LOCATION, blobStore);
         state.updateRunStatus(first.runId(), RunRecord.Status.FAILED, null, null);
         state.findFiles(first.runId()).forEach(file -> state.replaceFile(new FileRecord(file.runId(),
-                file.fileKey(), file.sourcePath(), file.specId(), file.partitionPath(), file.targetPath(), 99,
-                file.status(), file.recordsWritten(), file.recordsDeleted(), file.attempts(), file.lastError(),
-                file.updatedAt())));
+                file.sourcePath(), file.targetPath(), 99, file.status(), file.recordsWritten(), file.error())));
 
         assertThatThrownBy(() -> starter(Map.of()).start(source, target(null), LOCATION, blobStore))
                 .isInstanceOf(MigrationFailedException.class)

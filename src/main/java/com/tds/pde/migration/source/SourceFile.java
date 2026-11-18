@@ -15,11 +15,6 @@ public record SourceFile(FileScanTask task) {
         return task.file().location();
     }
 
-    /** Stable identifier of this file across runs and resumes: the SHA-256 of its location, in hex. */
-    public String key() {
-        return keyOf(location());
-    }
-
     /** Physical rows in the data file, before deletes are applied. */
     public long recordCount() {
         return task.file().recordCount();
@@ -29,6 +24,7 @@ public record SourceFile(FileScanTask task) {
         return task.deletes().size();
     }
 
+    /** The SHA-256 of a file location, in hex. */
     public static String keyOf(String location) {
         try {
             return HexFormat.of().formatHex(

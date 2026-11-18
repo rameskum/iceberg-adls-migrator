@@ -106,7 +106,7 @@ class HdfsEndToEndTest {
                 .findLatestRunForTarget("abfss://data@salesacct.dfs.core.windows.net/sales/orders")
                 .orElseThrow();
         assertThat(run.status()).isEqualTo(RunRecord.Status.SUCCEEDED);
-        assertThat(run.sourceTableLocation()).startsWith("hdfs://");
+        assertThat(run.sourceLocation()).startsWith("hdfs://");
         List<String> dataBlobs = blobStore.list("sales/orders/").stream()
                 .map(blob -> blob.name()).filter(name -> !name.contains("/_migration/")).toList();
         assertThat(dataBlobs).hasSize(2);

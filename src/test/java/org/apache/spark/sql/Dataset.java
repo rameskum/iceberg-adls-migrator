@@ -14,4 +14,8 @@ public class Dataset {
     public List<Row> collectAsList() {
         return rows;
     }
+
+    public void createOrReplaceTempView(String viewName) {
+        SparkSession.views.put(viewName, rows);
+    }
 }

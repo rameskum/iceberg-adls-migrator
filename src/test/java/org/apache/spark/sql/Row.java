@@ -20,4 +20,8 @@ public class Row {
     public Object get(int index) {
         return values[index];
     }
+
+    Object[] values() {
+        return values;
+    }
 }

@@ -15,14 +15,11 @@ import com.tds.pde.migration.processing.FileResult;
 import com.tds.pde.migration.processing.FileTask;
 import com.tds.pde.migration.processing.PublishedFile;
 import com.tds.pde.migration.progress.MigrationProgressTracker;
-import com.tds.pde.migration.progress.ProgressSnapshot;
 import com.tds.pde.migration.run.PartitionProcessor;
 import com.tds.pde.migration.run.PartitionTasks;
 import com.tds.pde.migration.run.RunStarter;
 import com.tds.pde.migration.run.StartedRun;
 import com.tds.pde.migration.source.IcebergDataReader;
-import com.tds.pde.migration.source.MigrationPlan;
-import com.tds.pde.migration.source.SourceTable;
 import com.tds.pde.migration.state.ControlRecord;
 import com.tds.pde.migration.state.FileRecord;
 import com.tds.pde.migration.state.MigrationStateRepository;
@@ -34,7 +31,6 @@ import java.util.Map;
 import java.util.Optional;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
-import org.jspecify.annotations.Nullable;
 import org.springframework.stereotype.Component;
 
 /**
@@ -115,7 +111,7 @@ public class MigrationOrchestrator {
         if (!published.isEmpty()) {
             log.info("Resuming after already published work:\n  {}", progress.summary());
         }
-        saveControl(run, progress, RunRecord.Status.RUNNING, null, null);
+        saveControl(run, RunRecord.Status.RUNNING);
 
         PartitionProcessor partitions = new PartitionProcessor(run,
                 new DataFileProcessor(dataReader, dataWriter, blobStore, lock::ensureHeld), state, progress, lock,
@@ -131,7 +127,6 @@ public class MigrationOrchestrator {
                 log.info("Partition completed: partition={} files={}", partition.partition().displayName(),
                         partition.files().size());
                 progress.partitionCompleted();
-                saveControl(run, progress, RunRecord.Status.RUNNING, null, null);
             }
             if (partitions.stopped()) {
                 log.error("Stopping at the first failed file (migration.failure.on-file-failure=FAIL_FAST)");
@@ -143,7 +138,7 @@ public class MigrationOrchestrator {
         if (failures.isEmpty()) {
             Instant finished = Instant.now();
             state.updateRunStatus(run.runId(), RunRecord.Status.SUCCEEDED, finished, null);
-            saveControl(run, progress, RunRecord.Status.SUCCEEDED, finished, null);
+            saveControl(run, RunRecord.Status.SUCCEEDED);
             log.info("Migration completed: runId={}\n  {}", run.runId(), progress.summary());
             return;
         }
@@ -164,19 +159,18 @@ public class MigrationOrchestrator {
         Map<String, PublishedFile.Counts> published = new HashMap<>();
         for (PartitionTasks partition : run.partitions()) {
             for (FileTask task : partition.files()) {
-                String fileKey = task.source().key();
+                String sourcePath = task.source().location();
                 Optional<PublishedFile.Counts> counts = PublishedFile.find(blobStore, run.context(), task);
                 if (counts.isEmpty()) {
                     continue;
                 }
-                FileRecord stored = run.fileStates().get(fileKey);
+                FileRecord stored = run.fileStates().get(sourcePath);
                 if (stored == null || stored.status() != FileRecord.Status.COMPLETED) {
                     log.info("Source file was already published; recording it as completed: source={} target={}",
                             task.source().location(), task.target());
-                    state.markFileCompleted(run.runId(), fileKey, counts.get().recordsWritten(),
-                            counts.get().physicalRowsRead() - counts.get().recordsWritten());
+                    state.markFileCompleted(run.runId(), sourcePath, counts.get().recordsWritten());
                 }
-                published.put(fileKey, counts.get());
+                published.put(sourcePath, counts.get());
                 progress.fileAlreadyCompleted(counts.get().physicalRowsRead(), counts.get().recordsWritten());
             }
             if (published.keySet().containsAll(keys(partition))) {
@@ -190,31 +184,21 @@ public class MigrationOrchestrator {
         try {
             Instant finished = Instant.now();
             state.updateRunStatus(run.runId(), RunRecord.Status.FAILED, finished, reason);
-            saveControl(run, progress, RunRecord.Status.FAILED, finished, reason);
+            saveControl(run, RunRecord.Status.FAILED);
         } catch (RuntimeException e) {
             log.error("Could not record the run as failed; it stays RUNNING until resumed: runId={} reason={}",
                     run.runId(), e.getMessage());
         }
     }
 
-    /** The control table's view of this table migration: the source's metadata and the run's progress. */
-    private void saveControl(StartedRun run, MigrationProgressTracker progress, RunRecord.Status status,
-                             @Nullable Instant finishedAt, @Nullable String error) {
-        ProgressSnapshot counts = progress.snapshot();
-        MigrationPlan plan = run.plan();
-        SourceTable table = plan.table();
-        RunRecord record = run.run();
-        state.saveControl(new ControlRecord(record.sourceDatasetId(), record.targetDatasetId(),
-                record.sourceTableLocation(), record.targetLocation(), status, record.runId(),
-                table.formatVersion(), table.snapshotId(), table.snapshotTimestamp(), table.schema().schemaId(),
-                plan.partitionSpecs(), plan.totalPartitions(), plan.totalFiles(), plan.totalRecords(),
-                plan.totalDeleteFiles(), plan.totalBytes(), counts.completedPartitions(), counts.completedFiles(),
-                counts.failedFiles(), counts.recordsWritten(), counts.committedRecords() - counts.recordsWritten(),
-                record.startedAt(), finishedAt, error));
+    /** The control table's view of this table migration: the source table at the snapshot, the run's status. */
+    private void saveControl(StartedRun run, RunRecord.Status status) {
+        state.saveControl(new ControlRecord(run.run().sourceDatasetId(), run.run().targetDatasetId(), status,
+                run.runId(), run.plan().table().snapshotId(), run.plan().totalFiles(), run.plan().totalRecords()));
     }
 
     private static List<String> keys(PartitionTasks partition) {
-        return partition.files().stream().map(task -> task.source().key()).toList();
+        return partition.files().stream().map(task -> task.source().location()).toList();
     }
 
     private static String failureList(List<FileResult> failures) {

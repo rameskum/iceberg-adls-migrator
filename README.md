@@ -41,7 +41,8 @@ Databricks job ──app_args──▶ team launcher (isolated class loader) ─
 | `ParquetDataWriter` | Writes Parquet with Iceberg's writer (exact type mapping), including empty files |
 | `AzureBlobStore` | Staged block upload and atomic commit, metadata, listing, deletes, lease lock |
 | `MigrationStateRepository` | Control, run and file tables, with retries |
-| `SparkSqlExecutor` | Runs the state SQL through the cluster's Spark session |
+| `StateTable` | Each state table's columns: the source of its DDL and of the schema of rows merged into it |
+| `SparkSqlExecutor` | Runs the state SQL through the cluster's Spark session; turns rows into a typed temporary view to merge from |
 | `MigrationProgressTracker` | Record, file and partition progress, committed and in flight |
 
 ## Build
@@ -104,8 +105,8 @@ cluster's Spark session as the job's identity.
 - create the target container (the app never creates it);
 - grant the identity *Storage Blob Data Contributor* on it;
 - grant the job's identity `USE CATALOG`, `USE SCHEMA`, `CREATE TABLE`, and `SELECT` and `MODIFY` on the schema
-  holding the state tables. The app creates them at startup from
-  [`src/main/resources/db/databricks/migration-state.sql`](src/main/resources/db/databricks/migration-state.sql).
+  holding the state tables. The app creates them at startup from their definitions in
+  [`StateTable`](src/main/java/com/tds/pde/migration/state/StateTable.java).
 
 ## Configuration
 
@@ -159,26 +160,52 @@ is authoritative.
 
 ## State tables
 
-Three Delta tables, shared by every migration job and created at startup with `CREATE TABLE IF NOT EXISTS`:
+Three Delta tables, shared by every migration job and created at startup with `CREATE TABLE IF NOT EXISTS`. Each
+fact is stored once; the rest is a join away.
 
-| Table | One row per | Holds |
+| Table | One row per | Columns |
 |---|---|---|
-| control (`migration_control`) | table migration: a source table and its target | Source metadata at the pinned snapshot (format version, snapshot id and time, schema id, partition specs, total partitions, files, records, delete files and bytes), the latest run id and status, completed and failed counts, records written and deleted, start, finish, error |
-| run (`migration_run`) | run | Pinned snapshot, read and output schemas, totals, status, start, finish, error |
-| file (`migration_file`) | source data file of a run | Source and target paths, physical records, status (`PENDING`, `COMPLETED`, `FAILED`), records written and deleted, attempts, last error |
+| control (`migration_control`) | table migration, keyed by `source_dataset_id` and `target_dataset_id` | `status` and `last_run_id` of the latest run; the source table at its pinned snapshot: `snapshot_id`, `total_files`, `total_records` |
+| run (`migration_run`) | run | `run_id`, `status` (`RUNNING`, `SUCCEEDED`, `FAILED`, `SUPERSEDED`), the migration's `source_dataset_id` and `target_dataset_id`, the resolved `source_location` and `target_location`, and what a resume must reproduce: `snapshot_id`, `source_schema_json`, `output_schema_json`; `started_at`, `finished_at`, `error` |
+| file (`migration_file`) | source data file of a run | `run_id`, `source_path`, `target_path`, `physical_records`, `status` (`PENDING`, `COMPLETED`, `FAILED`), `records_written` (the other physical records were deleted), `error` |
 
-The control row is written when a run starts, after each partition completes and when the run ends, so it shows a
-migration's progress while it runs:
+A run belongs to the migration with its dataset pair, and the control row points at the latest run. The control row
+is written when a run starts and when it ends; progress while a run is going comes from its file rows, which are
+updated as each file completes:
 
 ```sql
-SELECT source_dataset_id, status, completed_files, total_files, records_written, total_records, last_run_id, error
-FROM main.migration.migration_control;
+SELECT c.source_dataset_id, c.target_dataset_id, c.status, c.last_run_id, c.snapshot_id,
+       count_if(f.status = 'COMPLETED') AS completed_files, count_if(f.status = 'FAILED') AS failed_files,
+       c.total_files, coalesce(sum(f.records_written), 0) AS records_written, c.total_records,
+       r.started_at, r.finished_at, r.error
+FROM main.migration.migration_control c
+JOIN main.migration.migration_run r ON r.run_id = c.last_run_id
+LEFT JOIN main.migration.migration_file f ON f.run_id = r.run_id
+GROUP BY ALL;
 ```
 
-**Writes.** The SQL runs through the cluster's `SparkSession`, reached by reflection because the launcher's isolated
-class loader hides the runtime's classes. Every statement is a Delta commit, so a file costs one write: its outcome.
-Parallel jobs migrating *different* tables share the tables safely: deletion vectors and row tracking give
-row-level concurrency, and the rare conflicting commit is retried with jittered backoff.
+Every run of one migration, oldest first:
+
+```sql
+SELECT * FROM main.migration.migration_run
+WHERE source_dataset_id = :source AND target_dataset_id = :target
+ORDER BY started_at;
+```
+
+**Writes.** Every write is a `MERGE INTO`. The rows to write become a DataFrame typed by the table's `StateTable`
+definition, registered as a temporary view and merged on the table's key:
+
+| Write | Merge |
+|---|---|
+| Control row | `WHEN MATCHED THEN UPDATE SET * WHEN NOT MATCHED THEN INSERT *` |
+| New run, its file rows | `WHEN NOT MATCHED THEN INSERT *`, so a retry after a commit that did land adds nothing |
+| Run status, file outcome, superseding runs | `WHEN MATCHED THEN UPDATE SET` the changed columns; a run or file outcome must match exactly one row |
+
+The statements run through the cluster's `SparkSession`, reached by reflection because the launcher's isolated class
+loader hides the runtime's classes; each call switches the thread's context class loader to Spark's, because Spark and
+Hadoop load their own classes through it. Every statement is a Delta commit, so a file costs one write: its outcome.
+Parallel jobs migrating *different* tables share the tables safely: deletion vectors and row tracking give row-level
+concurrency, and the rare conflicting commit is retried with jittered backoff.
 
 ## Runs and resume
 
@@ -292,13 +319,14 @@ Migration completed: runId=20261117-204240-0fef7d
   Azurite's account key is published in its documentation.
 
 Spark and Delta do not run in the tests: the orchestration tests keep state in an in-memory stand-in for the
-repository, and the Spark bridge is tested against stand-in classes with Spark's API shape. The state table SQL itself
-is only exercised on Databricks.
+repository, and the Spark bridge is tested against stand-in classes with Spark's API shape. The packaged app was run
+by hand through a replica of the launcher on a JVM holding open-source Spark 4.0.1 and Delta 4.0.0, covering a new
+run, a refused rerun, a clean run with a failed file, and its resume.
 
 ## Not yet verified outside tests
 
-- Managed identity sign-in, the Spark bridge against a real Databricks `SparkSession`, and the Delta DDL and
-  statements on Unity Catalog: these need the Databricks workspace.
+- Managed identity sign-in, and the state tables on Databricks' own Spark and Delta with Unity Catalog, including
+  row-level concurrency between parallel jobs: these need the Databricks workspace.
 - A production HDFS cluster (tests use an in-process one).
 - Equality deletes are loaded into memory per data file; memory then grows with the size of the equality delete
   files, not the data files. Tables here are append-only, so none are expected.

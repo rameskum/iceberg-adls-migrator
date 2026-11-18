@@ -105,15 +105,15 @@ public class RunStarter {
 
         RunRecord run = new RunRecord(runId, RunRecord.Status.RUNNING, source.datasetId(), target.datasetId(),
                 source.location(), target.location(), plan.table().snapshotId(),
-                SchemaParser.toJson(plan.table().schema()), SchemaParser.toJson(outputSchema.schema()),
-                plan.totalPartitions(), plan.totalFiles(), plan.totalRecords(), Instant.now(), null, null);
+                SchemaParser.toJson(plan.table().schema()), SchemaParser.toJson(outputSchema.schema()), Instant.now(),
+                null, null);
         state.insertRun(run);
         List<FileRecord> files = pendingFiles(runId, partitions);
         state.insertFiles(files);
         log.info("Run started: runId={} snapshotId={} files={}", runId, plan.table().snapshotId(), files.size());
 
         return new StartedRun(run, new RunContext(runId, plan.table(), outputSchema), plan, partitions,
-                files.stream().collect(Collectors.toMap(FileRecord::fileKey, Function.identity())), false);
+                files.stream().collect(Collectors.toMap(FileRecord::sourcePath, Function.identity())), false);
     }
 
     private StartedRun resume(RunRecord run, DatasetDescriptor source, DatasetDescriptor target,
@@ -141,7 +141,7 @@ public class RunStarter {
 
         List<PartitionTasks> partitions = tasks(plan, location);
         Map<String, FileRecord> stored = state.findFiles(run.runId()).stream()
-                .collect(Collectors.toMap(FileRecord::fileKey, Function.identity()));
+                .collect(Collectors.toMap(FileRecord::sourcePath, Function.identity()));
         requireSameFiles(run, partitions, stored);
 
         state.updateRunStatus(run.runId(), RunRecord.Status.RUNNING, null, null);
@@ -150,17 +150,20 @@ public class RunStarter {
                 run.snapshotId(), run.status(), completed, stored.size());
 
         RunRecord running = new RunRecord(run.runId(), RunRecord.Status.RUNNING, run.sourceDatasetId(),
-                run.targetDatasetId(), run.sourceTableLocation(), run.targetLocation(), run.snapshotId(),
-                run.sourceSchemaJson(), run.outputSchemaJson(), run.totalPartitions(), run.totalFiles(),
-                run.totalRecords(), run.startedAt(), null, null);
+                run.targetDatasetId(), run.sourceLocation(), run.targetLocation(), run.snapshotId(),
+                run.sourceSchemaJson(), run.outputSchemaJson(), run.startedAt(), null, null);
         return new StartedRun(running, new RunContext(run.runId(), plan.table(), outputSchema), plan, partitions,
                 stored, true);
     }
 
     private static void requireSameDatasets(RunRecord run, DatasetDescriptor source, DatasetDescriptor target) {
-        if (!run.sourceTableLocation().equals(source.location())
-                || !run.targetLocation().equals(target.location())) {
-            throw new MigrationFailedException("Run " + run.runId() + " copies " + run.sourceTableLocation() + " to "
+        if (!run.sourceDatasetId().equals(source.datasetId()) || !run.targetDatasetId().equals(target.datasetId())) {
+            throw new MigrationFailedException("Run " + run.runId() + " belongs to the migration of dataset "
+                    + run.sourceDatasetId() + " to " + run.targetDatasetId() + ", not " + source.datasetId() + " to "
+                    + target.datasetId());
+        }
+        if (!run.sourceLocation().equals(source.location()) || !run.targetLocation().equals(target.location())) {
+            throw new MigrationFailedException("Run " + run.runId() + " copies " + run.sourceLocation() + " to "
                     + run.targetLocation() + ", not " + source.location() + " to " + target.location());
         }
     }
@@ -173,7 +176,7 @@ public class RunStarter {
         for (PartitionTasks partition : partitions) {
             for (FileTask task : partition.files()) {
                 planned++;
-                FileRecord record = stored.get(task.source().key());
+                FileRecord record = stored.get(task.source().location());
                 if (record == null) {
                     mismatches.add("not recorded: " + task.source().location());
                 } else if (!record.targetPath().equals(task.target())
@@ -241,13 +244,11 @@ public class RunStarter {
     }
 
     private static List<FileRecord> pendingFiles(String runId, List<PartitionTasks> partitions) {
-        Instant now = Instant.now();
         List<FileRecord> files = new ArrayList<>();
         for (PartitionTasks partition : partitions) {
             for (FileTask task : partition.files()) {
-                files.add(new FileRecord(runId, task.source().key(), task.source().location(),
-                        partition.partition().specId(), partition.partition().path(), task.target(),
-                        task.source().recordCount(), FileRecord.Status.PENDING, null, null, 0, null, now));
+                files.add(new FileRecord(runId, task.source().location(), task.target(), task.source().recordCount(),
+                        FileRecord.Status.PENDING, null, null));
             }
         }
         return files;
