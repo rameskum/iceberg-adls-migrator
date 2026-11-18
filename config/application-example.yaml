@@ -28,6 +28,9 @@ migration:
     page-size: 1MB
     # ZSTD, SNAPPY, GZIP or UNCOMPRESSED
     compression: ZSTD
+  processing:
+    # Files copied at the same time. Each holds about a source row group, a target row group and an upload block.
+    parallel-files: 4
   progress:
     log-every-records: 100000
     log-every: 30s
@@ -40,3 +43,6 @@ migration:
     run-table: main.migration.migration_run
     file-table: main.migration.migration_file
     write-retries: 5
+    # File outcomes are written in batches: every 50 files, or with the first outcome after 30s.
+    outcome-batch-size: 50
+    outcome-flush-interval: 30s

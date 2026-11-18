@@ -9,7 +9,6 @@ import com.tds.pde.migration.schema.OutputSchema;
 import com.tds.pde.migration.source.IcebergDataReader;
 import com.tds.pde.migration.source.IcebergMetadataReader;
 import com.tds.pde.migration.source.MigrationPlan;
-import com.tds.pde.migration.source.SourceFile;
 import com.tds.pde.migration.testing.IcebergTestTables;
 import com.tds.pde.migration.testing.LocalFileBlobStore;
 import com.tds.pde.migration.testing.ParquetOutput;
@@ -17,8 +16,13 @@ import com.tds.pde.migration.testing.TestProperties;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.List;
 import java.util.Map;
 import java.util.Random;
+import java.util.concurrent.Callable;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.iceberg.DataFile;
 import org.apache.iceberg.PartitionSpec;
@@ -36,8 +40,9 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
 /**
- * Migrates a source file larger than the whole heap. Runs in its own JVM with {@code -Xmx128m} (see the
- * {@code bounded-memory} surefire execution), so holding the file in memory would fail with OutOfMemoryError.
+ * Migrates two source files, each larger than the whole heap, at the same time, as parallel file copying does.
+ * Runs in its own JVM with {@code -Xmx128m} (see the {@code bounded-memory} surefire execution), so holding a file
+ * in memory would fail with OutOfMemoryError.
  */
 @Tag("memory")
 class BoundedMemoryTest {
@@ -52,40 +57,55 @@ class BoundedMemoryTest {
     Path tempDir;
 
     @Test
-    void migratesAFileLargerThanTheHeapWithBoundedMemory() throws IOException {
+    void migratesTwoFilesLargerThanTheHeapAtTheSameTimeWithBoundedMemory() throws Exception {
         Table table = IcebergTestTables.create(tempDir.resolve("big"), SCHEMA, PartitionSpec.unpartitioned());
         table.updateProperties().set(TableProperties.PARQUET_ROW_GROUP_SIZE_BYTES, String.valueOf(8 << 20)).commit();
-        DataFile source = writeRandomRows(table);
-        table.newAppend().appendFile(source).commit();
         long maxHeap = Runtime.getRuntime().maxMemory();
-        assertThat(source.fileSizeInBytes()).as("source file must exceed the heap").isGreaterThan(maxHeap);
+        for (String name : List.of("big-1.parquet", "big-2.parquet")) {
+            DataFile source = writeRandomRows(table, name);
+            assertThat(source.fileSizeInBytes()).as("source file must exceed the heap").isGreaterThan(maxHeap);
+            table.newAppend().appendFile(source).commit();
+        }
 
         MigrationPlan plan = new IcebergMetadataReader(new Configuration()).plan(table.location(), null);
-        SourceFile file = plan.partitions().getFirst().files().getFirst();
-        FileTask task = new FileTask(file, "", new TargetPathResolver().resolve("out", "", file.location()));
+        RunContext run = new RunContext("run-1", plan.table(), OutputSchema.unchanged(SCHEMA));
         LocalFileBlobStore blobStore = new LocalFileBlobStore(tempDir.resolve("target"));
         DataFileProcessor processor = new DataFileProcessor(new IcebergDataReader(),
                 new ParquetDataWriter(TestProperties.bind(Map.of("migration.parquet.row-group-size", "16MB"))),
                 blobStore);
+        List<FileTask> tasks = plan.partitions().getFirst().files().stream()
+                .map(file -> new FileTask(file, "", new TargetPathResolver().resolve("out", "", file.location())))
+                .toList();
+        assertThat(tasks).hasSize(2);
 
-        FileResult result = processor.process(new RunContext("run-1", plan.table(), OutputSchema.unchanged(SCHEMA)),
-                task, FileProgressListener.NONE);
+        ExecutorService workers = Executors.newFixedThreadPool(tasks.size());
+        List<Future<FileResult>> results;
+        try {
+            results = workers.invokeAll(tasks.stream()
+                    .<Callable<FileResult>>map(task -> () -> processor.process(run, task, FileProgressListener.NONE))
+                    .toList());
+        } finally {
+            workers.shutdown();
+        }
 
-        assertThat(result.error()).isNull();
-        assertThat(result.recordsWritten()).isEqualTo(ROWS);
-        Path output = blobStore.file(task.target());
-        assertThat(Files.size(output)).as("output file must exceed the heap").isGreaterThan(maxHeap);
-        assertThat(ParquetOutput.of(output).rowCount()).isEqualTo(ROWS);
+        for (int i = 0; i < tasks.size(); i++) {
+            FileResult result = results.get(i).get();
+            assertThat(result.error()).isNull();
+            assertThat(result.recordsWritten()).isEqualTo(ROWS);
+            Path output = blobStore.file(tasks.get(i).target());
+            assertThat(Files.size(output)).as("output file must exceed the heap").isGreaterThan(maxHeap);
+            assertThat(ParquetOutput.of(output).rowCount()).isEqualTo(ROWS);
+        }
     }
 
     /** Streams random, incompressible rows into one data file without holding them. */
-    private static DataFile writeRandomRows(Table table) throws IOException {
+    private static DataFile writeRandomRows(Table table, String name) throws IOException {
         Random random = new Random(42);
         char[] alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/".toCharArray();
         char[] payload = new char[PAYLOAD_LENGTH];
         GenericRecord row = GenericRecord.create(SCHEMA);
         DataWriter<Record> writer = Parquet.writeData(
-                        table.io().newOutputFile(table.locationProvider().newDataLocation("big.parquet")))
+                        table.io().newOutputFile(table.locationProvider().newDataLocation(name)))
                 .forTable(table)
                 .createWriterFunc(GenericParquetWriter::create)
                 .overwrite()

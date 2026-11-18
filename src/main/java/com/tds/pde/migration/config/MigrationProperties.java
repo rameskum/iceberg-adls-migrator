@@ -2,6 +2,7 @@ package com.tds.pde.migration.config;
 
 import jakarta.validation.Valid;
 import jakarta.validation.constraints.AssertTrue;
+import jakarta.validation.constraints.Max;
 import jakarta.validation.constraints.Min;
 import jakarta.validation.constraints.NotNull;
 import jakarta.validation.constraints.Pattern;
@@ -32,6 +33,7 @@ public record MigrationProperties(
         @NotNull @Valid Datasets datasets,
         @DefaultValue @Valid Azure azure,
         @DefaultValue @Valid Parquet parquet,
+        @DefaultValue @Valid Processing processing,
         @DefaultValue @Valid Progress progress,
         @DefaultValue @Valid Failure failure,
         @NotNull @Valid State state) {
@@ -107,6 +109,13 @@ public record MigrationProperties(
     }
 
     /**
+     * @param parallelFiles source files copied at the same time. Memory grows with it: each file in flight holds
+     *                      about one source row group, one target row group and one upload block.
+     */
+    public record Processing(@DefaultValue("4") @Min(1) @Max(64) int parallelFiles) {
+    }
+
+    /**
      * Record progress is logged whenever either threshold is crossed.
      */
     public record Progress(@DefaultValue("100000") @Positive long logEveryRecords,
@@ -128,15 +137,20 @@ public record MigrationProperties(
      * into SQL because identifiers cannot be bound as parameters, so only plain {@code [catalog.][schema.]table}
      * identifiers are accepted.
      *
-     * @param controlTable fully qualified control table, e.g. {@code main.migration.migration_control}
-     * @param runTable     fully qualified run table, e.g. {@code main.migration.migration_run}
-     * @param fileTable    fully qualified file table, e.g. {@code main.migration.migration_file}
-     * @param writeRetries attempts for each state write before the run is stopped
+     * @param controlTable          fully qualified control table, e.g. {@code main.migration.migration_control}
+     * @param runTable              fully qualified run table, e.g. {@code main.migration.migration_run}
+     * @param fileTable             fully qualified file table, e.g. {@code main.migration.migration_file}
+     * @param writeRetries          attempts for each state write before the run is stopped
+     * @param outcomeBatchSize      file outcomes written to the file table in one commit
+     * @param outcomeFlushInterval  longest a file outcome waits for its batch to fill; the next outcome after it
+     *                              writes the batch
      */
     public record State(@NotNull @Pattern(regexp = TABLE_NAME, message = TABLE_NAME_MESSAGE) String controlTable,
                         @NotNull @Pattern(regexp = TABLE_NAME, message = TABLE_NAME_MESSAGE) String runTable,
                         @NotNull @Pattern(regexp = TABLE_NAME, message = TABLE_NAME_MESSAGE) String fileTable,
-                        @DefaultValue("5") @Min(1) int writeRetries) {
+                        @DefaultValue("5") @Min(1) int writeRetries,
+                        @DefaultValue("50") @Min(1) @Max(5000) int outcomeBatchSize,
+                        @DefaultValue("30s") @NotNull Duration outcomeFlushInterval) {
 
         static final String TABLE_NAME = "[A-Za-z_][A-Za-z0-9_]*(\\.[A-Za-z_][A-Za-z0-9_]*){0,2}";
         static final String TABLE_NAME_MESSAGE =

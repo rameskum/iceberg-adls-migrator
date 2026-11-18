@@ -28,7 +28,7 @@ final class LeaseRunLock implements RunLock {
         this.lease = lease;
         this.blobName = blobName;
         this.renewer = Executors.newSingleThreadScheduledExecutor(runnable -> {
-            Thread thread = new Thread(runnable, "migration-lock-renewal");
+            Thread thread = new Thread(runnable, "lock-renewal");
             thread.setDaemon(true);
             return thread;
         });

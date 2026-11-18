@@ -3,6 +3,8 @@ package com.tds.pde.migration.progress;
 import com.tds.pde.migration.config.MigrationProperties;
 import java.math.BigDecimal;
 import java.math.RoundingMode;
+import java.util.HashMap;
+import java.util.Map;
 import java.util.function.LongSupplier;
 import lombok.extern.slf4j.Slf4j;
 
@@ -10,13 +12,13 @@ import lombok.extern.slf4j.Slf4j;
  * Keeps and reports the three independent progress measures of a run: records, data files and partitions.
  *
  * <p>Counts only become final ("committed") when the work behind them is: records and files once their
- * target file is published, partitions once all their files are. Rows of the file being processed are
- * reported separately as in flight and are dropped if that file fails.
+ * target file is published, partitions once all their files are. Rows of the files being processed are
+ * reported separately as in flight and are dropped if their file fails.
  *
  * <p>Record totals are physical source rows (before deletes), the only total Iceberg metadata gives exactly
  * without scanning; rows removed by deletes count as processed, and are reported as deleted.
  *
- * <p>Not thread-safe: one run thread drives it.
+ * <p>Thread-safe: files copied in parallel report to one tracker.
  */
 @Slf4j
 public final class MigrationProgressTracker {
@@ -35,8 +37,8 @@ public final class MigrationProgressTracker {
     private long failedFiles;
     private long completedPartitions;
 
-    private long inFlightRecords;
-    private long inFlightWritten;
+    /** Cumulative physical rows read and rows written of each file being processed, by source path. */
+    private final Map<String, long[]> inFlight = new HashMap<>();
 
     private long lastLoggedRecords;
     private long lastLoggedAt;
@@ -56,7 +58,7 @@ public final class MigrationProgressTracker {
         return total == 0 ? 100.0 : (completed * 100.0) / total;
     }
 
-    public void start(long totalRecords, long totalFiles, long totalPartitions) {
+    public synchronized void start(long totalRecords, long totalFiles, long totalPartitions) {
         this.totalRecords = totalRecords;
         this.totalFiles = totalFiles;
         this.totalPartitions = totalPartitions;
@@ -64,7 +66,7 @@ public final class MigrationProgressTracker {
     }
 
     /** A file a resumed run had already published. */
-    public void fileAlreadyCompleted(long physicalRecords, long written) {
+    public synchronized void fileAlreadyCompleted(long physicalRecords, long written) {
         committedRecords += physicalRecords;
         recordsWritten += written;
         completedFiles++;
@@ -72,25 +74,23 @@ public final class MigrationProgressTracker {
     }
 
     /** A partition a resumed run had already finished. */
-    public void partitionAlreadyCompleted() {
+    public synchronized void partitionAlreadyCompleted() {
         completedPartitions++;
     }
 
-    /** Cumulative counts of the file being processed. */
-    public void onFileProgress(long physicalRowsRead, long written) {
-        inFlightRecords = physicalRowsRead;
-        inFlightWritten = written;
-        long processed = committedRecords + inFlightRecords;
+    /** Cumulative counts of a file being processed. */
+    public synchronized void onFileProgress(String sourcePath, long physicalRowsRead, long written) {
+        inFlight.put(sourcePath, new long[] {physicalRowsRead, written});
+        long processed = committedRecords + inFlightRecords();
         long now = nanoClock.getAsLong();
         if (processed - lastLoggedRecords >= logEveryRecords || now - lastLoggedAt >= logEveryNanos) {
             logRecordProgress(processed, now);
         }
     }
 
-    /** The current file was published: its rows become committed. */
-    public void fileCompleted(long physicalRowsRead, long written) {
-        inFlightRecords = 0;
-        inFlightWritten = 0;
+    /** A file was published: its rows become committed. */
+    public synchronized void fileCompleted(String sourcePath, long physicalRowsRead, long written) {
+        inFlight.remove(sourcePath);
         committedRecords += physicalRowsRead;
         recordsWritten += written;
         completedFiles++;
@@ -101,25 +101,25 @@ public final class MigrationProgressTracker {
         }
     }
 
-    /** The current file failed: nothing it read counts. */
-    public void fileFailed() {
-        inFlightRecords = 0;
-        inFlightWritten = 0;
+    /** A file failed: nothing it read counts. */
+    public synchronized void fileFailed(String sourcePath) {
+        inFlight.remove(sourcePath);
         failedFiles++;
     }
 
-    public void partitionCompleted() {
+    public synchronized void partitionCompleted() {
         completedPartitions++;
         log.info("Partition progress: {}/{} ({}%)", completedPartitions, totalPartitions,
                 format(completedPartitions, totalPartitions));
     }
 
-    public ProgressSnapshot snapshot() {
-        return new ProgressSnapshot(totalRecords, committedRecords, recordsWritten, inFlightRecords, inFlightWritten,
+    public synchronized ProgressSnapshot snapshot() {
+        return new ProgressSnapshot(totalRecords, committedRecords, recordsWritten, inFlightRecords(),
+                inFlightWritten(),
                 totalFiles, completedFiles, failedFiles, totalPartitions, completedPartitions);
     }
 
-    public String summary() {
+    public synchronized String summary() {
         return "Records: " + committedRecords + "/" + totalRecords + " (" + format(committedRecords, totalRecords)
                 + "%) written=" + recordsWritten + " deleted=" + (committedRecords - recordsWritten)
                 + "\n  Files: " + completedFiles + "/" + totalFiles + " (" + format(completedFiles, totalFiles)
@@ -130,9 +130,18 @@ public final class MigrationProgressTracker {
 
     private void logRecordProgress(long processed, long now) {
         log.info("Record progress: {}/{} ({}%) committed={} inFlight={} written={}", processed, totalRecords,
-                format(processed, totalRecords), committedRecords, inFlightRecords, recordsWritten + inFlightWritten);
+                format(processed, totalRecords), committedRecords, inFlightRecords(),
+                recordsWritten + inFlightWritten());
         lastLoggedRecords = processed;
         lastLoggedAt = now;
+    }
+
+    private long inFlightRecords() {
+        return inFlight.values().stream().mapToLong(counts -> counts[0]).sum();
+    }
+
+    private long inFlightWritten() {
+        return inFlight.values().stream().mapToLong(counts -> counts[1]).sum();
     }
 
     /** Up to four decimals, without trailing zeros: 100, 0.83, 0.0067. */

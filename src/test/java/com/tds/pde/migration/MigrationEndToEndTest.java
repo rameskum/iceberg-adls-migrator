@@ -143,11 +143,44 @@ class MigrationEndToEndTest {
     }
 
     @Test
-    void stopsAtTheFirstFailedFileByDefault() {
+    void copiesFilesInParallel() {
+        appendFiles();
+        blobStore.holdCommitsUntilConcurrent(3);
+
+        migrate("--migration.processing.parallel-files=3");
+
+        assertThat(blobStore.maxConcurrentUploads()).isEqualTo(3);
+        assertThat(onlyRun().status()).isEqualTo(RunRecord.Status.SUCCEEDED);
+        assertThat(files(onlyRun())).extracting(FileRecord::status).containsOnly(FileRecord.Status.COMPLETED);
+        assertThat(dataBlobs()).hasSize(3);
+    }
+
+    @Test
+    void recordsFileOutcomesInBatches() {
+        appendFiles();
+
+        migrate("--migration.state.outcome-batch-size=2", "--migration.state.outcome-flush-interval=1h");
+
+        assertThat(stateStore.outcomeWrites()).as("a full batch, then the rest at the end").containsExactly(2, 1);
+        assertThat(files(onlyRun())).extracting(FileRecord::status).containsOnly(FileRecord.Status.COMPLETED);
+    }
+
+    @Test
+    void recordsAnOutcomeAtOnceWhenTheFlushIntervalHasPassed() {
+        appendFiles();
+
+        migrate("--migration.state.outcome-flush-interval=0s");
+
+        assertThat(stateStore.outcomeWrites()).containsExactly(1, 1, 1);
+    }
+
+    @Test
+    void stopsAtTheFirstFailedFileByDefault(CapturedOutput output) {
         appendFiles();
         blobStore.failWritesTo(name -> name.contains("region=EU"));
 
-        assertThatThrownBy(this::migrate)
+        // One file at a time, so that no other file is already being copied when the first one fails.
+        assertThatThrownBy(() -> migrate("--migration.processing.parallel-files=1"))
                 .isInstanceOf(MigrationFailedException.class)
                 .hasMessageContaining("failed: 1 of 3 files failed")
                 .hasMessageContaining("resume it with migration.run-id=");
@@ -158,7 +191,8 @@ class MigrationEndToEndTest {
         assertThat(statusByPartition(run)).isEqualTo(Map.of(
                 "region=APAC", List.of(FileRecord.Status.COMPLETED),
                 "region=EU", List.of(FileRecord.Status.FAILED, FileRecord.Status.PENDING)));
-        // Only two partitions exist; with fail-fast the second EU file was never attempted.
+        // Only two partitions exist; with fail-fast the second EU file was never started.
+        assertThat(output.getOut()).contains("Stopped starting files after the first failed file");
         assertThat(files(run)).filteredOn(file -> file.status() == FileRecord.Status.FAILED).singleElement()
                 .satisfies(file -> assertThat(file.error()).contains("injected write failure"));
         assertThat(dataBlobs()).hasSize(1);
@@ -307,7 +341,8 @@ class MigrationEndToEndTest {
                 "--migration.state.file-table=" + "migration_file",
                 "--migration.state.control-table=" + "migration_control"));
         args.addAll(List.of(extraArgs));
-        MigrationApplication.run(new SpringApplication(MigrationApplication.class, InMemoryStorage.class, InMemoryState.class),
+        MigrationApplication.run(
+                new SpringApplication(MigrationApplication.class, InMemoryStorage.class, InMemoryState.class),
                 args.toArray(String[]::new));
     }
 

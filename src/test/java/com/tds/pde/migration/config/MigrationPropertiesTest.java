@@ -66,6 +66,19 @@ class MigrationPropertiesTest {
         assertThat(properties.progress().logEvery()).isEqualTo(Duration.ofSeconds(30));
         assertThat(properties.failure().onFileFailure()).isEqualTo(OnFileFailure.FAIL_FAST);
         assertThat(properties.state().writeRetries()).isEqualTo(5);
+        assertThat(properties.state().outcomeBatchSize()).isEqualTo(50);
+        assertThat(properties.state().outcomeFlushInterval()).isEqualTo(Duration.ofSeconds(30));
+        assertThat(properties.processing().parallelFiles()).isEqualTo(4);
+    }
+
+    @Test
+    void rejectsParallelFilesOutsideItsRange() {
+        Map<String, String> values = required();
+        values.put("migration.processing.parallel-files", "0");
+
+        assertThatThrownBy(() -> bind(values))
+                .isInstanceOf(BindException.class)
+                .hasStackTraceContaining("on field 'parallelFiles'");
     }
 
     @Test
@@ -205,9 +218,11 @@ class MigrationPropertiesTest {
         MigrationProperties properties = bind(new Binder(ConfigurationPropertySources.get(environment)));
 
         assertThat(properties.runId()).isNull();
-        assertThat(properties.source().datasetId()).isEqualTo(java.util.UUID.fromString("0e9c1a5e-4c55-4a3b-9f3e-1c2a7d8b6e01"));
+        assertThat(properties.source().datasetId())
+                .isEqualTo(java.util.UUID.fromString("0e9c1a5e-4c55-4a3b-9f3e-1c2a7d8b6e01"));
         assertThat(properties.source().hadoop()).containsEntry("fs.defaultFS", "hdfs://namenode:8020");
-        assertThat(properties.target().datasetId()).isEqualTo(java.util.UUID.fromString("5b2f7d3c-8a1e-4f6b-b2d4-9c0e3a7f1d02"));
+        assertThat(properties.target().datasetId())
+                .isEqualTo(java.util.UUID.fromString("5b2f7d3c-8a1e-4f6b-b2d4-9c0e3a7f1d02"));
         assertThat(properties.state().controlTable()).isEqualTo("main.migration.migration_control");
         assertThat(properties.state().runTable()).isEqualTo("main.migration.migration_run");
         assertThat(properties.state().fileTable()).isEqualTo("main.migration.migration_file");

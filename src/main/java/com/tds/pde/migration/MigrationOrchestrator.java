@@ -15,12 +15,14 @@ import com.tds.pde.migration.processing.FileResult;
 import com.tds.pde.migration.processing.FileTask;
 import com.tds.pde.migration.processing.PublishedFile;
 import com.tds.pde.migration.progress.MigrationProgressTracker;
-import com.tds.pde.migration.run.PartitionProcessor;
+import com.tds.pde.migration.run.FileOutcomeRecorder;
+import com.tds.pde.migration.run.FileRunner;
 import com.tds.pde.migration.run.PartitionTasks;
 import com.tds.pde.migration.run.RunStarter;
 import com.tds.pde.migration.run.StartedRun;
 import com.tds.pde.migration.source.IcebergDataReader;
 import com.tds.pde.migration.state.ControlRecord;
+import com.tds.pde.migration.state.FileOutcome;
 import com.tds.pde.migration.state.FileRecord;
 import com.tds.pde.migration.state.MigrationStateRepository;
 import com.tds.pde.migration.state.RunRecord;
@@ -100,7 +102,10 @@ public class MigrationOrchestrator {
     }
 
     private void execute(StartedRun run, BlobStore blobStore, RunLock lock, MigrationProgressTracker progress) {
-        Map<String, PublishedFile.Counts> published = run.resumed() ? restorePublished(run, blobStore, progress)
+        FileOutcomeRecorder outcomes = new FileOutcomeRecorder(state, run.runId(),
+                properties.state().outcomeBatchSize(), properties.state().outcomeFlushInterval());
+        Map<String, PublishedFile.Counts> published = run.resumed()
+                ? restorePublished(run, blobStore, progress, outcomes)
                 : Map.of();
 
         log.info("Migration overview: runId={} resumed={} table={} snapshotId={}\n  Total partitions: {}\n"
@@ -113,28 +118,17 @@ public class MigrationOrchestrator {
         }
         saveControl(run, RunRecord.Status.RUNNING);
 
-        PartitionProcessor partitions = new PartitionProcessor(run,
-                new DataFileProcessor(dataReader, dataWriter, blobStore, lock::ensureHeld), state, progress, lock,
-                properties.failure().onFileFailure());
-        for (PartitionTasks partition : run.partitions()) {
-            if (published.keySet().containsAll(keys(partition))) {
-                continue;
-            }
-            log.info("Partition processing started: partition={} specId={} files={} physicalRecords={}",
-                    partition.partition().displayName(), partition.partition().specId(), partition.files().size(),
-                    partition.partition().recordCount());
-            if (partitions.process(partition, published)) {
-                log.info("Partition completed: partition={} files={}", partition.partition().displayName(),
-                        partition.files().size());
-                progress.partitionCompleted();
-            }
-            if (partitions.stopped()) {
-                log.error("Stopping at the first failed file (migration.failure.on-file-failure=FAIL_FAST)");
-                break;
-            }
+        log.info("Copying files: parallelFiles={} outcomeBatchSize={}", properties.processing().parallelFiles(),
+                properties.state().outcomeBatchSize());
+        FileRunner.Result result = new FileRunner(run,
+                new DataFileProcessor(dataReader, dataWriter, blobStore, lock::ensureHeld), outcomes, progress, lock,
+                properties.failure().onFileFailure(), properties.processing().parallelFiles()).run(published);
+        if (result.stopped()) {
+            log.error("Stopped starting files after the first failed file "
+                    + "(migration.failure.on-file-failure=FAIL_FAST); files already being copied finished");
         }
 
-        List<FileResult> failures = partitions.failures();
+        List<FileResult> failures = result.failures();
         if (failures.isEmpty()) {
             Instant finished = Instant.now();
             state.updateRunStatus(run.runId(), RunRecord.Status.SUCCEEDED, finished, null);
@@ -155,7 +149,8 @@ public class MigrationOrchestrator {
      * completion the state store missed is recorded now instead of being written again.
      */
     private Map<String, PublishedFile.Counts> restorePublished(StartedRun run, BlobStore blobStore,
-                                                               MigrationProgressTracker progress) {
+                                                               MigrationProgressTracker progress,
+                                                               FileOutcomeRecorder outcomes) {
         Map<String, PublishedFile.Counts> published = new HashMap<>();
         for (PartitionTasks partition : run.partitions()) {
             for (FileTask task : partition.files()) {
@@ -168,7 +163,7 @@ public class MigrationOrchestrator {
                 if (stored == null || stored.status() != FileRecord.Status.COMPLETED) {
                     log.info("Source file was already published; recording it as completed: source={} target={}",
                             task.source().location(), task.target());
-                    state.markFileCompleted(run.runId(), sourcePath, counts.get().recordsWritten());
+                    outcomes.record(FileOutcome.completed(sourcePath, counts.get().recordsWritten()));
                 }
                 published.put(sourcePath, counts.get());
                 progress.fileAlreadyCompleted(counts.get().physicalRowsRead(), counts.get().recordsWritten());
@@ -177,6 +172,7 @@ public class MigrationOrchestrator {
                 progress.partitionAlreadyCompleted();
             }
         }
+        outcomes.flush();
         return published;
     }
 

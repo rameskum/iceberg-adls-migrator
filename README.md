@@ -5,7 +5,8 @@ account without hierarchical namespace). The target is plain Parquet: no Iceberg
 
 - One source data file becomes exactly one target Parquet file.
 - The output holds the **logical** table data: position deletes, equality deletes and deletion vectors are applied.
-- Rows are streamed one at a time; memory stays bounded however large the table is.
+- Several files are copied at the same time; within a file, rows are streamed one at a time, so memory stays
+  bounded however large the table is.
 - A file becomes visible at its target only once it is complete and verified, so a failed or interrupted
   write can never be mistaken for a finished file.
 - Every table migration, run and file is tracked in Delta tables written through the cluster's own Spark session,
@@ -35,7 +36,8 @@ Databricks job ──app_args──▶ team launcher (isolated class loader) ─
 | `RunStarter` | New run, resume, auto-resume or clean; pins snapshot, schemas and file list in the state store |
 | `IcebergMetadataReader` | Loads the table by path, pins the snapshot, plans files, groups them by partition, validates |
 | `TargetSchemaValidator` | Checks the target schema against the Iceberg schema; decides string conversions |
-| `PartitionProcessor` | Per-file checkpoint: lock check, in progress, process, completed or failed, failure policy |
+| `FileRunner` | Copies up to `parallel-files` files at once: lock check, copy, count, record the outcome; failure policy |
+| `FileOutcomeRecorder` | Writes file outcomes to the file table in batches |
 | `DataFileProcessor` | Copies one source file to one target file; independent of runs, progress and state |
 | `IcebergDataReader` | Streams the live rows of one data file, the way Iceberg's generic reader does |
 | `ParquetDataWriter` | Writes Parquet with Iceberg's writer (exact type mapping), including empty files |
@@ -132,11 +134,20 @@ complete example. Invalid values stop the app before any data is touched.
 | `migration.parquet.compression` | `ZSTD` | `ZSTD`, `SNAPPY`, `GZIP` or `UNCOMPRESSED` |
 | `migration.progress.log-every-records` | `100000` | Log record progress at least this often (in records) |
 | `migration.progress.log-every` | `30s` | ...and at least this often (in time) |
+| `migration.processing.parallel-files` | `4` | Files copied at the same time (1 to 64); see memory below |
 | `migration.failure.on-file-failure` | `FAIL_FAST` | Or `CONTINUE` with the remaining files |
 | `migration.state.control-table` | required | e.g. `main.migration.migration_control` |
 | `migration.state.run-table` | required | e.g. `main.migration.migration_run` |
 | `migration.state.file-table` | required | e.g. `main.migration.migration_file` |
 | `migration.state.write-retries` | `5` | Attempts per state table call before the run stops |
+| `migration.state.outcome-batch-size` | `50` | File outcomes written to the file table in one commit |
+| `migration.state.outcome-flush-interval` | `30s` | The first outcome after this long since the last write is written at once, with any waiting |
+
+**Memory and parallel files.** Each file being copied holds about one source row group (as written in the
+source table), one target row group (`migration.parquet.row-group-size`) and one upload block
+(`migration.target.block-size`). With the defaults that is up to about 300 MB per file for large source files, so
+`parallel-files: 4` needs roughly 1.2 GB of driver heap at peak; small files need far less. More parallel files help
+until HDFS, the network or Azure is saturated.
 
 **Authentication.** The `TokenCredential` bean in `AzureConfig` is the single place to plug in a different
 sign-in mechanism. The default is the cluster's managed identity.
@@ -262,9 +273,12 @@ Migration completed: runId=20261117-204240-0fef7d
 - **Record totals are physical rows** (before deletes), the only total Iceberg metadata gives exactly without
   scanning the table. Rows removed by deletes count as processed and are reported as `deleted`, so a completed
   run always reaches 100%.
-- **Committed and in flight.** Rows of the file being written are reported as `inFlight`; they become
-  `committed` only when that file is published, and are dropped if it fails. Files count when published;
-  partitions count when all their files are.
+- **Committed and in flight.** Rows of the files being written are reported as `inFlight`, summed over the files
+  copied in parallel; they become `committed` only when their file is published, and are dropped if it fails.
+  Files count when published; partitions count when all their files are. With files copied in parallel, the log
+  lines of different files interleave; the thread name (`file-worker-N`) tells them apart.
+- **The file table trails the log slightly:** outcomes are written in batches (see
+  `migration.state.outcome-batch-size`), so a finished file can show `PENDING` there until its batch is written.
 - For JSON logs set `logging.structured.format.console=ecs` (or `logstash`).
 
 ## Failure handling
@@ -272,13 +286,14 @@ Migration completed: runId=20261117-204240-0fef7d
 - **A failed file publishes nothing.** Its staged blocks are never committed; Azure discards them after 7 days.
 - **Every file is verified before publishing:** all physical rows recorded in Iceberg metadata must have been read,
   and the closed Parquet file must hold exactly the rows written.
-- **`FAIL_FAST`** (default) stops at the first failed file; **`CONTINUE`** processes the rest. Either way the run
-  ends `FAILED`, lists the failed files (source, target, reason) and throws `MigrationFailedException` with
-  the run id to resume.
+- **`FAIL_FAST`** (default) starts no more files after the first failed one; files already being copied in
+  parallel finish and count. **`CONTINUE`** processes the rest. Either way the run ends `FAILED`, lists the failed
+  files (source, target, reason) and throws `MigrationFailedException` with the run id to resume.
 - **Checked before anything is written:** non-Parquet data files, unreadable delete files, format versions above 3,
   schema mismatches, a non-empty target for a new run, another active run.
 - **State table failures** are retried with jittered backoff (about 1s, then 2s, ...); if they persist the run stops,
-  and the next resume recognises published files by their blob metadata.
+  and the next resume recognises published files by their blob metadata. The same covers outcomes that were still
+  waiting for their batch when a run stopped or crashed: nothing published is copied twice.
 
 ## Output
 
@@ -305,8 +320,8 @@ Migration completed: runId=20261117-204240-0fef7d
   changes, empty and never-written tables, fail-fast, continue, resume, recovery of completions the state store
   missed, lock conflicts and loss, clean.
 - **HDFS:** one end-to-end test reads the source from an in-process HDFS (`MiniDFSCluster`).
-- **Bounded memory:** `BoundedMemoryTest` (tag `memory`) runs in its own JVM with `-Xmx128m` and migrates a
-  source file larger than the heap.
+- **Bounded memory:** `BoundedMemoryTest` (tag `memory`) runs in its own JVM with `-Xmx128m` and migrates two
+  source files, each larger than the heap, at the same time.
 - **Azure:** the Blob adapter tests and one end-to-end test need a real Blob API. They run when
   `AZURE_STORAGE_TEST_CONNECTION_STRING` is set, for example against Azurite:
 
@@ -330,5 +345,5 @@ run, a refused rerun, a clean run with a failed file, and its resume.
 - A production HDFS cluster (tests use an in-process one).
 - Equality deletes are loaded into memory per data file; memory then grows with the size of the equality delete
   files, not the data files. Tables here are append-only, so none are expected.
-- Files are processed one at a time. `DataFileProcessor` is independent of the run, so file-level parallelism can
-  be added around it later.
+- The best `parallel-files` for a real cluster: it depends on HDFS, network and Azure throughput, so measure it
+  with the `durationMs` of each file and the run's total time.

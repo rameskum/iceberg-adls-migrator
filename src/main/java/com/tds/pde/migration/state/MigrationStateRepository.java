@@ -165,22 +165,28 @@ public class MigrationStateRepository {
                 .stream().map(MigrationStateRepository::file).toList();
     }
 
-    public void markFileCompleted(String runId, String sourcePath, long recordsWritten) {
-        Map<String, Object> row = new HashMap<>();
-        row.put("run_id", runId);
-        row.put("source_path", sourcePath);
-        row.put("records_written", recordsWritten);
-        mergeOne("mark file completed", fileTable, row, FILE_KEY, "WHEN MATCHED THEN UPDATE SET"
-                + " status = 'COMPLETED', records_written = s.records_written, error = NULL");
-    }
-
-    public void markFileFailed(String runId, String sourcePath, String error) {
-        Map<String, Object> row = new HashMap<>();
-        row.put("run_id", runId);
-        row.put("source_path", sourcePath);
-        row.put("error", truncate(error));
-        mergeOne("mark file failed", fileTable, row, FILE_KEY, "WHEN MATCHED THEN UPDATE SET status = 'FAILED',"
-                + " error = s.error");
+    /** Writes the outcomes of files of one run; each must match an existing file row. */
+    public void recordFileOutcomes(String runId, List<FileOutcome> outcomes) {
+        for (int start = 0; start < outcomes.size(); start += FILE_ROWS_PER_MERGE) {
+            List<FileOutcome> chunk = outcomes.subList(start, Math.min(outcomes.size(), start + FILE_ROWS_PER_MERGE));
+            List<Map<String, ?>> rows = new ArrayList<>(chunk.size());
+            for (FileOutcome outcome : chunk) {
+                Map<String, Object> row = new HashMap<>();
+                row.put("run_id", runId);
+                row.put("source_path", outcome.sourcePath());
+                row.put("status", outcome.status().name());
+                row.put("records_written", outcome.recordsWritten());
+                row.put("error", truncate(outcome.error()));
+                rows.add(row);
+            }
+            String operation = "record " + chunk.size() + " file outcomes";
+            long updated = merge(operation, fileTable, rows, FILE_KEY, "WHEN MATCHED THEN UPDATE SET"
+                    + " status = s.status, records_written = s.records_written, error = s.error");
+            if (updated >= 0 && updated != chunk.size()) {
+                throw new IllegalStateException(operation + " updated " + updated + " rows instead of "
+                        + chunk.size());
+            }
+        }
     }
 
     // ---- helpers ----------------------------------------------------------------------------------------------

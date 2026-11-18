@@ -1,11 +1,13 @@
 package com.tds.pde.migration.testing;
 
 import com.tds.pde.migration.state.ControlRecord;
+import com.tds.pde.migration.state.FileOutcome;
 import com.tds.pde.migration.state.FileRecord;
 import com.tds.pde.migration.state.MigrationStateRepository;
 import com.tds.pde.migration.state.RunRecord;
 import com.tds.pde.migration.state.SqlExecutor;
 import java.time.Instant;
+import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -53,6 +55,7 @@ public class InMemoryState {
         private final Map<String, ControlRecord> controls = new LinkedHashMap<>();
         private final Map<String, RunRecord> runs = new LinkedHashMap<>();
         private final Map<String, FileRecord> files = new LinkedHashMap<>();
+        private final List<Integer> outcomeWrites = new ArrayList<>();
 
         public Store() {
             super(NO_SQL, TestProperties.defaults());
@@ -138,17 +141,18 @@ public class InMemoryState {
         }
 
         @Override
-        public void markFileCompleted(String runId, String sourcePath, long recordsWritten) {
-            FileRecord file = file(runId, sourcePath);
-            replaceFile(new FileRecord(runId, sourcePath, file.targetPath(), file.physicalRecords(),
-                    FileRecord.Status.COMPLETED, recordsWritten, null));
+        public synchronized void recordFileOutcomes(String runId, List<FileOutcome> outcomes) {
+            outcomeWrites.add(outcomes.size());
+            for (FileOutcome outcome : outcomes) {
+                FileRecord file = file(runId, outcome.sourcePath());
+                replaceFile(new FileRecord(runId, outcome.sourcePath(), file.targetPath(), file.physicalRecords(),
+                        outcome.status(), outcome.recordsWritten(), outcome.error()));
+            }
         }
 
-        @Override
-        public void markFileFailed(String runId, String sourcePath, String error) {
-            FileRecord file = file(runId, sourcePath);
-            replaceFile(new FileRecord(runId, sourcePath, file.targetPath(), file.physicalRecords(),
-                    FileRecord.Status.FAILED, file.recordsWritten(), error));
+        /** The size of every file outcome write, in order. */
+        public List<Integer> outcomeWrites() {
+            return List.copyOf(outcomeWrites);
         }
 
         private FileRecord file(String runId, String sourcePath) {

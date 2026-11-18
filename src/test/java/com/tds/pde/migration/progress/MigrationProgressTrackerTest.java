@@ -42,11 +42,11 @@ class MigrationProgressTrackerTest {
         MigrationProgressTracker progress = tracker(1_000_000, Duration.ofHours(1));
         progress.start(300, 3, 2);
 
-        progress.onFileProgress(80, 70);
+        progress.onFileProgress("file-1", 80, 70);
         assertThat(progress.snapshot().committedRecords()).isZero();
         assertThat(progress.snapshot().inFlightRecords()).isEqualTo(80);
 
-        progress.fileCompleted(100, 90);
+        progress.fileCompleted("file-1", 100, 90);
         ProgressSnapshot afterFirst = progress.snapshot();
         assertThat(afterFirst.committedRecords()).isEqualTo(100);
         assertThat(afterFirst.recordsWritten()).isEqualTo(90);
@@ -56,12 +56,28 @@ class MigrationProgressTrackerTest {
     }
 
     @Test
+    void addsUpTheInFlightRowsOfFilesProcessedInParallel() {
+        MigrationProgressTracker progress = tracker(1_000_000, Duration.ofHours(1));
+        progress.start(300, 3, 2);
+
+        progress.onFileProgress("file-1", 80, 70);
+        progress.onFileProgress("file-2", 30, 30);
+        progress.onFileProgress("file-1", 90, 80);
+        assertThat(progress.snapshot().inFlightRecords()).isEqualTo(120);
+        assertThat(progress.snapshot().inFlightWritten()).isEqualTo(110);
+
+        progress.fileCompleted("file-1", 100, 90);
+        assertThat(progress.snapshot().inFlightRecords()).as("only file-2 is still in flight").isEqualTo(30);
+        assertThat(progress.snapshot().committedRecords()).isEqualTo(100);
+    }
+
+    @Test
     void discardsTheInFlightRowsOfAFailedFile() {
         MigrationProgressTracker progress = tracker(1_000_000, Duration.ofHours(1));
         progress.start(300, 3, 2);
 
-        progress.onFileProgress(60, 60);
-        progress.fileFailed();
+        progress.onFileProgress("file-1", 60, 60);
+        progress.fileFailed("file-1");
 
         ProgressSnapshot snapshot = progress.snapshot();
         assertThat(snapshot.committedRecords()).isZero();
@@ -90,7 +106,7 @@ class MigrationProgressTrackerTest {
 
         try (LogCapture logs = new LogCapture(MigrationProgressTracker.class.getName())) {
             for (long read = 256; read <= 5_000; read += 256) {
-                progress.onFileProgress(read, read);
+                progress.onFileProgress("file-1", read, read);
             }
             assertThat(logs.messagesStartingWith("Record progress: ")).containsExactly(
                     "Record progress: 1024/5000 (20.48%) committed=0 inFlight=1024 written=1024",
@@ -106,10 +122,10 @@ class MigrationProgressTrackerTest {
         progress.start(5_000, 1, 1);
 
         try (LogCapture logs = new LogCapture(MigrationProgressTracker.class.getName())) {
-            progress.onFileProgress(100, 100);
+            progress.onFileProgress("file-1", 100, 100);
             clock.addAndGet(Duration.ofSeconds(31).toNanos());
-            progress.onFileProgress(200, 200);
-            progress.onFileProgress(300, 300);
+            progress.onFileProgress("file-1", 200, 200);
+            progress.onFileProgress("file-1", 300, 300);
 
             assertThat(logs.messagesStartingWith("Record progress: ")).containsExactly(
                     "Record progress: 200/5000 (4%) committed=0 inFlight=200 written=200");
@@ -122,10 +138,11 @@ class MigrationProgressTrackerTest {
         progress.start(200, 2, 120);
 
         try (LogCapture logs = new LogCapture(MigrationProgressTracker.class.getName())) {
-            progress.fileCompleted(100, 100);
+            progress.fileCompleted("file-1", 100, 100);
             progress.partitionCompleted();
 
-            assertThat(logs.messages()).containsExactly("File progress: 1/2 (50%)", "Partition progress: 1/120 (0.8333%)");
+            assertThat(logs.messages())
+                    .containsExactly("File progress: 1/2 (50%)", "Partition progress: 1/120 (0.8333%)");
         }
     }
 
@@ -133,8 +150,8 @@ class MigrationProgressTrackerTest {
     void summarisesAllThreeMeasures() {
         MigrationProgressTracker progress = tracker(1_000_000, Duration.ofHours(1));
         progress.start(200, 2, 1);
-        progress.fileCompleted(100, 95);
-        progress.fileCompleted(100, 100);
+        progress.fileCompleted("file-1", 100, 95);
+        progress.fileCompleted("file-2", 100, 100);
         progress.partitionCompleted();
 
         assertThat(progress.summary()).isEqualTo("Records: 200/200 (100%) written=195 deleted=5\n"

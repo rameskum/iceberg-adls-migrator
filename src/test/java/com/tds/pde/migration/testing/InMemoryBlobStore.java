@@ -14,6 +14,8 @@ import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Predicate;
 
 /**
@@ -34,6 +36,22 @@ public final class InMemoryBlobStore implements BlobStore {
     private volatile long failWritesAfterBytes = -1;
     private volatile Predicate<String> failWritesTo = name -> false;
     private volatile boolean failNextCommit;
+    private final AtomicInteger openUploads = new AtomicInteger();
+    private final AtomicInteger maxOpenUploads = new AtomicInteger();
+    private volatile int holdCommitsUntilOpen;
+
+    /**
+     * Holds every commit until {@code uploads} uploads have been open at the same time, and fails it if that does
+     * not happen within ten seconds: only files copied in parallel get through.
+     */
+    public void holdCommitsUntilConcurrent(int uploads) {
+        this.holdCommitsUntilOpen = uploads;
+    }
+
+    /** The most uploads that were open at the same time. */
+    public int maxConcurrentUploads() {
+        return maxOpenUploads.get();
+    }
 
     /** Makes every upload throw once it has received more than {@code bytes} bytes. */
     public void failWritesAfter(long bytes) {
@@ -75,6 +93,7 @@ public final class InMemoryBlobStore implements BlobStore {
     @Override
     public StagedUpload startUpload(String blobName) {
         uploadsStarted.merge(blobName, 1, Integer::sum);
+        maxOpenUploads.accumulateAndGet(openUploads.incrementAndGet(), Math::max);
         return new Upload(blobName);
     }
 
@@ -186,12 +205,25 @@ public final class InMemoryBlobStore implements BlobStore {
                 failNextCommit = false;
                 throw new UncheckedIOException(new IOException("injected commit failure for " + blobName));
             }
+            awaitConcurrentUploads();
             committed.put(blobName, new Blob(staged.toByteArray(), Map.copyOf(metadata)));
+            openUploads.decrementAndGet();
         }
 
         @Override
         public void abort() {
             aborted.add(blobName);
+            openUploads.decrementAndGet();
+        }
+
+        private void awaitConcurrentUploads() {
+            long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
+            while (maxOpenUploads.get() < holdCommitsUntilOpen) {
+                if (System.nanoTime() > deadline) {
+                    throw new IllegalStateException("only " + maxOpenUploads.get() + " uploads were open at once");
+                }
+                Thread.onSpinWait();
+            }
         }
     }
 }
