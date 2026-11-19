@@ -73,7 +73,8 @@ public class MigrationStateRepository {
     /**
      * Brings a table created before its clustering was defined to that clustering. A table already clustered on
      * exactly those columns is left alone: altering it would be a Delta metadata commit, which conflicts with
-     * parallel jobs' merges.
+     * parallel jobs' merges. Clustering only speeds the table up, so a failed alter, typically because the job's
+     * identity does not own the table, is tried once and leaves the table as it is.
      */
     private void cluster(StateTable table) {
         Object current = retrying("read clustering of state table " + table.name(),
@@ -81,8 +82,15 @@ public class MigrationStateRepository {
         if (table.clusterBy().equals(current)) {
             return;
         }
-        retrying("cluster state table " + table.name(), () -> sql.update("ALTER TABLE " + table.name()
-                + " CLUSTER BY (" + String.join(", ", table.clusterBy()) + ")", Map.of()));
+        String alter = "ALTER TABLE " + table.name() + " CLUSTER BY (" + String.join(", ", table.clusterBy()) + ")";
+        try {
+            sql.update(alter, Map.of());
+        } catch (SqlExecutionException e) {
+            log.warn("Cannot cluster state table, continuing unclustered; to cluster it, run as its owner: {}"
+                            + " table={} clusterBy={} currentClusterBy={} reason={}", alter, table.name(),
+                    table.clusterBy(), current, e.getMessage());
+            return;
+        }
         log.info("State table clustered: table={} clusterBy={} previousClusterBy={}", table.name(),
                 table.clusterBy(), current);
     }

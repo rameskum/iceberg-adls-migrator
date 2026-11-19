@@ -188,8 +188,9 @@ when `OPTIMIZE` runs, which predictive optimization does for Unity Catalog manag
 `OPTIMIZE` on the two tables. At startup the app reads each table's `clusteringColumns` from `DESCRIBE DETAIL` and,
 when they differ, as for tables created before clustering existed, runs `ALTER TABLE <table> CLUSTER BY (...)` and
 logs it. A table already clustered right is left alone, so it gets no metadata commit that could conflict with
-parallel jobs' merges. Altering needs ownership of the table; if the job's identity does not own it, startup fails
-until someone who does runs `ALTER TABLE <file-table> CLUSTER BY (run_id)` and
+parallel jobs' merges. Altering needs ownership of the table. When the alter fails, for example because the job's
+identity does not own the table, it is not retried: the app logs a warning with the statement to run and carries on
+with the table unclustered, until its owner runs `ALTER TABLE <file-table> CLUSTER BY (run_id)` and
 `ALTER TABLE <run-table> CLUSTER BY (target_location)` once by hand.
 
 **Retention.** A clean start deletes the file rows of every superseded run of its target: their output is gone

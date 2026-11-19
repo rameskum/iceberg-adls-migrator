@@ -2,6 +2,8 @@ package com.tds.pde.migration.state;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
+import ch.qos.logback.classic.Level;
+import com.tds.pde.migration.testing.LogCapture;
 import com.tds.pde.migration.testing.TestProperties;
 import java.time.Duration;
 import java.util.ArrayList;
@@ -10,6 +12,7 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.function.Function;
+import org.jspecify.annotations.Nullable;
 import org.junit.jupiter.api.Test;
 
 /** The SQL the repository sends, against an executor that records it. */
@@ -66,6 +69,24 @@ class MigrationStateRepositoryTest {
     }
 
     @Test
+    void carriesOnUnclusteredWhenATableCannotBeAltered() {
+        sql.details.put("migration_run", List.of("target_location"));
+        sql.details.put("migration_file", List.of());
+        sql.failingStatement = "ALTER TABLE migration_file CLUSTER BY (run_id)";
+
+        try (LogCapture logs = new LogCapture(MigrationStateRepository.class.getName())) {
+            repository.createTablesIfMissing();
+
+            assertThat(sql.statements).as("tried once, not retried")
+                    .containsOnlyOnce("ALTER TABLE migration_file CLUSTER BY (run_id)");
+            assertThat(logs.messagesAt(Level.WARN)).singleElement().asString()
+                    .contains("ALTER TABLE migration_file CLUSTER BY (run_id)", "table=migration_file",
+                            "clusterBy=[run_id]", "[PERMISSION_DENIED]");
+            assertThat(logs.messages()).last().asString().startsWith("State tables ready:");
+        }
+    }
+
+    @Test
     void deletesTheFileRowsOfTheTargetsSupersededRuns() {
         sql.queryResult = List.of(Map.of("run_id", "run-1"), Map.of("run_id", "run-2"));
 
@@ -97,11 +118,15 @@ class MigrationStateRepositoryTest {
         List<Map<String, Object>> queryResult = List.of();
         /** clusteringColumns that DESCRIBE DETAIL reports, by table. */
         final Map<String, List<String>> details = new HashMap<>();
+        @Nullable String failingStatement;
 
         @Override
         public long update(String statement, Map<String, ?> params) {
             statements.add(statement);
             parameters.add(params);
+            if (statement.equals(failingStatement)) {
+                throw new SqlExecutionException("[PERMISSION_DENIED] User does not have MANAGE on table", null);
+            }
             return -1;
         }
 
