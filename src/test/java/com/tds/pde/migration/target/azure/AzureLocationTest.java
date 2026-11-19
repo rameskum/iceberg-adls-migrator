@@ -35,6 +35,35 @@ class AzureLocationTest {
     }
 
     @Test
+    void overlapsTheSameFolderAndFoldersWithinItOrContainingIt() {
+        AzureLocation orders = AzureLocation.parse("abfss://data@salesacct.dfs.core.windows.net/sales/orders");
+
+        assertThat(orders.overlaps(AzureLocation.parse("abfs://data@salesacct.dfs.core.windows.net/sales/orders/")))
+                .isTrue();
+        assertThat(orders.overlaps(AzureLocation.parse("abfss://data@salesacct.dfs.core.windows.net/sales")))
+                .isTrue();
+        assertThat(orders.overlaps(AzureLocation.parse("abfss://data@salesacct.dfs.core.windows.net/sales/orders/eu")))
+                .isTrue();
+        assertThat(orders.overlaps(AzureLocation.parse("abfss://data@salesacct.dfs.core.windows.net"))).isTrue();
+    }
+
+    @Test
+    void doesNotOverlapSiblingsOrOtherContainersAndAccounts() {
+        AzureLocation orders = AzureLocation.parse("abfss://data@salesacct.dfs.core.windows.net/sales/orders");
+
+        assertThat(orders.overlaps(AzureLocation.parse("abfss://data@salesacct.dfs.core.windows.net/sales/orders-eu")))
+                .isFalse();
+        assertThat(orders.overlaps(AzureLocation.parse("abfss://data@salesacct.dfs.core.windows.net/sales/order")))
+                .isFalse();
+        assertThat(orders.overlaps(AzureLocation.parse("abfss://data@salesacct.dfs.core.windows.net/sales/Orders")))
+                .as("blob names are case-sensitive").isFalse();
+        assertThat(orders.overlaps(AzureLocation.parse("abfss://other@salesacct.dfs.core.windows.net/sales/orders")))
+                .isFalse();
+        assertThat(orders.overlaps(AzureLocation.parse("abfss://data@otheracct.dfs.core.windows.net/sales/orders")))
+                .isFalse();
+    }
+
+    @Test
     void rejectsOtherSchemes() {
         assertThatThrownBy(() -> AzureLocation.parse("https://salesacct.blob.core.windows.net/data/x"))
                 .isInstanceOf(IllegalArgumentException.class)

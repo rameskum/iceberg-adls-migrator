@@ -4,6 +4,7 @@ import com.azure.core.util.BinaryData;
 import com.azure.core.util.Context;
 import com.azure.storage.blob.models.BlobHttpHeaders;
 import com.azure.storage.blob.options.BlockBlobCommitBlockListOptions;
+import com.azure.storage.blob.options.BlockBlobStageBlockOptions;
 import com.azure.storage.blob.specialized.BlockBlobClient;
 import com.tds.pde.migration.target.StagedUpload;
 import java.io.IOException;
@@ -11,6 +12,8 @@ import java.io.InterruptedIOException;
 import java.io.OutputStream;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
 import java.util.ArrayList;
 import java.util.Base64;
 import java.util.List;
@@ -24,7 +27,8 @@ import lombok.extern.slf4j.Slf4j;
 import org.jspecify.annotations.Nullable;
 
 /**
- * A block blob built from staged blocks (Put Block) and published in one atomic Put Block List.
+ * A block blob built from staged blocks (Put Block), each sent with its MD5 so the service rejects one corrupted in
+ * transit, and published in one atomic Put Block List.
  * Staged blocks are invisible to readers, and Azure discards uncommitted blocks after seven days, so an
  * interrupted upload leaves nothing behind that could pass for a finished file.
  *
@@ -97,6 +101,20 @@ final class AzureStagedUpload implements StagedUpload {
         return buffersAllocated;
     }
 
+    /**
+     * The MD5 of a block, sent as its Content-MD5: the service then rejects a block whose bytes changed on the way,
+     * on top of what TLS already checks.
+     */
+    private static byte[] md5(byte[] block, int length) {
+        try {
+            MessageDigest digest = MessageDigest.getInstance("MD5");
+            digest.update(block, 0, length);
+            return digest.digest();
+        } catch (NoSuchAlgorithmException e) {
+            throw new IllegalStateException("Every Java runtime provides MD5", e);
+        }
+    }
+
     private String nextBlockId() {
         // Block ids must be Base64 and equally long within a blob.
         String raw = uploadId + "-" + String.format("%06d", blockIds.size());
@@ -167,7 +185,9 @@ final class AzureStagedUpload implements StagedUpload {
             blockIds.add(blockId);
             staging = stagingThreads.submit(() -> {
                 // Wraps the block without copying; it is not touched again until staging has finished.
-                blob.stageBlock(blockId, BinaryData.fromByteBuffer(ByteBuffer.wrap(block, 0, length)));
+                blob.stageBlockWithResponse(new BlockBlobStageBlockOptions(blockId,
+                                BinaryData.fromByteBuffer(ByteBuffer.wrap(block, 0, length)))
+                                .setContentMd5(md5(block, length)), null, Context.NONE);
                 log.trace("Block staged: blob={} block={} bytes={}", blobName(), index, length);
             });
             filling = other;

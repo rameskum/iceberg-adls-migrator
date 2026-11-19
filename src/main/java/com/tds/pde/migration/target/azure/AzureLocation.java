@@ -59,6 +59,20 @@ public record AzureLocation(String account, String container, String prefix, Str
         return prefix.isEmpty() ? "" : prefix + "/";
     }
 
+    /**
+     * Whether this location and {@code other} are the same folder, or one is within the other, in the same
+     * container: then cleaning either deletes files of the other.
+     */
+    public boolean overlaps(AzureLocation other) {
+        return blobEndpoint.equals(other.blobEndpoint) && container.equals(other.container)
+                && (isWithin(prefix, other.prefix) || isWithin(other.prefix, prefix));
+    }
+
+    /** Whether the folder {@code inner} is {@code outer} or within it; blob names are case-sensitive. */
+    private static boolean isWithin(String inner, String outer) {
+        return outer.isEmpty() || inner.equals(outer) || inner.startsWith(outer + "/");
+    }
+
     /** Joins a name under this location's prefix. */
     public String blobName(String relativeName) {
         return prefix.isEmpty() ? relativeName : prefix + "/" + relativeName;

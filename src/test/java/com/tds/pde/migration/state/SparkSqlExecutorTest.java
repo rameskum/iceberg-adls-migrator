@@ -90,7 +90,7 @@ class SparkSqlExecutorTest {
     void dropsTheViewWhenTheBodyFails() {
         assertThatThrownBy(() -> executor.withRows("run_id STRING", List.<Object[]>of(new Object[] {"run-1"}),
                 view -> {
-                    throw new SqlExecutionException("merge conflict", null);
+                    throw new SqlExecutionException("merge conflict", null, true);
                 }))
                 .hasMessage("merge conflict");
 
@@ -118,6 +118,36 @@ class SparkSqlExecutorTest {
         assertThatThrownBy(() -> executor.query("SELECT * FROM FAIL", Map.of()))
                 .isInstanceOf(SqlExecutionException.class)
                 .hasMessage("Spark SQL failed: [TABLE_OR_VIEW_NOT_FOUND] The table cannot be found");
+    }
+
+    @Test
+    void marksAStatementSparkCannotAnalyseAsNotRetryable() {
+        assertThatThrownBy(() -> executor.update("DELETE FROM FAIL", Map.of()))
+                .isInstanceOfSatisfying(SqlExecutionException.class, e -> assertThat(e.isRetryable()).isFalse());
+    }
+
+    @Test
+    void marksAMissingPermissionAsNotRetryable() {
+        assertThatThrownBy(() -> executor.update("DELETE FROM DENIED", Map.of()))
+                .isInstanceOfSatisfying(SqlExecutionException.class, e -> assertThat(e.isRetryable()).isFalse());
+    }
+
+    @Test
+    void marksADeltaCommitConflictAsRetryable() {
+        assertThatThrownBy(() -> executor.update("MERGE INTO CONFLICT", Map.of()))
+                .isInstanceOfSatisfying(SqlExecutionException.class, e -> assertThat(e.isRetryable()).isTrue());
+    }
+
+    @Test
+    void marksATransientFailureAsRetryable() {
+        assertThatThrownBy(() -> executor.update("MERGE INTO LOST", Map.of()))
+                .isInstanceOfSatisfying(SqlExecutionException.class, e -> assertThat(e.isRetryable()).isTrue());
+    }
+
+    @Test
+    void marksRowsSparkCannotTypeAsNotRetryable() {
+        assertThatThrownBy(() -> executor.withRows("id UNKNOWN_TYPE", List.of(), view -> 0))
+                .isInstanceOfSatisfying(SqlExecutionException.class, e -> assertThat(e.isRetryable()).isFalse());
     }
 
     @Test

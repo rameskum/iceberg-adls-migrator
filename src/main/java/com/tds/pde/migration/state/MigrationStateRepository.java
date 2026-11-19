@@ -26,9 +26,10 @@ import org.springframework.stereotype.Repository;
  * <p>The control row of a migration is changed only by conditional {@code UPDATE}s naming the run that owns it, or
  * the row state it was read in, so a run that lost the row changes nothing. Rows are inserted with a
  * {@code MERGE INTO} whose source is the rows to write, typed by the table's {@link StateTable} definition, so an
- * insert never depends on whether an earlier attempt landed. Every call is retried with jittered backoff, which also
- * absorbs Delta's concurrent-modification conflicts between parallel jobs, before it fails with
- * {@link StateStoreException}; a retried conditional update is evaluated again against the row as it now is.
+ * insert never depends on whether an earlier attempt landed. A call that fails with a retryable error, a Delta
+ * concurrent-modification conflict between parallel jobs or a transient failure, is retried with jittered backoff
+ * before it fails with {@link StateStoreException}; a retried conditional update is evaluated again against the row
+ * as it now is. Any other error, such as a missing table or permission, fails at once: retrying cannot change it.
  */
 @Slf4j
 @Repository
@@ -66,13 +67,33 @@ public class MigrationStateRepository {
      */
     public void createTablesIfMissing() {
         for (StateTable table : List.of(controlTable, fileTable)) {
-            retrying("create state table " + table.name(), () -> sql.update(table.createStatement(), Map.of()));
+            create(table);
             requireColumns(table);
             if (!table.clusterBy().isEmpty()) {
                 cluster(table);
             }
         }
         log.info("State tables ready: controlTable={} fileTable={}", controlTable.name(), fileTable.name());
+    }
+
+    /**
+     * Creates the table unless it exists. Two jobs starting at once can both find it missing, and the slower one's
+     * create can then fail because the table already exists, an error that is not retried; so a failed create only
+     * fails when the table is still missing.
+     */
+    private void create(StateTable table) {
+        try {
+            retrying("create state table " + table.name(), () -> sql.update(table.createStatement(), Map.of()));
+        } catch (StateStoreException e) {
+            try {
+                sql.query("SHOW COLUMNS IN " + table.name(), Map.of());
+            } catch (SqlExecutionException missing) {
+                e.addSuppressed(missing);
+                throw e;
+            }
+            log.info("State table exists, created meanwhile by another job: table={} createError={}", table.name(),
+                    e.getMessage());
+        }
     }
 
     private void requireColumns(StateTable table) {
@@ -123,6 +144,14 @@ public class MigrationStateRepository {
         return retrying("read control row", () -> sql.query("SELECT " + String.join(", ", controlTable.columnNames())
                 + " FROM " + controlTable.name() + " WHERE target_dataset_id = :target",
                 Map.of("target", targetDatasetId))).stream().map(MigrationStateRepository::control).toList();
+    }
+
+    /** The control rows of every other target dataset, whose target locations a target must keep clear of. */
+    public List<ControlRecord> findOtherControls(String targetDatasetId) {
+        return retrying("read other control rows", () -> sql.query("SELECT "
+                + String.join(", ", controlTable.columnNames()) + " FROM " + controlTable.name()
+                + " WHERE target_dataset_id <> :target", Map.of("target", targetDatasetId))).stream()
+                .map(MigrationStateRepository::control).toList();
     }
 
     /** Inserts the control row of a migration that has none yet; does nothing when one exists. */
@@ -283,6 +312,10 @@ public class MigrationStateRepository {
             try {
                 return call.get();
             } catch (SqlExecutionException e) {
+                if (!e.isRetryable()) {
+                    throw new StateStoreException("State store operation failed, not retried as the error is not "
+                            + "transient: " + operation + " (" + e.getMessage() + ")", e);
+                }
                 if (attempt >= attempts) {
                     throw new StateStoreException("State store operation failed after " + attempt + " attempts: "
                             + operation + " (" + e.getMessage() + ")", e);

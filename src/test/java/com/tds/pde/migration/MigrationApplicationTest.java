@@ -12,7 +12,10 @@ import com.tds.pde.migration.testing.InMemoryStorage;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.Arrays;
+import java.util.List;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.stream.Stream;
 import org.apache.iceberg.PartitionSpec;
 import org.apache.iceberg.Schema;
 import org.apache.iceberg.Table;
@@ -104,6 +107,27 @@ class MigrationApplicationTest {
                 "--migraton.target.clean=true"))
                 .isInstanceOf(IllegalArgumentException.class)
                 .hasMessageStartingWith("Unknown job parameter '--migraton.target.clean=true'");
+    }
+
+    @Test
+    void rejectsASecretPassedAsAJobParameterWithoutRepeatingIt() {
+        for (String key : List.of("migration.azure.auth.connection-string", "migration.azure.auth.connectionString",
+                "migration.azure.auth.connection_string", "migration.azure.auth.CONNECTION-STRING",
+                "migration.azure.auth[connection-string]")) {
+            String[] args = Stream.concat(Arrays.stream(args("0e9c1a5e-4c55-4a3b-9f3e-1c2a7d8b6e01")),
+                    Stream.of("--" + key + "=AccountKey=s3cr3t")).toArray(String[]::new);
+            AtomicBoolean started = new AtomicBoolean();
+            SpringApplication application = applicationTrackingClose(new AtomicBoolean());
+            application.addListeners(event -> started.set(true));
+
+            assertThatThrownBy(() -> MigrationApplication.run(application, args))
+                    .as(key)
+                    .isInstanceOf(IllegalArgumentException.class)
+                    .hasMessage("Job parameter --" + key + " holds a secret, which would show in the job's settings "
+                            + "and run history; set the environment variable MIGRATION_AZURE_AUTH_CONNECTIONSTRING "
+                            + "instead, from a secret reference {{secrets/<scope>/<key>}}");
+            assertThat(started).as("rejected before Spring starts").isFalse();
+        }
     }
 
     @Test

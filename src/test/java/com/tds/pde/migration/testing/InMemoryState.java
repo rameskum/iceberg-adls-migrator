@@ -113,6 +113,11 @@ public class InMemoryState {
         }
 
         @Override
+        public synchronized List<ControlRecord> findOtherControls(String targetDatasetId) {
+            return controls.stream().filter(row -> !row.targetDatasetId().equals(targetDatasetId)).toList();
+        }
+
+        @Override
         public void insertControl(ControlRecord control) {
             awaitRace();
             synchronized (this) {
