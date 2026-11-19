@@ -7,7 +7,6 @@ import com.tds.pde.migration.config.MigrationProperties;
 import com.tds.pde.migration.target.BlobStore;
 import com.tds.pde.migration.target.BlobStoreFactory;
 import jakarta.annotation.PreDestroy;
-import java.time.Duration;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ThreadFactory;
@@ -50,10 +49,6 @@ public class AzureBlobStoreFactory implements BlobStoreFactory {
 
     @Override
     public BlobStore open(AzureLocation location) {
-        return open(location, LeaseRunLock.RENEW_INTERVAL);
-    }
-
-    BlobStore open(AzureLocation location, Duration lockRenewInterval) {
         BlobServiceClient service = switch (auth.mode()) {
             case MANAGED_IDENTITY -> new BlobServiceClientBuilder()
                     .endpoint(location.blobEndpoint())
@@ -66,8 +61,7 @@ public class AzureBlobStoreFactory implements BlobStoreFactory {
         };
         log.info("Target storage opened: endpoint={} container={} prefix={} authMode={}",
                 service.getAccountUrl(), location.container(), location.prefix(), auth.mode());
-        return new AzureBlobStore(service.getBlobContainerClient(location.container()), blockSize, lockRenewInterval,
-                stagingThreads);
+        return new AzureBlobStore(service.getBlobContainerClient(location.container()), blockSize, stagingThreads);
     }
 
     @PreDestroy

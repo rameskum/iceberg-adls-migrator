@@ -3,12 +3,12 @@ package com.tds.pde.migration;
 import static org.apache.iceberg.types.Types.NestedField.optional;
 import static org.apache.iceberg.types.Types.NestedField.required;
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import com.azure.storage.blob.BlobContainerClient;
 import com.azure.storage.blob.BlobServiceClientBuilder;
 import com.azure.storage.blob.models.BlobItem;
-import com.tds.pde.migration.state.MigrationStateRepository;
-import com.tds.pde.migration.state.RunRecord;
+import com.tds.pde.migration.state.ControlRecord;
 import com.tds.pde.migration.testing.InMemoryState;
 import com.tds.pde.migration.testing.IcebergTestTables;
 import com.tds.pde.migration.testing.ParquetOutput;
@@ -76,29 +76,40 @@ class AzureEndToEndTest {
     }
 
     @Test
-    void migratesIntoBlobStorageAndCanBeResumedWithoutRework() {
+    void migratesIntoBlobStorageAndStartsOverWhenAskedToClean() {
         migrate();
 
-        List<String> dataBlobs = container.listBlobs().stream().map(BlobItem::getName)
-                .filter(name -> !name.contains("/_migration/")).sorted().toList();
+        List<String> dataBlobs = container.listBlobs().stream().map(BlobItem::getName).sorted().toList();
         assertThat(dataBlobs).hasSize(2).allMatch(name -> name.startsWith("sales/orders/region="));
         long rows = dataBlobs.stream()
                 .mapToLong(name -> ParquetOutput.of(container.getBlobClient(name).downloadContent().toBytes(), tempDir)
                         .standaloneRows().size())
                 .sum();
         assertThat(rows).isEqualTo(5000);
-        RunRecord run = repository().findLatestRunForTarget(
-                "abfss://" + container.getBlobContainerName() + "@" + container.getAccountName()
-                        + ".dfs.core.windows.net/sales/orders").orElseThrow();
-        assertThat(run.status()).isEqualTo(RunRecord.Status.SUCCEEDED);
+        ControlRecord first = control();
+        assertThat(first.status()).isEqualTo(ControlRecord.Status.COMPLETED);
+        assertThat(first.targetLocation()).isEqualTo("abfss://" + container.getBlobContainerName() + "@"
+                + container.getAccountName() + ".dfs.core.windows.net/sales/orders");
         var firstVersions = dataBlobs.stream()
                 .map(name -> container.getBlobClient(name).getProperties().getETag()).toList();
 
-        migrate("--migration.run-id=" + run.runId());
+        assertThatThrownBy(this::migrate).isInstanceOf(MigrationFailedException.class)
+                .hasMessageContaining("already holds 2 files written by run " + first.runId());
 
+        migrate("--migration.target.clean=true");
+
+        assertThat(control().runId()).isNotEqualTo(first.runId());
+        assertThat(control().status()).isEqualTo(ControlRecord.Status.COMPLETED);
+        assertThat(container.listBlobs().stream().map(BlobItem::getName).sorted().toList()).isEqualTo(dataBlobs);
         assertThat(dataBlobs.stream().map(name -> container.getBlobClient(name).getProperties().getETag()).toList())
-                .as("a resumed run that had published everything rewrites nothing")
-                .isEqualTo(firstVersions);
+                .as("deleted and copied again from the beginning")
+                .doesNotContainAnyElementsOf(firstVersions);
+    }
+
+    private ControlRecord control() {
+        List<ControlRecord> controls = stateStore.findControls("5b2f7d3c-8a1e-4f6b-b2d4-9c0e3a7f1d02");
+        assertThat(controls).hasSize(1);
+        return controls.getFirst();
     }
 
     private void migrate(String... extraArgs) {
@@ -106,17 +117,12 @@ class AzureEndToEndTest {
                 "--migration.source.dataset-id=0e9c1a5e-4c55-4a3b-9f3e-1c2a7d8b6e01",
                 "--migration.target.dataset-id=5b2f7d3c-8a1e-4f6b-b2d4-9c0e3a7f1d02",
                 "--migration.datasets.stub-directory=" + datasets,
-                "--migration.state.run-table=" + "migration_run",
                 "--migration.state.file-table=" + "migration_file",
                 "--migration.azure.auth.mode=CONNECTION_STRING",
                 "--migration.azure.auth.connection-string=" + connectionString,
                 "--migration.state.control-table=" + "migration_control"));
         args.addAll(List.of(extraArgs));
         MigrationApplication.run(new SpringApplication(MigrationApplication.class, InMemoryState.class), args.toArray(String[]::new));
-    }
-
-    private MigrationStateRepository repository() {
-        return stateStore;
     }
 
     private static List<Record> rows(String region, long firstId, int count) {

@@ -31,7 +31,6 @@ class MigrationPropertiesTest {
         values.put("migration.target.dataset-id", "5b2f7d3c-8a1e-4f6b-b2d4-9c0e3a7f1d02");
         values.put("migration.datasets.stub-directory", "/tmp/datasets");
         values.put("migration.state.control-table", "main.migration.migration_control");
-        values.put("migration.state.run-table", "main.migration.migration_run");
         values.put("migration.state.file-table", "main.migration.migration_file");
         return values;
     }
@@ -52,7 +51,6 @@ class MigrationPropertiesTest {
     void appliesDefaultsWhenOnlyRequiredValuesAreSet() {
         MigrationProperties properties = bind(required());
 
-        assertThat(properties.runId()).isNull();
         assertThat(properties.source().snapshotId()).isNull();
         assertThat(properties.source().hadoop()).isEmpty();
         assertThat(properties.target().clean()).isFalse();
@@ -81,14 +79,6 @@ class MigrationPropertiesTest {
     }
 
     @Test
-    void treatsBlankRunIdAsAbsent() {
-        Map<String, String> values = required();
-        values.put("migration.run-id", "  ");
-
-        assertThat(bind(values).runId()).isNull();
-    }
-
-    @Test
     void keepsCaseOfBracketedHadoopKeys() {
         Map<String, String> values = required();
         values.put("migration.source.hadoop[fs.defaultFS]", "hdfs://namenode:8020");
@@ -114,11 +104,11 @@ class MigrationPropertiesTest {
     @Test
     void rejectsTableNamesThatAreNotPlainIdentifiers() {
         Map<String, String> values = required();
-        values.put("migration.state.run-table", "main.migration.runs; DROP TABLE x");
+        values.put("migration.state.control-table", "main.migration.control; DROP TABLE x");
 
         assertThatThrownBy(() -> bind(values))
                 .isInstanceOf(BindException.class)
-                .hasStackTraceContaining("runTable")
+                .hasStackTraceContaining("controlTable")
                 .hasStackTraceContaining("must be [catalog.][schema.]table");
     }
 
@@ -157,25 +147,15 @@ class MigrationPropertiesTest {
     @Test
     void reportsEveryInvalidPropertyOfASectionTogether() {
         Map<String, String> values = required();
-        values.put("migration.state.run-table", "runs; DROP TABLE x");
+        values.put("migration.state.control-table", "control; DROP TABLE x");
         values.put("migration.state.file-table", "a.b.c.d");
         values.put("migration.state.write-retries", "0");
 
         assertThatThrownBy(() -> bind(values))
                 .isInstanceOf(BindException.class)
-                .hasStackTraceContaining("on field 'runTable'")
+                .hasStackTraceContaining("on field 'controlTable'")
                 .hasStackTraceContaining("on field 'fileTable'")
                 .hasStackTraceContaining("on field 'writeRetries'");
-    }
-
-    @Test
-    void rejectsARunIdThatIsNotOfTheGeneratedShape() {
-        Map<String, String> values = required();
-        values.put("migration.run-id", "resume-please");
-
-        assertThatThrownBy(() -> bind(values))
-                .isInstanceOf(BindException.class)
-                .hasStackTraceContaining("must look like 20261117-103000-ab12cd");
     }
 
     @Test
@@ -189,11 +169,21 @@ class MigrationPropertiesTest {
     }
 
     @Test
-    void acceptsARunIdOfTheGeneratedShape() {
-        Map<String, String> values = required();
-        values.put("migration.run-id", "20261117-103000-ab12cd");
+    void defaultsTheHeartbeatTimeoutToFiveMinutes() {
+        assertThat(bind(required()).state().heartbeatTimeout()).isEqualTo(Duration.ofMinutes(5));
+    }
 
-        assertThat(bind(values).runId()).isEqualTo("20261117-103000-ab12cd");
+    @Test
+    void rejectsAHeartbeatTimeoutThatDoesNotCoverSeveralHeartbeats() {
+        Map<String, String> values = required();
+        values.put("migration.progress.log-every", "2m");
+
+        assertThatThrownBy(() -> bind(values))
+                .isInstanceOf(BindException.class)
+                .hasStackTraceContaining("state.heartbeat-timeout must be at least 4 times progress.log-every");
+
+        values.put("migration.state.heartbeat-timeout", "8m");
+        assertThat(bind(values).state().heartbeatTimeout()).isEqualTo(Duration.ofMinutes(8));
     }
 
     @Test
@@ -205,14 +195,13 @@ class MigrationPropertiesTest {
 
         MigrationProperties properties = bind(new Binder(ConfigurationPropertySources.get(environment)));
 
-        assertThat(properties.runId()).isNull();
         assertThat(properties.source().datasetId())
                 .isEqualTo(java.util.UUID.fromString("0e9c1a5e-4c55-4a3b-9f3e-1c2a7d8b6e01"));
         assertThat(properties.source().hadoop()).containsEntry("fs.defaultFS", "hdfs://namenode:8020");
         assertThat(properties.target().datasetId())
                 .isEqualTo(java.util.UUID.fromString("5b2f7d3c-8a1e-4f6b-b2d4-9c0e3a7f1d02"));
         assertThat(properties.state().controlTable()).isEqualTo("main.migration.migration_control");
-        assertThat(properties.state().runTable()).isEqualTo("main.migration.migration_run");
+        assertThat(properties.state().heartbeatTimeout()).isEqualTo(Duration.ofMinutes(5));
         assertThat(properties.state().fileTable()).isEqualTo("main.migration.migration_file");
     }
 }

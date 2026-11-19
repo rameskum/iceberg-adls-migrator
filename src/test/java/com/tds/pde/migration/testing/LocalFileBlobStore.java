@@ -1,7 +1,6 @@
 package com.tds.pde.migration.testing;
 
 import com.tds.pde.migration.target.BlobStore;
-import com.tds.pde.migration.target.RunLock;
 import com.tds.pde.migration.target.StagedUpload;
 import java.io.IOException;
 import java.io.OutputStream;
@@ -9,15 +8,13 @@ import java.io.UncheckedIOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
-import java.util.Comparator;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.stream.Stream;
 
 /**
  * Blob store on local disk for data too large to keep in memory: uploads stage into a temporary file that a
- * commit moves into place atomically. Supports uploads and listing metadata only.
+ * commit moves into place atomically. Supports uploads only, and keeps the metadata they were committed with.
  */
 public final class LocalFileBlobStore implements BlobStore {
 
@@ -79,13 +76,9 @@ public final class LocalFileBlobStore implements BlobStore {
         };
     }
 
-    @Override
-    public Stream<BlobMetadata> listWithMetadata(String prefix) {
-        return metadata.entrySet().stream()
-                .filter(entry -> entry.getKey().startsWith(prefix))
-                .map(entry -> new BlobMetadata(entry.getKey(), entry.getValue()))
-                .sorted(Comparator.comparing(BlobMetadata::name))
-                .toList().stream();
+    /** The metadata the blob was committed with; {@code null} when it was not committed. */
+    public Map<String, String> metadata(String blobName) {
+        return metadata.get(blobName);
     }
 
     @Override
@@ -95,11 +88,6 @@ public final class LocalFileBlobStore implements BlobStore {
 
     @Override
     public void delete(String blobName) {
-        throw new UnsupportedOperationException();
-    }
-
-    @Override
-    public RunLock acquireLock(String blobName) {
         throw new UnsupportedOperationException();
     }
 }

@@ -4,16 +4,16 @@ import com.tds.pde.migration.state.ControlRecord;
 import com.tds.pde.migration.state.FileOutcome;
 import com.tds.pde.migration.state.FileRecord;
 import com.tds.pde.migration.state.MigrationStateRepository;
-import com.tds.pde.migration.state.RunRecord;
 import com.tds.pde.migration.state.SqlExecutor;
 import com.tds.pde.migration.state.StateStoreException;
 import java.time.Instant;
 import java.util.ArrayList;
-import java.util.Comparator;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.Optional;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.CyclicBarrier;
+import java.util.concurrent.TimeUnit;
 import java.util.function.Function;
 import org.jspecify.annotations.Nullable;
 import org.springframework.context.annotation.Bean;
@@ -23,6 +23,9 @@ import org.springframework.context.annotation.Primary;
  * State tables kept in memory for tests, in place of the Spark-backed Delta tables. Also an extra application
  * source that installs {@link #current} as the repository; deliberately not a {@code @Configuration}, so component
  * scanning never picks it up. Tests run one at a time, so one shared store is enough.
+ *
+ * <p>Control row writes are atomic, like Delta commits: of two conditional writes racing on one row, only the first
+ * applies. Inserts of a new key can be made to behave like Databricks' row-level concurrency, where both commit.
  */
 public class InMemoryState {
 
@@ -35,6 +38,9 @@ public class InMemoryState {
     }
 
     public static final class Store extends MigrationStateRepository {
+
+        /** The run id {@link #takeOverOnFirstOutcome()} gives the control row. */
+        public static final String OTHER_RUN = "20990101-000000-0th3r0";
 
         private static final SqlExecutor NO_SQL = new SqlExecutor() {
             @Override
@@ -53,28 +59,48 @@ public class InMemoryState {
             }
         };
 
-        private final Map<String, ControlRecord> controls = new LinkedHashMap<>();
-        private final Map<String, RunRecord> runs = new LinkedHashMap<>();
+        private final List<ControlRecord> controls = new ArrayList<>();
         private final Map<String, FileRecord> files = new LinkedHashMap<>();
         private final List<Integer> outcomeWrites = new ArrayList<>();
-        private int fileRowsBeforeCrash = -1;
+        private final List<ControlRecord.Progress> renewals = new ArrayList<>();
+        private volatile boolean duplicateInserts;
+        private volatile @Nullable CyclicBarrier claimBarrier;
+        private volatile boolean takeOverOnFirstOutcome;
+        private final CountDownLatch takeOverNoticed = new CountDownLatch(1);
+        private volatile @Nullable String takenFromRun;
 
         public Store() {
             super(NO_SQL, TestProperties.defaults());
         }
 
-        public List<RunRecord> runs() {
-            return List.copyOf(runs.values());
+        /** Lets two inserts of the same new key both commit, as Databricks' row-level concurrency may. */
+        public void allowDuplicateInserts() {
+            this.duplicateInserts = true;
         }
 
-        /** Replaces a file row as if the state table had been changed behind the run's back. */
-        public void replaceFile(FileRecord file) {
-            files.put(file.runId() + "/" + file.sourcePath(), file);
+        /** Holds every control row claim until {@code parties} claims are waiting, so that they race. */
+        public void raceClaims(int parties) {
+            this.claimBarrier = new CyclicBarrier(parties);
         }
 
-        /** Removes a file row as if it had never been written. */
-        public void removeFile(FileRecord file) {
-            files.remove(file.runId() + "/" + file.sourcePath());
+        /** {@link #takeOver()} once the first file outcome is recorded, holding the worker that recorded it. */
+        public void takeOverOnFirstOutcome() {
+            this.takeOverOnFirstOutcome = true;
+        }
+
+        /** Sets the control row as if written by another run. */
+        public synchronized void putControl(ControlRecord control) {
+            controls.removeIf(row -> row.targetDatasetId().equals(control.targetDatasetId()));
+            controls.add(control);
+        }
+
+        public synchronized List<ControlRecord> controls() {
+            return List.copyOf(controls);
+        }
+
+        /** The progress written by every successful heartbeat renewal, in order. */
+        public synchronized List<ControlRecord.Progress> renewals() {
+            return List.copyOf(renewals);
         }
 
         @Override
@@ -82,120 +108,154 @@ public class InMemoryState {
         }
 
         @Override
-        public void saveControl(ControlRecord control) {
-            controls.put(control.sourceDatasetId() + " -> " + control.targetDatasetId(), control);
+        public synchronized List<ControlRecord> findControls(String targetDatasetId) {
+            return controls.stream().filter(row -> row.targetDatasetId().equals(targetDatasetId)).toList();
         }
 
         @Override
-        public Optional<ControlRecord> findControl(String sourceDatasetId, String targetDatasetId) {
-            return Optional.ofNullable(controls.get(sourceDatasetId + " -> " + targetDatasetId));
+        public void insertControl(ControlRecord control) {
+            awaitRace();
+            synchronized (this) {
+                if (duplicateInserts || findControls(control.targetDatasetId()).isEmpty()) {
+                    controls.add(control);
+                }
+            }
         }
 
         @Override
-        public void insertRun(RunRecord run) {
-            runs.put(run.runId(), run);
+        public void replaceControl(ControlRecord expected, ControlRecord replacement) {
+            awaitRace();
+            synchronized (this) {
+                int index = controls.indexOf(expected);
+                if (index >= 0) {
+                    controls.set(index, replacement);
+                }
+            }
         }
 
         @Override
-        public Optional<RunRecord> findRun(String runId) {
-            return Optional.ofNullable(runs.get(runId));
+        public synchronized void deleteControl(String targetDatasetId, String runId) {
+            controls.removeIf(row -> row.targetDatasetId().equals(targetDatasetId) && row.runId().equals(runId));
         }
 
         @Override
-        public Optional<RunRecord> findLatestUnfinishedRun(String sourceLocation, String targetLocation) {
-            return runs.values().stream()
-                    .filter(run -> run.sourceLocation().equals(sourceLocation)
-                            && run.targetLocation().equals(targetLocation) && run.isUnfinished())
-                    .max(Comparator.comparing(RunRecord::startedAt));
+        public synchronized long renewControl(String targetDatasetId, String runId, Instant heartbeatAt,
+                                              ControlRecord.Progress progress) {
+            long updated = update(targetDatasetId, runId, row -> new ControlRecord(row.targetDatasetId(),
+                    row.sourceDatasetId(), row.sourceLocation(), row.targetLocation(), row.runId(), row.status(),
+                    row.snapshotId(), row.startedAt(), heartbeatAt, row.finishedAt(), row.totalFiles(),
+                    row.totalRecords(), progress, row.error()));
+            if (updated > 0) {
+                renewals.add(progress);
+            } else if (runId.equals(takenFromRun)) {
+                takeOverNoticed.countDown();
+            }
+            return updated;
         }
 
         @Override
-        public Optional<RunRecord> findLatestRunForTarget(String targetLocation) {
-            return runs.values().stream()
-                    .filter(run -> run.targetLocation().equals(targetLocation)
-                            && run.status() != RunRecord.Status.SUPERSEDED)
-                    .max(Comparator.comparing(RunRecord::startedAt));
+        public synchronized long finishControl(String targetDatasetId, String runId, ControlRecord.Status status,
+                                               Instant finishedAt, @Nullable String error,
+                                               ControlRecord.Progress progress) {
+            return update(targetDatasetId, runId, row -> new ControlRecord(row.targetDatasetId(),
+                    row.sourceDatasetId(), row.sourceLocation(), row.targetLocation(), row.runId(), status,
+                    row.snapshotId(), row.startedAt(), finishedAt, finishedAt, row.totalFiles(), row.totalRecords(),
+                    progress, error));
         }
 
-        @Override
-        public void updateRunStatus(String runId, RunRecord.Status status, @Nullable Instant finishedAt,
-                                    @Nullable String error) {
-            RunRecord run = runs.get(runId);
-            runs.put(runId, new RunRecord(run.runId(), status, run.sourceDatasetId(), run.targetDatasetId(),
-                    run.sourceLocation(), run.targetLocation(), run.snapshotId(), run.sourceSchemaJson(),
-                    run.outputSchemaJson(), run.startedAt(), finishedAt, error));
+        private long update(String targetDatasetId, String runId, Function<ControlRecord, ControlRecord> change) {
+            long updated = 0;
+            for (int i = 0; i < controls.size(); i++) {
+                ControlRecord row = controls.get(i);
+                if (row.targetDatasetId().equals(targetDatasetId) && row.runId().equals(runId)) {
+                    controls.set(i, change.apply(row));
+                    updated++;
+                }
+            }
+            return updated;
         }
 
-        @Override
-        public long supersedeRuns(String targetLocation) {
-            List<RunRecord> owning = runs.values().stream()
-                    .filter(run -> run.targetLocation().equals(targetLocation)
-                            && run.status() != RunRecord.Status.SUPERSEDED)
-                    .toList();
-            owning.forEach(run -> updateRunStatus(run.runId(), RunRecord.Status.SUPERSEDED, run.finishedAt(),
-                    run.error()));
-            return owning.size();
-        }
-
-        @Override
-        public long deleteSupersededFiles(String targetLocation) {
-            List<String> superseded = runs.values().stream()
-                    .filter(run -> run.targetLocation().equals(targetLocation)
-                            && run.status() == RunRecord.Status.SUPERSEDED)
-                    .map(RunRecord::runId).toList();
-            int before = files.size();
-            files.values().removeIf(file -> superseded.contains(file.runId()));
-            return before - files.size();
-        }
-
-        /**
-         * Makes the next file row insert record only its first {@code rows} rows and then fail, as if the job died
-         * part way through recording a new run's files.
-         */
-        public void crashAfterFileRows(int rows) {
-            this.fileRowsBeforeCrash = rows;
+        private void awaitRace() {
+            CyclicBarrier barrier = claimBarrier;
+            if (barrier != null) {
+                try {
+                    barrier.await(10, TimeUnit.SECONDS);
+                } catch (Exception e) {
+                    throw new IllegalStateException("the claims did not race", e);
+                }
+            }
         }
 
         /** Like the MERGE it stands for: rows already present are left as they are. */
         @Override
-        public void insertFiles(List<FileRecord> newFiles) {
-            int crashAfter = fileRowsBeforeCrash;
-            fileRowsBeforeCrash = -1;
-            for (int i = 0; i < newFiles.size(); i++) {
-                if (i == crashAfter) {
-                    throw new StateStoreException("injected crash after " + crashAfter + " file rows", null);
-                }
-                FileRecord file = newFiles.get(i);
+        public synchronized void insertFiles(List<FileRecord> newFiles) {
+            for (FileRecord file : newFiles) {
                 files.putIfAbsent(file.runId() + "/" + file.sourcePath(), file);
             }
         }
 
         @Override
-        public List<FileRecord> findFiles(String runId) {
+        public synchronized List<FileRecord> findFiles(String runId) {
             return files.values().stream().filter(file -> file.runId().equals(runId)).toList();
         }
 
         @Override
-        public synchronized void recordFileOutcomes(String runId, List<FileOutcome> outcomes) {
-            outcomeWrites.add(outcomes.size());
-            for (FileOutcome outcome : outcomes) {
-                FileRecord file = file(runId, outcome.sourcePath());
-                replaceFile(new FileRecord(runId, outcome.sourcePath(), file.targetPath(), file.physicalRecords(),
-                        outcome.status(), outcome.recordsWritten(), outcome.error()));
+        public synchronized long deleteFiles(String runId) {
+            int before = files.size();
+            files.values().removeIf(file -> file.runId().equals(runId));
+            return before - files.size();
+        }
+
+        @Override
+        public void recordFileOutcomes(String runId, List<FileOutcome> outcomes) {
+            synchronized (this) {
+                outcomeWrites.add(outcomes.size());
+                for (FileOutcome outcome : outcomes) {
+                    FileRecord file = files.get(runId + "/" + outcome.sourcePath());
+                    if (file == null) {
+                        throw new StateStoreException("file " + outcome.sourcePath() + " of run " + runId
+                                + " is not recorded", null);
+                    }
+                    files.put(runId + "/" + outcome.sourcePath(), new FileRecord(runId, outcome.sourcePath(),
+                            file.targetPath(), file.physicalRecords(), outcome.status(), outcome.recordsWritten(),
+                            outcome.error()));
+                }
+            }
+            if (takeOverOnFirstOutcome) {
+                takeOverOnFirstOutcome = false;
+                takeOver();
+            }
+        }
+
+        /**
+         * Hands the only control row to {@link #OTHER_RUN}, as a run that cleaned the target after the running run's
+         * heartbeat went stale would, and waits until the running run's next renewal has found the row taken.
+         */
+        public void takeOver() {
+            synchronized (this) {
+                if (controls.size() != 1) {
+                    throw new IllegalStateException("expected one control row, found " + controls);
+                }
+                ControlRecord row = controls.getFirst();
+                takenFromRun = row.runId();
+                controls.set(0, new ControlRecord(row.targetDatasetId(), row.sourceDatasetId(),
+                        row.sourceLocation(), row.targetLocation(), OTHER_RUN, ControlRecord.Status.RUNNING,
+                        row.snapshotId(), Instant.now(), Instant.now(), null, row.totalFiles(), row.totalRecords(),
+                        ControlRecord.Progress.NONE, null));
+            }
+            try {
+                if (!takeOverNoticed.await(10, TimeUnit.SECONDS)) {
+                    throw new IllegalStateException("the run never noticed that it lost the migration");
+                }
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new IllegalStateException(e);
             }
         }
 
         /** The size of every file outcome write, in order. */
-        public List<Integer> outcomeWrites() {
+        public synchronized List<Integer> outcomeWrites() {
             return List.copyOf(outcomeWrites);
-        }
-
-        private FileRecord file(String runId, String sourcePath) {
-            FileRecord file = files.get(runId + "/" + sourcePath);
-            if (file == null) {
-                throw new IllegalStateException("file " + sourcePath + " of run " + runId + " is not recorded");
-            }
-            return file;
         }
     }
 }

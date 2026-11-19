@@ -15,10 +15,6 @@ public record MigrationPlan(SourceTable table, List<PlannedPartition> partitions
         partitions = List.copyOf(partitions);
     }
 
-    public MigrationPlan withTable(SourceTable newTable) {
-        return new MigrationPlan(newTable, partitions, totalRecords, totalBytes, totalFiles, totalDeleteFiles);
-    }
-
     static MigrationPlan empty(SourceTable table) {
         return new MigrationPlan(table, List.of(), 0, 0, 0, 0);
     }

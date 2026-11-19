@@ -14,7 +14,7 @@ import org.jspecify.annotations.Nullable;
 public record FileRecord(String runId, String sourcePath, String targetPath, long physicalRecords, Status status,
                          @Nullable Long recordsWritten, @Nullable String error) {
 
-    /** Only outcomes are recorded: every state write is a Delta commit, and published blobs prove completion. */
+    /** Only outcomes are recorded, in batches, as every state write is a Delta commit. */
     public enum Status {
         PENDING,
         COMPLETED,

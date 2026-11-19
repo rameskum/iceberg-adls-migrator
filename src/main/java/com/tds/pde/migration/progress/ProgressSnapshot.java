@@ -7,7 +7,7 @@ package com.tds.pde.migration.progress;
  * @param recordsWritten   live rows in published files
  * @param inFlightRecords  physical rows read so far from the files being processed
  * @param totalBytes       size of all source data files
- * @param bytesRead        size of the source data files that are published, including those of earlier runs
+ * @param bytesRead        size of the source data files that are published
  * @param bytesWritten     size of the target files this run published
  * @param inFlightFiles    files being processed
  */

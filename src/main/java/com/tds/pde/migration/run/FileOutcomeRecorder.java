@@ -14,8 +14,8 @@ import lombok.extern.slf4j.Slf4j;
  * Delta commit taking seconds. A batch is written once it holds {@code batchSize} outcomes, or when an outcome
  * arrives after {@code flushInterval} has passed since the last write.
  *
- * <p>Losing unwritten outcomes, e.g. in a crash, is harmless: a published file carries its own proof of
- * completion, so a resume records it instead of copying it again, and a failed file is simply retried.
+ * <p>Outcomes still waiting when a run crashes are lost and their files stay PENDING; such a run did not complete,
+ * so the next run cleans the target and copies every file again.
  *
  * <p>Thread-safe: parallel file workers report to one recorder. A write blocks the reporting worker, and others
  * reporting meanwhile, for its duration.
@@ -70,8 +70,8 @@ public final class FileOutcomeRecorder {
     /** Drops pending outcomes unwritten, when this run may no longer write its state. */
     public synchronized void discard() {
         if (!pending.isEmpty()) {
-            log.warn("File outcomes not recorded; a resume recovers them from the published files: runId={} "
-                    + "files={}", runId, pending.size());
+            log.warn("File outcomes not recorded, as the run no longer owns the migration: runId={} files={}", runId,
+                    pending.size());
             pending.clear();
         }
     }

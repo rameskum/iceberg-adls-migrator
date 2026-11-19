@@ -3,64 +3,57 @@ package com.tds.pde.migration.run;
 import com.tds.pde.migration.MigrationFailedException;
 import com.tds.pde.migration.config.MigrationProperties;
 import com.tds.pde.migration.dataset.DatasetDescriptor;
-import com.tds.pde.migration.target.BlobStore;
-import com.tds.pde.migration.target.TargetPathResolver;
-import com.tds.pde.migration.target.azure.AzureLocation;
 import com.tds.pde.migration.processing.FileTask;
 import com.tds.pde.migration.processing.RunContext;
-import com.tds.pde.migration.schema.TargetSchemaValidator;
 import com.tds.pde.migration.schema.OutputSchema;
+import com.tds.pde.migration.schema.TargetSchemaValidator;
 import com.tds.pde.migration.source.IcebergMetadataReader;
 import com.tds.pde.migration.source.MigrationPlan;
 import com.tds.pde.migration.source.PlannedPartition;
 import com.tds.pde.migration.source.SourceFile;
+import com.tds.pde.migration.state.ControlRecord;
 import com.tds.pde.migration.state.FileRecord;
 import com.tds.pde.migration.state.MigrationStateRepository;
-import com.tds.pde.migration.state.RunRecord;
+import com.tds.pde.migration.target.BlobStore;
+import com.tds.pde.migration.target.TargetPathResolver;
+import com.tds.pde.migration.target.azure.AzureLocation;
 import java.security.SecureRandom;
+import java.time.Duration;
 import java.time.Instant;
 import java.time.ZoneOffset;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
-import java.util.HashMap;
-import java.util.HashSet;
 import java.util.HexFormat;
 import java.util.List;
-import java.util.Map;
-import java.util.Objects;
-import java.util.Optional;
-import java.util.Set;
-import java.util.function.Function;
-import java.util.stream.Collectors;
+import java.util.Locale;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
-import org.apache.iceberg.Schema;
-import org.apache.iceberg.SchemaParser;
+import org.jspecify.annotations.Nullable;
 import org.springframework.stereotype.Component;
 
 /**
- * Decides which run to execute and records it before any file is processed:
- * <ul>
- *   <li>{@code migration.run-id} set: resume that run;</li>
- *   <li>{@code migration.target.clean=true}: delete the target, supersede earlier runs and delete their file
- *       rows, start fresh;</li>
- *   <li>otherwise: resume the latest unfinished run for this source and target, or start a new run into an
- *       empty target.</li>
- * </ul>
- * The caller must hold the target's run lock.
+ * Starts a new run of a migration: decides whether it may start, claims the migration's control row, and then
+ * prepares the target. Every run starts from the beginning under a new run id; there is no resuming.
+ *
+ * <p>A run may start when the migration has no run yet, or its latest run COMPLETED, and the target is empty. After
+ * a run that did not complete (FAILED, or RUNNING with a stale heartbeat because it died), or into a target that
+ * holds files, it only starts with {@code migration.target.clean=true}, which deletes the target's files first.
+ * Clean is refused while the latest run is RUNNING with a fresh heartbeat: it may still be writing.
+ *
+ * <p>The claim is a conditional write of the control row: an insert when the migration has none, otherwise an
+ * update that only applies while the row is still as it was read. Of two runs racing, Delta lets one commit and the
+ * other's write, retried after the conflict, no longer applies. The row is then read back, and the claim only holds
+ * when it is the migration's single row and names this run: two first runs inserting at once can both commit, as
+ * neither updates an existing row, and then only one of them can see a single row.
  */
 @Slf4j
 @Component
 @RequiredArgsConstructor
 public class RunStarter {
 
-    /** Folder under the target prefix holding migration bookkeeping; Spark ignores names starting with '_'. */
-    public static final String BOOKKEEPING_FOLDER = "_migration";
-
     private static final DateTimeFormatter RUN_ID_TIME =
             DateTimeFormatter.ofPattern("yyyyMMdd-HHmmss").withZone(ZoneOffset.UTC);
     private static final SecureRandom RANDOM = new SecureRandom();
-    private static final int MAX_LISTED_MISMATCHES = 10;
 
     private final MigrationProperties properties;
     private final MigrationStateRepository state;
@@ -68,183 +61,129 @@ public class RunStarter {
     private final TargetSchemaValidator schemaValidator;
     private final TargetPathResolver pathResolver;
 
+    /**
+     * Checks that a run may start, plans it, and claims the migration for it. Writes nothing when it refuses.
+     *
+     * @throws MigrationFailedException when the run may not start, or another run claimed the migration first
+     */
     public StartedRun start(DatasetDescriptor source, DatasetDescriptor target, AzureLocation location,
                             BlobStore blobStore) {
-        String runId = properties.runId();
         boolean clean = properties.target().clean();
-        if (clean && runId != null) {
-            throw new MigrationFailedException("migration.target.clean starts a new run and cannot be combined "
-                    + "with migration.run-id=" + runId);
+        ControlRecord previous = latestRun(target.datasetId());
+        if (previous != null) {
+            requireStartable(previous, clean);
         }
-
-        if (runId != null) {
-            RunRecord run = state.findRun(runId)
-                    .orElseThrow(() -> new MigrationFailedException("Run " + runId + " does not exist"));
-            requireSameDatasets(run, source, target);
-            if (run.status() == RunRecord.Status.SUPERSEDED) {
-                throw new MigrationFailedException("Run " + runId + " was superseded by a clean start; its output "
-                        + "is gone. Start a new run instead.");
-            }
-            return resume(run, source, target, location);
-        }
-        if (clean) {
-            clean(location, blobStore, target.location());
-            return startNew(source, target, location);
-        }
-        Optional<RunRecord> unfinished = state.findLatestUnfinishedRun(source.location(), target.location());
-        if (unfinished.isPresent()) {
-            log.info("Resuming the latest unfinished run for this source and target: runId={} status={} "
-                    + "startedAt={}", unfinished.get().runId(), unfinished.get().status(), unfinished.get().startedAt());
-            return resume(unfinished.get(), source, target, location);
-        }
-        requireEmptyTarget(location, blobStore, target.location());
-        return startNew(source, target, location);
-    }
-
-    private StartedRun startNew(DatasetDescriptor source, DatasetDescriptor target, AzureLocation location) {
-        MigrationPlan plan = metadataReader.plan(source.location(), properties.source().snapshotId());
-        OutputSchema outputSchema = schemaValidator.resolve(plan.table().schema(), target.schema());
-        String runId = newRunId();
-        List<PartitionTasks> partitions = tasks(plan, location);
-
-        RunRecord run = new RunRecord(runId, RunRecord.Status.RUNNING, source.datasetId(), target.datasetId(),
-                source.location(), target.location(), plan.table().snapshotId(),
-                SchemaParser.toJson(plan.table().schema()), SchemaParser.toJson(outputSchema.schema()), Instant.now(),
-                null, null);
-        state.insertRun(run);
-        List<FileRecord> files = pendingFiles(runId, partitions);
-        state.insertFiles(files);
-        log.info("Run started: runId={} snapshotId={} files={}", runId, plan.table().snapshotId(), files.size());
-
-        return new StartedRun(run, new RunContext(runId, plan.table(), outputSchema), plan, partitions,
-                files.stream().collect(Collectors.toMap(FileRecord::sourcePath, Function.identity())), false);
-    }
-
-    private StartedRun resume(RunRecord run, DatasetDescriptor source, DatasetDescriptor target,
-                              AzureLocation location) {
-        Long configuredSnapshot = properties.source().snapshotId();
-        if (configuredSnapshot != null && !configuredSnapshot.equals(run.snapshotId())) {
-            throw new MigrationFailedException("Run " + run.runId() + " is pinned to snapshot " + run.snapshotId()
-                    + " but migration.source.snapshot-id is " + configuredSnapshot);
-        }
-        MigrationPlan plan = metadataReader.plan(source.location(), run.snapshotId());
-        if (!Objects.equals(plan.table().snapshotId(), run.snapshotId())) {
-            throw new MigrationFailedException("Run " + run.runId() + " started on a table that had never been "
-                    + "written; it has been written since. Start over with migration.target.clean=true.");
-        }
-
-        // Read and write with exactly the schemas the run started with, so every file of the run looks the same.
-        Schema readSchema = SchemaParser.fromJson(run.sourceSchemaJson());
-        plan = plan.withTable(plan.table().withSchema(readSchema));
-        OutputSchema outputSchema = schemaValidator.resolve(readSchema, target.schema());
-        if (!outputSchema.schema().sameSchema(SchemaParser.fromJson(run.outputSchemaJson()))) {
-            throw new MigrationFailedException("The target schema changed since run " + run.runId()
-                    + " started, so resuming would mix file schemas. Restore it, or start over with "
-                    + "migration.target.clean=true.");
-        }
-
-        List<PartitionTasks> partitions = tasks(plan, location);
-        Map<String, FileRecord> stored = new HashMap<>(state.findFiles(run.runId()).stream()
-                .collect(Collectors.toMap(FileRecord::sourcePath, Function.identity())));
-        List<FileRecord> unrecorded = requireSameFiles(run, partitions, stored);
-        if (!unrecorded.isEmpty()) {
-            // The run started but died before all its file rows were written; finish what it began.
-            log.warn("Run {} stopped before recording all its files; recording the {} missing as PENDING",
-                    run.runId(), unrecorded.size());
-            state.insertFiles(unrecorded);
-            unrecorded.forEach(file -> stored.put(file.sourcePath(), file));
-        }
-
-        state.updateRunStatus(run.runId(), RunRecord.Status.RUNNING, null, null);
-        long completed = stored.values().stream().filter(f -> f.status() == FileRecord.Status.COMPLETED).count();
-        log.info("Run resumed: runId={} snapshotId={} previousStatus={} completedFiles={}/{}", run.runId(),
-                run.snapshotId(), run.status(), completed, stored.size());
-
-        RunRecord running = new RunRecord(run.runId(), RunRecord.Status.RUNNING, run.sourceDatasetId(),
-                run.targetDatasetId(), run.sourceLocation(), run.targetLocation(), run.snapshotId(),
-                run.sourceSchemaJson(), run.outputSchemaJson(), run.startedAt(), null, null);
-        return new StartedRun(running, new RunContext(run.runId(), plan.table(), outputSchema), plan, partitions,
-                stored, true);
-    }
-
-    private static void requireSameDatasets(RunRecord run, DatasetDescriptor source, DatasetDescriptor target) {
-        if (!run.sourceDatasetId().equals(source.datasetId()) || !run.targetDatasetId().equals(target.datasetId())) {
-            throw new MigrationFailedException("Run " + run.runId() + " belongs to the migration of dataset "
-                    + run.sourceDatasetId() + " to " + run.targetDatasetId() + ", not " + source.datasetId() + " to "
-                    + target.datasetId());
-        }
-        if (!run.sourceLocation().equals(source.location()) || !run.targetLocation().equals(target.location())) {
-            throw new MigrationFailedException("Run " + run.runId() + " copies " + run.sourceLocation() + " to "
-                    + run.targetLocation() + ", not " + source.location() + " to " + target.location());
-        }
-    }
-
-    /**
-     * The pinned snapshot is immutable, so re-planning it must yield the files the run recorded, unchanged. Planned
-     * files without a row are expected: a run that died while its file rows were being written lacks some of them.
-     *
-     * @return the PENDING rows of the planned files the run has not recorded yet
-     */
-    private static List<FileRecord> requireSameFiles(RunRecord run, List<PartitionTasks> partitions,
-                                                     Map<String, FileRecord> stored) {
-        List<String> mismatches = new ArrayList<>();
-        List<FileRecord> unrecorded = new ArrayList<>();
-        Set<String> planned = new HashSet<>();
-        for (FileRecord file : pendingFiles(run.runId(), partitions)) {
-            planned.add(file.sourcePath());
-            FileRecord record = stored.get(file.sourcePath());
-            if (record == null) {
-                unrecorded.add(file);
-            } else if (!record.targetPath().equals(file.targetPath())
-                    || record.physicalRecords() != file.physicalRecords()) {
-                mismatches.add("changed: " + file.sourcePath());
-            }
-        }
-        stored.keySet().stream().filter(path -> !planned.contains(path)).sorted()
-                .forEach(path -> mismatches.add("no longer planned: " + path));
-        if (!mismatches.isEmpty()) {
-            throw new MigrationFailedException("Snapshot " + run.snapshotId() + " no longer yields the files run "
-                    + run.runId() + " recorded; start over with migration.target.clean=true:\n  "
-                    + String.join("\n  ", mismatches.subList(0, Math.min(mismatches.size(), MAX_LISTED_MISMATCHES))));
-        }
-        return unrecorded;
-    }
-
-    private void requireEmptyTarget(AzureLocation location, BlobStore blobStore, String targetLocation) {
-        List<BlobStore.BlobInfo> existing = outputBlobs(location, blobStore);
-        if (existing.isEmpty()) {
-            return;
-        }
-        String owner = state.findLatestRunForTarget(targetLocation)
-                .map(run -> " written by run " + run.runId() + " (" + run.status() + ")")
-                .orElse("");
-        throw new MigrationFailedException("Target " + location + " already holds " + existing.size()
-                + " files" + owner + ". Resume that run with migration.run-id, or start over with "
-                + "migration.target.clean=true; nothing was written.");
-    }
-
-    private void clean(AzureLocation location, BlobStore blobStore, String targetLocation) {
-        if (location.isContainerRoot()) {
+        if (clean && location.isContainerRoot()) {
             throw new MigrationFailedException("Refusing to clean " + location
                     + ": it is a whole container. Point the target at a folder within it.");
         }
-        List<BlobStore.BlobInfo> blobs = outputBlobs(location, blobStore);
-        long bytes = blobs.stream().mapToLong(BlobStore.BlobInfo::size).sum();
-        log.warn("Cleaning target before a fresh run: target={} blobs={} bytes={}", location, blobs.size(),
-                bytes);
-        blobs.forEach(blob -> blobStore.delete(blob.name()));
-        long superseded = state.supersedeRuns(targetLocation);
-        long deletedFileRows = state.deleteSupersededFiles(targetLocation);
-        log.info("Target cleaned: target={} deletedBlobs={} supersededRuns={} deletedFileRows={}", location,
-                blobs.size(), superseded, deletedFileRows);
+
+        MigrationPlan plan = metadataReader.plan(source.location(), properties.source().snapshotId());
+        OutputSchema outputSchema = schemaValidator.resolve(plan.table().schema(), target.schema());
+        if (!clean) {
+            requireEmptyTarget(location, blobStore, previous);
+        }
+
+        Instant now = Instant.now();
+        ControlRecord claimed = new ControlRecord(target.datasetId(), source.datasetId(), source.location(),
+                target.location(), newRunId(), ControlRecord.Status.RUNNING, plan.table().snapshotId(), now, now,
+                null, plan.totalFiles(), plan.totalRecords(), ControlRecord.Progress.NONE, null);
+        claim(previous, claimed);
+        log.info("Run claimed the migration: runId={} previousRunId={} previousStatus={} clean={}",
+                claimed.runId(), previous == null ? "<none>" : previous.runId(),
+                previous == null ? "<none>" : previous.status(), clean);
+        return new StartedRun(claimed, previous, new RunContext(claimed.runId(), plan.table(), outputSchema), plan,
+                tasks(plan, location));
     }
 
-    /** Everything under the target prefix except the migration's own bookkeeping, such as the lock. */
-    private static List<BlobStore.BlobInfo> outputBlobs(AzureLocation location, BlobStore blobStore) {
-        String bookkeeping = location.blobPrefix() + BOOKKEEPING_FOLDER + "/";
-        return blobStore.list(location.blobPrefix()).stream()
-                .filter(blob -> !blob.name().startsWith(bookkeeping))
-                .toList();
+    /**
+     * Gets the target ready for the claimed run: with clean, deletes every file under it; then replaces the
+     * previous run's file rows, whose files are gone, with this run's, all PENDING.
+     */
+    public void prepare(StartedRun run, AzureLocation location, BlobStore blobStore) {
+        if (properties.target().clean()) {
+            clean(location, blobStore);
+        }
+        if (run.previous() != null) {
+            long deleted = state.deleteFiles(run.previous().runId());
+            log.info("File rows of the previous run deleted: runId={} rows={}", run.previous().runId(),
+                    deleted < 0 ? "unknown" : deleted);
+        }
+        List<FileRecord> files = pendingFiles(run.runId(), run.partitions());
+        state.insertFiles(files);
+        log.info("Run started: runId={} snapshotId={} files={}", run.runId(), run.plan().table().snapshotId(),
+                files.size());
+    }
+
+    private @Nullable ControlRecord latestRun(String targetDatasetId) {
+        List<ControlRecord> rows = state.findControls(targetDatasetId);
+        if (rows.size() > 1) {
+            throw new MigrationFailedException("The control table holds " + rows.size() + " rows for target dataset "
+                    + targetDatasetId + " (runs " + rows.stream().map(ControlRecord::runId).toList() + "), left by "
+                    + "two runs that started at the same moment. Delete the rows of the runs that are not running, "
+                    + "then start again; nothing was written.");
+        }
+        return rows.isEmpty() ? null : rows.getFirst();
+    }
+
+    private void requireStartable(ControlRecord previous, boolean clean) {
+        Duration timeout = properties.state().heartbeatTimeout();
+        Instant now = Instant.now();
+        if (previous.isLive(now, timeout)) {
+            throw new MigrationFailedException("Run " + previous.runId() + " of this migration is still running: "
+                    + "its heartbeat was renewed " + ago(previous.heartbeatAt(), now) + " ago. Only one run may "
+                    + "write a target" + (clean ? ", and migration.target.clean=true is refused until that run's "
+                    + "heartbeat is older than migration.state.heartbeat-timeout (" + timeout + ")" : "")
+                    + "; nothing was written.");
+        }
+        if (previous.status() != ControlRecord.Status.COMPLETED && !clean) {
+            String how = previous.status() == ControlRecord.Status.FAILED
+                    ? "failed" + (previous.error() == null ? "" : " (" + previous.error() + ")")
+                    : "stopped without finishing: its heartbeat was last renewed " + ago(previous.heartbeatAt(), now)
+                            + " ago";
+            throw new MigrationFailedException("Run " + previous.runId() + " of this migration " + how + ". Set "
+                    + "migration.target.clean=true to delete what it wrote and start again from the beginning; "
+                    + "nothing was written.");
+        }
+    }
+
+    private void requireEmptyTarget(AzureLocation location, BlobStore blobStore, @Nullable ControlRecord previous) {
+        List<BlobStore.BlobInfo> existing = blobStore.list(location.blobPrefix());
+        if (existing.isEmpty()) {
+            return;
+        }
+        String owner = previous == null ? "" : " written by run " + previous.runId() + " (" + previous.status() + ")";
+        throw new MigrationFailedException("Target " + location + " already holds " + existing.size() + " files"
+                + owner + ". Set migration.target.clean=true to delete them and start again from the beginning; "
+                + "nothing was written.");
+    }
+
+    private void claim(@Nullable ControlRecord previous, ControlRecord claimed) {
+        if (previous == null) {
+            state.insertControl(claimed);
+        } else {
+            state.replaceControl(previous, claimed);
+        }
+        List<ControlRecord> rows = state.findControls(claimed.targetDatasetId());
+        if (rows.size() == 1 && rows.getFirst().runId().equals(claimed.runId())) {
+            return;
+        }
+        if (rows.stream().anyMatch(row -> row.runId().equals(claimed.runId()))) {
+            // Both first runs inserted a row; this one cannot tell it was first, so it backs off.
+            state.deleteControl(claimed.targetDatasetId(), claimed.runId());
+        }
+        throw new MigrationFailedException("Another run claimed this migration at the same time ("
+                + rows.stream().map(ControlRecord::runId).filter(id -> !id.equals(claimed.runId())).toList()
+                + "); only one run may write a target. Nothing was written.");
+    }
+
+    private void clean(AzureLocation location, BlobStore blobStore) {
+        List<BlobStore.BlobInfo> blobs = blobStore.list(location.blobPrefix());
+        long bytes = blobs.stream().mapToLong(BlobStore.BlobInfo::size).sum();
+        log.warn("Cleaning the target before starting again: target={} blobs={} bytes={}", location, blobs.size(),
+                bytes);
+        blobs.forEach(blob -> blobStore.delete(blob.name()));
+        log.info("Target cleaned: target={} deletedBlobs={}", location, blobs.size());
     }
 
     private List<PartitionTasks> tasks(MigrationPlan plan, AzureLocation location) {
@@ -269,6 +208,10 @@ public class RunStarter {
             }
         }
         return files;
+    }
+
+    private static String ago(Instant then, Instant now) {
+        return Duration.between(then, now).withNanos(0).toString().substring(2).toLowerCase(Locale.ROOT);
     }
 
     private static String newRunId() {

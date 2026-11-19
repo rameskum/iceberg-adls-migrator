@@ -8,24 +8,30 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import com.tds.pde.migration.MigrationFailedException;
 import com.tds.pde.migration.dataset.DatasetDescriptor;
 import com.tds.pde.migration.dataset.DatasetFormat;
-import com.tds.pde.migration.dataset.DatasetSchema;
-import com.tds.pde.migration.target.TargetPathResolver;
-import com.tds.pde.migration.target.azure.AzureLocation;
 import com.tds.pde.migration.schema.TargetSchemaValidator;
 import com.tds.pde.migration.source.IcebergMetadataReader;
+import com.tds.pde.migration.state.ControlRecord;
 import com.tds.pde.migration.state.FileRecord;
-import com.tds.pde.migration.state.RunRecord;
-import com.tds.pde.migration.state.StateStoreException;
-import com.tds.pde.migration.testing.InMemoryState;
+import com.tds.pde.migration.target.TargetPathResolver;
+import com.tds.pde.migration.target.azure.AzureLocation;
 import com.tds.pde.migration.testing.IcebergTestTables;
 import com.tds.pde.migration.testing.InMemoryBlobStore;
+import com.tds.pde.migration.testing.InMemoryState;
 import com.tds.pde.migration.testing.TestProperties;
 import java.io.IOException;
 import java.io.OutputStream;
 import java.nio.file.Path;
+import java.time.Duration;
+import java.time.Instant;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
+import java.util.stream.IntStream;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.iceberg.PartitionSpec;
 import org.apache.iceberg.Schema;
@@ -44,7 +50,8 @@ class RunStarterTest {
             optional(2, "region", Types.StringType.get()));
     private static final AzureLocation LOCATION =
             AzureLocation.parse("abfss://data@salesacct.dfs.core.windows.net/sales/orders");
-    private static final String LOCK = LOCATION.blobName("_migration/lock");
+    private static final String TARGET_ID = "5b2f7d3c-8a1e-4f6b-b2d4-9c0e3a7f1d02";
+    private static final String EARLIER_RUN = "20261117-103000-ab12cd";
 
     @TempDir
     Path tempDir;
@@ -61,202 +68,151 @@ class RunStarterTest {
         IcebergTestTables.append(table, rows("EU", 2));
         IcebergTestTables.append(table, rows("EU", 1));
         IcebergTestTables.append(table, rows("US", 3));
-        source = new DatasetDescriptor("0e9c1a5e-4c55-4a3b-9f3e-1c2a7d8b6e01", DatasetFormat.ICEBERG, table.location(), null);
+        source = new DatasetDescriptor("0e9c1a5e-4c55-4a3b-9f3e-1c2a7d8b6e01", DatasetFormat.ICEBERG,
+                table.location(), null);
     }
 
     @Test
-    void startsANewRunIntoAnEmptyTargetAndRecordsEveryFile() {
-        StartedRun started = starter(Map.of()).start(source, target(null), LOCATION, blobStore);
+    void claimsANewMigrationAndRecordsEveryFileOfTheRun() {
+        StartedRun started = start(Map.of());
 
-        assertThat(started.resumed()).isFalse();
         assertThat(started.runId()).matches("\\d{8}-\\d{6}-[0-9a-f]{6}");
+        assertThat(started.previous()).isNull();
         assertThat(started.partitions()).hasSize(2);
-        RunRecord run = state.findRun(started.runId()).orElseThrow();
-        assertThat(run.status()).isEqualTo(RunRecord.Status.RUNNING);
-        assertThat(run.snapshotId()).isEqualTo(table.currentSnapshot().snapshotId());
+        ControlRecord control = onlyControl();
+        assertThat(control).isEqualTo(started.control());
+        assertThat(control.status()).isEqualTo(ControlRecord.Status.RUNNING);
+        assertThat(control.snapshotId()).isEqualTo(table.currentSnapshot().snapshotId());
+        assertThat(control.totalFiles()).isEqualTo(3);
+        assertThat(control.totalRecords()).isEqualTo(6);
+        assertThat(control.progress()).isEqualTo(ControlRecord.Progress.NONE);
+        assertThat(control.targetLocation()).isEqualTo(target().location());
+        assertThat(state.findFiles(started.runId())).as("recorded by prepare").isEmpty();
+
+        starter(Map.of()).prepare(started, LOCATION, blobStore);
+
         assertThat(state.findFiles(started.runId())).hasSize(3)
                 .allSatisfy(file -> {
                     assertThat(file.status()).isEqualTo(FileRecord.Status.PENDING);
                     assertThat(file.targetPath()).startsWith("sales/orders/region=");
                 });
-        assertThat(started.context().runId()).isEqualTo(started.runId());
-    }
-
-    @Test
-    void ignoresTheRunLockWhenCheckingThatTheTargetIsEmpty() {
-        blobStore.acquireLock(LOCK);
-
-        assertThat(starter(Map.of()).start(source, target(null), LOCATION, blobStore).resumed()).isFalse();
     }
 
     @Test
     void refusesANewRunIntoATargetThatAlreadyHoldsFiles() throws IOException {
-        StartedRun earlier = starter(Map.of()).start(source, target(null), LOCATION, blobStore);
-        state.updateRunStatus(earlier.runId(), RunRecord.Status.SUCCEEDED, null, null);
         publish(LOCATION.blobName("region=EU__part-0-1234abcd.parquet"));
 
-        assertThatThrownBy(() -> starter(Map.of()).start(source, target(null), LOCATION, blobStore))
+        assertThatThrownBy(() -> start(Map.of()))
                 .isInstanceOf(MigrationFailedException.class)
-                .hasMessageContaining("already holds 1 files written by run " + earlier.runId() + " (SUCCEEDED)")
+                .hasMessageContaining("already holds 1 files")
                 .hasMessageContaining("migration.target.clean=true");
+        assertThat(state.controls()).isEmpty();
     }
 
     @Test
     void doesNotMistakeASiblingFolderForTheTarget() throws IOException {
         publish("sales/orders-archive/part-0.parquet");
 
-        assertThat(starter(Map.of()).start(source, target(null), LOCATION, blobStore).resumed()).isFalse();
+        assertThat(start(Map.of()).previous()).isNull();
     }
 
     @Test
-    void resumesTheLatestUnfinishedRunWithItsPinnedSnapshotAndSchema() {
-        StartedRun first = starter(Map.of()).start(source, target(null), LOCATION, blobStore);
-        state.updateRunStatus(first.runId(), RunRecord.Status.FAILED, null, "boom");
-        IcebergTestTables.append(table, rows("APAC", 5));
-        table.updateSchema().renameColumn("region", "market").commit();
+    void refusesToStartAfterARunThatFailed() {
+        ControlRecord failed = control(EARLIER_RUN, ControlRecord.Status.FAILED, Instant.now(), "1 of 3 files failed");
+        state.putControl(failed);
 
-        StartedRun resumed = starter(Map.of()).start(source, target(null), LOCATION, blobStore);
-
-        assertThat(resumed.resumed()).isTrue();
-        assertThat(resumed.runId()).isEqualTo(first.runId());
-        assertThat(resumed.context().source().snapshotId()).isEqualTo(first.context().source().snapshotId());
-        assertThat(resumed.plan().totalFiles()).isEqualTo(3);
-        assertThat(resumed.context().source().schema().findField("region")).isNotNull();
-        assertThat(state.findRun(first.runId()).orElseThrow().status()).isEqualTo(RunRecord.Status.RUNNING);
-        assertThat(resumed.fileStates()).hasSize(3);
-    }
-
-    @Test
-    void resumesTheRequestedRun() {
-        StartedRun first = starter(Map.of()).start(source, target(null), LOCATION, blobStore);
-        state.updateRunStatus(first.runId(), RunRecord.Status.SUCCEEDED, null, null);
-
-        StartedRun resumed = starter(Map.of("migration.run-id", first.runId()))
-                .start(source, target(null), LOCATION, blobStore);
-
-        assertThat(resumed.resumed()).isTrue();
-        assertThat(resumed.runId()).isEqualTo(first.runId());
-    }
-
-    @Test
-    void rejectsAnUnknownRun() {
-        assertThatThrownBy(() -> starter(Map.of("migration.run-id", "nope"))
-                .start(source, target(null), LOCATION, blobStore))
+        assertThatThrownBy(() -> start(Map.of()))
                 .isInstanceOf(MigrationFailedException.class)
-                .hasMessage("Run nope does not exist");
+                .hasMessageContaining("Run " + EARLIER_RUN + " of this migration failed (1 of 3 files failed)")
+                .hasMessageContaining("Set migration.target.clean=true");
+        assertThat(state.controls()).containsExactly(failed);
     }
 
     @Test
-    void rejectsARunOfAnotherTarget() {
-        StartedRun first = starter(Map.of()).start(source, target(null), LOCATION, blobStore);
-        DatasetDescriptor elsewhere = new DatasetDescriptor("5b2f7d3c-8a1e-4f6b-b2d4-9c0e3a7f1d02", DatasetFormat.PARQUET,
-                "abfss://data@salesacct.dfs.core.windows.net/elsewhere", null);
+    void refusesToStartAfterARunThatDiedWithoutFinishing() {
+        ControlRecord died = control(EARLIER_RUN, ControlRecord.Status.RUNNING, Instant.now().minusSeconds(3600),
+                null);
+        state.putControl(died);
 
-        assertThatThrownBy(() -> starter(Map.of("migration.run-id", first.runId()))
-                .start(source, elsewhere, LOCATION, blobStore))
+        assertThatThrownBy(() -> start(Map.of()))
                 .isInstanceOf(MigrationFailedException.class)
-                .hasMessageContaining("not " + table.location() + " to abfss://data@salesacct.dfs.core.windows.net/elsewhere");
+                .hasMessageContaining("stopped without finishing: its heartbeat was last renewed 1h ago")
+                .hasMessageContaining("Set migration.target.clean=true");
+        assertThat(state.controls()).containsExactly(died);
     }
 
     @Test
-    void refusesToResumeWhenTheTargetSchemaChanged() {
-        StartedRun first = starter(Map.of()).start(source, target(null), LOCATION, blobStore);
-        state.updateRunStatus(first.runId(), RunRecord.Status.FAILED, null, null);
-        DatasetSchema nowConvertsUuid = new DatasetSchema(List.of(
-                new DatasetSchema.Field("id", "string", false), new DatasetSchema.Field("region", "string", true)));
+    void refusesToStartWhileTheLatestRunIsLive() {
+        ControlRecord live = control(EARLIER_RUN, ControlRecord.Status.RUNNING, Instant.now(), null);
+        state.putControl(live);
 
-        assertThatThrownBy(() -> starter(Map.of()).start(source, target(nowConvertsUuid), LOCATION, blobStore))
+        assertThatThrownBy(() -> start(Map.of()))
                 .isInstanceOf(MigrationFailedException.class)
-                .hasMessageContaining("target schema changed since run " + first.runId());
+                .hasMessageContaining("Run " + EARLIER_RUN + " of this migration is still running");
+        assertThat(state.controls()).containsExactly(live);
     }
 
     @Test
-    void refusesToResumeWhenThePinnedSnapshotNoLongerMatchesTheRecordedFiles() {
-        StartedRun first = starter(Map.of()).start(source, target(null), LOCATION, blobStore);
-        state.updateRunStatus(first.runId(), RunRecord.Status.FAILED, null, null);
-        state.findFiles(first.runId()).forEach(file -> state.replaceFile(new FileRecord(file.runId(),
-                file.sourcePath(), file.targetPath(), 99, file.status(), file.recordsWritten(), file.error())));
-
-        assertThatThrownBy(() -> starter(Map.of()).start(source, target(null), LOCATION, blobStore))
-                .isInstanceOf(MigrationFailedException.class)
-                .hasMessageContaining("no longer yields the files run " + first.runId() + " recorded")
-                .hasMessageContaining("changed: ");
-    }
-
-    @Test
-    void recordsTheMissingFilesOfARunThatDiedBeforeRecordingThemAndResumesIt() {
-        state.crashAfterFileRows(0);
-        assertThatThrownBy(() -> starter(Map.of()).start(source, target(null), LOCATION, blobStore))
-                .isInstanceOf(StateStoreException.class);
-        RunRecord crashed = state.runs().getFirst();
-        assertThat(state.findFiles(crashed.runId())).isEmpty();
-
-        StartedRun resumed = starter(Map.of()).start(source, target(null), LOCATION, blobStore);
-
-        assertThat(resumed.resumed()).isTrue();
-        assertThat(resumed.runId()).isEqualTo(crashed.runId());
-        assertThat(resumed.fileStates()).hasSize(3);
-        assertThat(state.findFiles(crashed.runId())).hasSize(3)
-                .allSatisfy(file -> assertThat(file.status()).isEqualTo(FileRecord.Status.PENDING));
-    }
-
-    @Test
-    void keepsTheRecordedStateOfFilesWhenRecordingTheMissingOnes() {
-        StartedRun first = starter(Map.of()).start(source, target(null), LOCATION, blobStore);
-        List<FileRecord> files = state.findFiles(first.runId());
-        FileRecord done = files.getFirst();
-        state.replaceFile(new FileRecord(done.runId(), done.sourcePath(), done.targetPath(), done.physicalRecords(),
-                FileRecord.Status.COMPLETED, done.physicalRecords(), null));
-        state.removeFile(files.getLast());
-
-        StartedRun resumed = starter(Map.of()).start(source, target(null), LOCATION, blobStore);
-
-        assertThat(resumed.fileStates().get(done.sourcePath()).status()).isEqualTo(FileRecord.Status.COMPLETED);
-        assertThat(resumed.fileStates().get(files.getLast().sourcePath()).status())
-                .isEqualTo(FileRecord.Status.PENDING);
-        assertThat(state.findFiles(first.runId())).hasSize(3);
-    }
-
-    @Test
-    void refusesToResumeWhenARecordedFileIsNoLongerPlanned() {
-        StartedRun first = starter(Map.of()).start(source, target(null), LOCATION, blobStore);
-        state.updateRunStatus(first.runId(), RunRecord.Status.FAILED, null, null);
-        state.insertFiles(List.of(new FileRecord(first.runId(), "hdfs://nn/expired.parquet",
-                "sales/orders/expired.parquet", 1, FileRecord.Status.PENDING, null, null)));
-
-        assertThatThrownBy(() -> starter(Map.of()).start(source, target(null), LOCATION, blobStore))
-                .isInstanceOf(MigrationFailedException.class)
-                .hasMessageContaining("no longer yields the files run " + first.runId() + " recorded")
-                .hasMessageContaining("no longer planned: hdfs://nn/expired.parquet");
-        assertThat(state.findFiles(first.runId())).hasSize(4);
-    }
-
-    @Test
-    void refusesToResumeWithADifferentConfiguredSnapshot() {
-        StartedRun first = starter(Map.of()).start(source, target(null), LOCATION, blobStore);
-
-        assertThatThrownBy(() -> starter(Map.of("migration.run-id", first.runId(),
-                "migration.source.snapshot-id", "123")).start(source, target(null), LOCATION, blobStore))
-                .isInstanceOf(MigrationFailedException.class)
-                .hasMessageContaining("is pinned to snapshot");
-    }
-
-    @Test
-    void cleansTheTargetAndSupersedesEarlierRuns() throws IOException {
-        StartedRun first = starter(Map.of()).start(source, target(null), LOCATION, blobStore);
+    void refusesToCleanWhileTheLatestRunsHeartbeatIsFresh() throws IOException {
+        ControlRecord live = control(EARLIER_RUN, ControlRecord.Status.RUNNING, Instant.now().minusSeconds(240),
+                null);
+        state.putControl(live);
         publish(LOCATION.blobName("region=EU__part-0-1234abcd.parquet"));
+
+        assertThatThrownBy(() -> start(Map.of("migration.target.clean", "true")))
+                .isInstanceOf(MigrationFailedException.class)
+                .hasMessageContaining("is still running: its heartbeat was renewed 4m ago")
+                .hasMessageContaining("migration.target.clean=true is refused until that run's heartbeat is older "
+                        + "than migration.state.heartbeat-timeout (PT5M)");
+        assertThat(state.controls()).containsExactly(live);
+        assertThat(blobStore.blobs()).hasSize(1);
+    }
+
+    @Test
+    void cleansTheTargetAfterARunWhoseHeartbeatWentStale() throws IOException {
+        ControlRecord died = control(EARLIER_RUN, ControlRecord.Status.RUNNING, Instant.now().minusSeconds(301),
+                null);
+        state.putControl(died);
+        state.insertFiles(List.of(new FileRecord(EARLIER_RUN, "hdfs://nn/old.parquet", "sales/orders/old.parquet", 1,
+                FileRecord.Status.COMPLETED, 1L, null)));
+        publish(LOCATION.blobName("old.parquet"));
         publish("sales/orders-archive/keep.parquet");
-        blobStore.acquireLock(LOCK);
 
-        StartedRun fresh = starter(Map.of("migration.target.clean", "true"))
-                .start(source, target(null), LOCATION, blobStore);
+        StartedRun fresh = start(Map.of("migration.target.clean", "true"));
+        starter(Map.of("migration.target.clean", "true")).prepare(fresh, LOCATION, blobStore);
 
-        assertThat(fresh.resumed()).isFalse();
-        assertThat(fresh.runId()).isNotEqualTo(first.runId());
-        assertThat(state.findRun(first.runId()).orElseThrow().status()).isEqualTo(RunRecord.Status.SUPERSEDED);
-        assertThat(state.findFiles(first.runId())).as("file rows of the superseded run").isEmpty();
+        assertThat(fresh.runId()).isNotEqualTo(EARLIER_RUN);
+        assertThat(fresh.previous()).isEqualTo(died);
+        assertThat(onlyControl().runId()).isEqualTo(fresh.runId());
+        assertThat(onlyControl().status()).isEqualTo(ControlRecord.Status.RUNNING);
+        assertThat(state.findFiles(EARLIER_RUN)).as("file rows of the replaced run").isEmpty();
         assertThat(state.findFiles(fresh.runId())).hasSize(3);
-        assertThat(blobStore.blobs().keySet()).containsExactlyInAnyOrder(LOCK, "sales/orders-archive/keep.parquet");
+        assertThat(blobStore.blobs().keySet()).containsExactly("sales/orders-archive/keep.parquet");
+    }
+
+    @Test
+    void cleansTheTargetRightAfterARunThatFailed() throws IOException {
+        state.putControl(control(EARLIER_RUN, ControlRecord.Status.FAILED, Instant.now(), "boom"));
+        publish(LOCATION.blobName("old.parquet"));
+
+        StartedRun fresh = start(Map.of("migration.target.clean", "true"));
+        starter(Map.of("migration.target.clean", "true")).prepare(fresh, LOCATION, blobStore);
+
+        assertThat(onlyControl().runId()).isEqualTo(fresh.runId());
+        assertThat(blobStore.blobs()).isEmpty();
+    }
+
+    @Test
+    void startsAgainAfterACompletedRunWhenTheTargetIsEmpty() {
+        state.putControl(control(EARLIER_RUN, ControlRecord.Status.COMPLETED, Instant.now(), null));
+        state.insertFiles(List.of(new FileRecord(EARLIER_RUN, "hdfs://nn/old.parquet", "sales/orders/old.parquet", 1,
+                FileRecord.Status.COMPLETED, 1L, null)));
+
+        StartedRun next = start(Map.of());
+        starter(Map.of()).prepare(next, LOCATION, blobStore);
+
+        assertThat(onlyControl().runId()).isEqualTo(next.runId());
+        assertThat(state.findFiles(EARLIER_RUN)).isEmpty();
     }
 
     @Test
@@ -264,28 +220,97 @@ class RunStarterTest {
         AzureLocation root = AzureLocation.parse("abfss://data@salesacct.dfs.core.windows.net");
 
         assertThatThrownBy(() -> starter(Map.of("migration.target.clean", "true"))
-                .start(source, target(null), root, blobStore))
+                .start(source, target(), root, blobStore))
                 .isInstanceOf(MigrationFailedException.class)
                 .hasMessageContaining("Refusing to clean");
+        assertThat(state.controls()).isEmpty();
     }
 
     @Test
-    void refusesToCombineCleanWithARunId() {
-        assertThatThrownBy(() -> starter(Map.of("migration.target.clean", "true", "migration.run-id", "r"))
-                .start(source, target(null), LOCATION, blobStore))
+    void refusesWhenTheControlTableHoldsTwoRowsForTheTarget() {
+        state.allowDuplicateInserts();
+        state.insertControl(control("20261117-103000-aaaaaa", ControlRecord.Status.FAILED, Instant.now(), null));
+        state.insertControl(control("20261117-103000-bbbbbb", ControlRecord.Status.FAILED, Instant.now(), null));
+
+        assertThatThrownBy(() -> start(Map.of("migration.target.clean", "true")))
                 .isInstanceOf(MigrationFailedException.class)
-                .hasMessageContaining("cannot be combined with migration.run-id=r");
+                .hasMessageContaining("holds 2 rows for target dataset " + TARGET_ID)
+                .hasMessageContaining("20261117-103000-aaaaaa, 20261117-103000-bbbbbb");
     }
 
     @Test
-    void refusesToResumeASupersededRun() {
-        StartedRun first = starter(Map.of()).start(source, target(null), LOCATION, blobStore);
-        state.supersedeRuns(target(null).location());
+    void ofTwoFirstRunsRacingForTheMigrationOneWins() throws Exception {
+        state.raceClaims(2);
 
-        assertThatThrownBy(() -> starter(Map.of("migration.run-id", first.runId()))
-                .start(source, target(null), LOCATION, blobStore))
-                .isInstanceOf(MigrationFailedException.class)
-                .hasMessageContaining("was superseded");
+        List<Future<StartedRun>> runs = race(Map.of());
+
+        assertOneWins(runs);
+    }
+
+    @Test
+    void ofTwoRunsRacingToCleanAfterAFailedRunOneWins() throws Exception {
+        state.putControl(control(EARLIER_RUN, ControlRecord.Status.FAILED, Instant.now(), null));
+        state.raceClaims(2);
+
+        List<Future<StartedRun>> runs = race(Map.of("migration.target.clean", "true"));
+
+        assertOneWins(runs);
+    }
+
+    @Test
+    void neverLetsTwoFirstRunsWinWhenBothOfTheirInsertsCommit() throws Exception {
+        // Row-level concurrency does not see two inserts of a new key as a conflict, so both rows land.
+        state.allowDuplicateInserts();
+        state.raceClaims(2);
+
+        List<Future<StartedRun>> runs = race(Map.of());
+
+        List<String> winners = new ArrayList<>();
+        for (Future<StartedRun> run : runs) {
+            try {
+                winners.add(run.get().runId());
+            } catch (java.util.concurrent.ExecutionException e) {
+                assertThat(e.getCause()).isInstanceOf(MigrationFailedException.class)
+                        .hasMessageContaining("Another run claimed this migration at the same time");
+            }
+        }
+        assertThat(winners).hasSizeLessThanOrEqualTo(1);
+        assertThat(state.controls()).as("losers withdraw their rows").extracting(ControlRecord::runId)
+                .isEqualTo(winners);
+    }
+
+    private List<Future<StartedRun>> race(Map<String, String> overrides) throws InterruptedException {
+        ExecutorService threads = Executors.newFixedThreadPool(2);
+        try {
+            List<Future<StartedRun>> runs = IntStream.range(0, 2)
+                    .mapToObj(i -> threads.submit(() -> start(overrides))).toList();
+            threads.shutdown();
+            assertThat(threads.awaitTermination(30, TimeUnit.SECONDS)).isTrue();
+            return runs;
+        } finally {
+            threads.shutdownNow();
+        }
+    }
+
+    private void assertOneWins(List<Future<StartedRun>> runs) throws InterruptedException {
+        List<StartedRun> winners = new ArrayList<>();
+        List<Throwable> losers = new ArrayList<>();
+        for (Future<StartedRun> run : runs) {
+            try {
+                winners.add(run.get());
+            } catch (java.util.concurrent.ExecutionException e) {
+                losers.add(e.getCause());
+            }
+        }
+        assertThat(winners).hasSize(1);
+        assertThat(losers).singleElement().isInstanceOf(MigrationFailedException.class)
+                .asString().contains("Another run claimed this migration at the same time ([" + winners.getFirst()
+                        .runId() + "])");
+        assertThat(onlyControl().runId()).isEqualTo(winners.getFirst().runId());
+    }
+
+    private StartedRun start(Map<String, String> overrides) {
+        return starter(overrides).start(source, target(), LOCATION, blobStore);
     }
 
     private RunStarter starter(Map<String, String> overrides) {
@@ -293,9 +318,22 @@ class RunStarterTest {
                 new TargetSchemaValidator(), new TargetPathResolver());
     }
 
-    private static DatasetDescriptor target(DatasetSchema schema) {
-        return new DatasetDescriptor("5b2f7d3c-8a1e-4f6b-b2d4-9c0e3a7f1d02", DatasetFormat.PARQUET,
-                "abfss://data@salesacct.dfs.core.windows.net/sales/orders", schema);
+    private ControlRecord onlyControl() {
+        assertThat(state.controls()).hasSize(1);
+        return state.controls().getFirst();
+    }
+
+    private ControlRecord control(String runId, ControlRecord.Status status, Instant heartbeatAt,
+                                  String error) {
+        return new ControlRecord(TARGET_ID, source.datasetId(), source.location(), target().location(), runId, status,
+                null, heartbeatAt.minus(Duration.ofHours(2)), heartbeatAt,
+                status == ControlRecord.Status.RUNNING ? null : heartbeatAt, 3, 6, ControlRecord.Progress.NONE,
+                error);
+    }
+
+    private static DatasetDescriptor target() {
+        return new DatasetDescriptor(TARGET_ID, DatasetFormat.PARQUET,
+                "abfss://data@salesacct.dfs.core.windows.net/sales/orders", null);
     }
 
     private void publish(String blobName) throws IOException {
@@ -307,7 +345,7 @@ class RunStarterTest {
     }
 
     private static List<Record> rows(String region, int count) {
-        return java.util.stream.IntStream.range(0, count).mapToObj(i -> {
+        return IntStream.range(0, count).mapToObj(i -> {
             GenericRecord row = GenericRecord.create(SCHEMA);
             row.setField("id", UUID.randomUUID());
             row.setField("region", region);

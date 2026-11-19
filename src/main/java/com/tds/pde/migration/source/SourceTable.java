@@ -16,9 +16,4 @@ import org.jspecify.annotations.Nullable;
  */
 public record SourceTable(String location, int formatVersion, @Nullable Long snapshotId, Schema schema,
                           Schema deleteSchema, FileIO io, @Nullable NameMapping nameMapping) {
-
-    /** The same table read into another schema, e.g. the one a resumed run pinned when it started. */
-    public SourceTable withSchema(Schema readSchema) {
-        return new SourceTable(location, formatVersion, snapshotId, readSchema, deleteSchema, io, nameMapping);
-    }
 }

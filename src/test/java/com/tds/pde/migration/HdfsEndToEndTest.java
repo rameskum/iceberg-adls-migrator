@@ -5,7 +5,7 @@ import static org.apache.iceberg.types.Types.NestedField.required;
 import static org.assertj.core.api.Assertions.assertThat;
 
 import com.tds.pde.migration.state.MigrationStateRepository;
-import com.tds.pde.migration.state.RunRecord;
+import com.tds.pde.migration.state.ControlRecord;
 import com.tds.pde.migration.testing.InMemoryState;
 import com.tds.pde.migration.testing.InMemoryBlobStore;
 import com.tds.pde.migration.testing.InMemoryStorage;
@@ -98,17 +98,13 @@ class HdfsEndToEndTest {
                 "--migration.target.dataset-id=5b2f7d3c-8a1e-4f6b-b2d4-9c0e3a7f1d02",
                 "--migration.source.hadoop[fs.defaultFS]=" + nameNode,
                 "--migration.datasets.stub-directory=" + datasets,
-                "--migration.state.run-table=" + "migration_run",
                 "--migration.state.file-table=" + "migration_file",
                 "--migration.state.control-table=" + "migration_control");
 
-        RunRecord run = stateStore
-                .findLatestRunForTarget("abfss://data@salesacct.dfs.core.windows.net/sales/orders")
-                .orElseThrow();
-        assertThat(run.status()).isEqualTo(RunRecord.Status.SUCCEEDED);
-        assertThat(run.sourceLocation()).startsWith("hdfs://");
-        List<String> dataBlobs = blobStore.list("sales/orders/").stream()
-                .map(blob -> blob.name()).filter(name -> !name.contains("/_migration/")).toList();
+        ControlRecord control = stateStore.findControls("5b2f7d3c-8a1e-4f6b-b2d4-9c0e3a7f1d02").getFirst();
+        assertThat(control.status()).isEqualTo(ControlRecord.Status.COMPLETED);
+        assertThat(control.sourceLocation()).startsWith("hdfs://");
+        List<String> dataBlobs = blobStore.list("sales/orders/").stream().map(blob -> blob.name()).toList();
         assertThat(dataBlobs).hasSize(2);
         assertThat(dataBlobs.stream()
                 .mapToLong(name -> ParquetOutput.of(blobStore.blob(name).orElseThrow().content(), tempDir).rowCount())

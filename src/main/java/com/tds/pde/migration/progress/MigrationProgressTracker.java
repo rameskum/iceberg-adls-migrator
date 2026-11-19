@@ -12,6 +12,7 @@ import java.util.Map;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
+import java.util.function.Consumer;
 import java.util.function.LongSupplier;
 import lombok.extern.slf4j.Slf4j;
 import org.jspecify.annotations.Nullable;
@@ -28,9 +29,9 @@ import org.jspecify.annotations.Nullable;
  * data file sizes in Iceberg metadata; a file in flight counts for the share of its rows read so far.
  *
  * <p>While a run is going, a timer logs one {@code Progress:} line every {@code migration.progress.log-every},
- * whether or not any file reports progress, so a stalled file shows as numbers that stop moving. The rate is
- * measured over the last five minutes of this run, and the ETA extrapolates it over the source bytes still to
- * copy; neither counts files an earlier run had published.
+ * whether or not any file reports progress, so a stalled file shows as numbers that stop moving, and then hands a
+ * {@link ProgressSnapshot} to the heartbeat listener, which renews the run's heartbeat with it. The rate is
+ * measured over the last five minutes of this run, and the ETA extrapolates it over the source bytes still to copy.
  *
  * <p>Thread-safe: files copied in parallel report to one tracker, and the timer reads it from its own thread.
  * {@link #close()} stops the timer.
@@ -41,9 +42,13 @@ public final class MigrationProgressTracker implements AutoCloseable {
     /** How far back the rate looks. */
     static final Duration RATE_WINDOW = Duration.ofMinutes(5);
 
+    /** How long {@link #close()} lets a heartbeat in progress finish, e.g. a state table write. */
+    private static final Duration CLOSE_TIMEOUT = Duration.ofSeconds(30);
+
     private final Duration heartbeatInterval;
     private final LongSupplier nanoClock;
     private final @Nullable ScheduledExecutorService timer;
+    private final Consumer<ProgressSnapshot> heartbeatListener;
 
     private long totalRecords;
     private long totalBytes;
@@ -56,14 +61,12 @@ public final class MigrationProgressTracker implements AutoCloseable {
     private long failedFiles;
     private long completedPartitions;
 
-    /** Source bytes of the files an earlier run had published. */
-    private long resumedSourceBytes;
     /** Source bytes of the files this run published. */
     private long committedSourceBytes;
     /** Source bytes of the files that failed, and the share of them read before they did. */
     private long failedSourceBytes;
     private long failedSourceBytesRead;
-    /** Target bytes of the files this run published; earlier runs' files are not measured. */
+    /** Target bytes of the files this run published. */
     private long committedBytesWritten;
 
     /** The files being processed, by source path. */
@@ -73,20 +76,28 @@ public final class MigrationProgressTracker implements AutoCloseable {
     /** Bytes processed by this run at the times the heartbeat looked, newest last; the oldest is the rate's start. */
     private final Deque<Sample> samples = new ArrayDeque<>();
 
-    /** Logs a heartbeat on a timer of its own. */
-    public MigrationProgressTracker(MigrationProperties.Progress settings) {
-        this(settings, System::nanoTime, true);
+    /**
+     * Logs a heartbeat on a timer of its own.
+     *
+     * @param heartbeatListener called on the timer's thread after each {@code Progress:} line, with the progress
+     *                          then; the next line waits for it to return
+     */
+    public MigrationProgressTracker(MigrationProperties.Progress settings,
+                                    Consumer<ProgressSnapshot> heartbeatListener) {
+        this(settings, System::nanoTime, true, heartbeatListener);
     }
 
     /** Logs a heartbeat only when {@link #heartbeat()} is called. */
     MigrationProgressTracker(MigrationProperties.Progress settings, LongSupplier nanoClock) {
-        this(settings, nanoClock, false);
+        this(settings, nanoClock, false, snapshot -> {
+        });
     }
 
     private MigrationProgressTracker(MigrationProperties.Progress settings, LongSupplier nanoClock,
-                                     boolean timed) {
+                                     boolean timed, Consumer<ProgressSnapshot> heartbeatListener) {
         this.heartbeatInterval = settings.logEvery();
         this.nanoClock = nanoClock;
+        this.heartbeatListener = heartbeatListener;
         this.timer = timed ? Executors.newSingleThreadScheduledExecutor(runnable -> {
             Thread thread = new Thread(runnable, "progress-timer");
             thread.setDaemon(true);
@@ -110,21 +121,19 @@ public final class MigrationProgressTracker implements AutoCloseable {
         samples.add(new Sample(startedAt, 0));
         if (timer != null) {
             long interval = heartbeatInterval.toNanos();
-            timer.scheduleWithFixedDelay(this::heartbeat, interval, interval, TimeUnit.NANOSECONDS);
+            timer.scheduleWithFixedDelay(this::tick, interval, interval, TimeUnit.NANOSECONDS);
         }
     }
 
-    /** A file a resumed run had already published. */
-    public synchronized void fileAlreadyCompleted(long physicalRecords, long written, long sourceBytes) {
-        committedRecords += physicalRecords;
-        recordsWritten += written;
-        resumedSourceBytes += sourceBytes;
-        completedFiles++;
-    }
-
-    /** A partition a resumed run had already finished. */
-    public synchronized void partitionAlreadyCompleted() {
-        completedPartitions++;
+    /** One heartbeat of the timer: the {@code Progress:} line, then the listener, outside this tracker's lock. */
+    private void tick() {
+        heartbeat();
+        try {
+            heartbeatListener.accept(snapshot());
+        } catch (RuntimeException e) {
+            // An exception would cancel the timer, and with it every later heartbeat.
+            log.error("Heartbeat listener failed: reason={}", e.getMessage(), e);
+        }
     }
 
     /** A file is about to be processed. */
@@ -170,7 +179,7 @@ public final class MigrationProgressTracker implements AutoCloseable {
 
     public synchronized ProgressSnapshot snapshot() {
         return new ProgressSnapshot(totalRecords, committedRecords, recordsWritten, inFlightRecords(),
-                inFlightWritten(), totalBytes, resumedSourceBytes + committedSourceBytes,
+                inFlightWritten(), totalBytes, committedSourceBytes,
                 committedBytesWritten, inFlight.size(),
                 totalFiles, completedFiles, failedFiles, totalPartitions, completedPartitions);
     }
@@ -190,7 +199,7 @@ public final class MigrationProgressTracker implements AutoCloseable {
 
         long readRecords = committedRecords + inFlightRecords();
         long writtenRecords = recordsWritten + inFlightWritten();
-        long readBytes = resumedSourceBytes + committedSourceBytes + inFlightBytesRead;
+        long readBytes = committedSourceBytes + inFlightBytesRead;
         // Failed files are not copied again by this run, so they are not left to copy.
         long remainingBytes = Math.max(0, totalBytes - readBytes - failedSourceBytes);
         log.info("Progress: files={}/{} ({}%) remaining={} failed={} inFlight={} "
@@ -212,15 +221,25 @@ public final class MigrationProgressTracker implements AutoCloseable {
                 + "%) failed=" + failedFiles
                 + "\n  Partitions: " + completedPartitions + "/" + totalPartitions + " ("
                 + format(completedPartitions, totalPartitions) + "%)"
-                + "\n  Bytes: read=" + formatBytes(resumedSourceBytes + committedSourceBytes) + "/"
+                + "\n  Bytes: read=" + formatBytes(committedSourceBytes) + "/"
                 + formatBytes(totalBytes) + " written=" + formatBytes(committedBytesWritten)
                 + " elapsed=" + formatDuration(Duration.ofNanos(nanoClock.getAsLong() - startedAt));
     }
 
-    /** Stops the heartbeat. */
+    /** Stops the heartbeat, after letting one in progress finish. */
     @Override
     public void close() {
-        if (timer != null) {
+        if (timer == null) {
+            return;
+        }
+        timer.shutdown();
+        try {
+            if (!timer.awaitTermination(CLOSE_TIMEOUT.toMillis(), TimeUnit.MILLISECONDS)) {
+                log.warn("Progress heartbeat did not stop within {}; interrupting it", CLOSE_TIMEOUT);
+                timer.shutdownNow();
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
             timer.shutdownNow();
         }
     }

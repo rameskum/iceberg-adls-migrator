@@ -53,7 +53,6 @@ class MigrationApplicationTest {
                 "--migration.source.dataset-id=" + sourceDatasetId,
                 "--migration.target.dataset-id=5b2f7d3c-8a1e-4f6b-b2d4-9c0e3a7f1d02",
                 "--migration.datasets.stub-directory=" + datasets,
-                "--migration.state.run-table=" + "migration_run",
                 "--migration.state.file-table=" + "migration_file",
                 "--migration.state.control-table=" + "migration_control",
         };
@@ -102,9 +101,18 @@ class MigrationApplicationTest {
     @Test
     void rejectsParametersOutsideTheKnownPrefixes() {
         assertThatThrownBy(() -> MigrationApplication.run(applicationTrackingClose(new AtomicBoolean()),
-                "--migraton.run-id=20261117-103000-ab12cd"))
+                "--migraton.target.clean=true"))
                 .isInstanceOf(IllegalArgumentException.class)
-                .hasMessageStartingWith("Unknown job parameter '--migraton.run-id=20261117-103000-ab12cd'");
+                .hasMessageStartingWith("Unknown job parameter '--migraton.target.clean=true'");
+    }
+
+    @Test
+    void rejectsTheRunIdOfRunsThatCouldBeResumed() {
+        String[] args = java.util.stream.Stream.concat(java.util.Arrays.stream(args("0e9c1a5e-4c55-4a3b-9f3e-1c2a7d8b6e01")),
+                java.util.stream.Stream.of("--migration.run-id=20261117-103000-ab12cd")).toArray(String[]::new);
+
+        assertThatThrownBy(() -> MigrationApplication.run(applicationTrackingClose(new AtomicBoolean()), args))
+                .hasStackTraceContaining("migration.run-id");
     }
 
     @Test
