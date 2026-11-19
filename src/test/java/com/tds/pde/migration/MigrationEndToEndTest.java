@@ -204,7 +204,9 @@ class MigrationEndToEndTest {
             Future<?> run = runner.submit(() -> migrate("--migration.processing.parallel-files=1",
                     "--migration.progress.log-every=50ms"));
 
-            await().atMost(Duration.ofSeconds(10)).until(() -> control().progress().completedFiles() == 1);
+            // The run claims its control row on another thread, so the row may not exist yet.
+            await().atMost(Duration.ofSeconds(10)).until(() -> stateStore.findControls(TARGET_ID).stream()
+                    .anyMatch(row -> row.progress().completedFiles() == 1));
             ControlRecord running = control();
             assertThat(running.status()).isEqualTo(ControlRecord.Status.RUNNING);
             assertThat(running.progress().recordsRead()).isEqualTo(1);
