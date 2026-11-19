@@ -381,8 +381,8 @@ Each completed file also logs `Source file completed` with its source and target
   clean refused under a live run and allowed once its heartbeat is stale, progress counters on the control row, a
   run that loses the migration (between files, and while a file is being written) publishing nothing more.
 - **HDFS:** one end-to-end test reads the source from an in-process HDFS (`MiniDFSCluster`).
-- **Bounded memory:** `BoundedMemoryTest` (tag `memory`) runs in its own JVM with `-Xmx128m` and migrates two
-  source files, each larger than the heap, at the same time.
+- **Bounded memory:** `BoundedMemoryTest` (tag `memory`) runs in its own JVM with `-Xmx128m` and the serial
+  collector, and migrates two source files, each larger than the heap, at the same time.
 - **Async block staging:** `AzureStagedUploadTest` drives the upload against a stand-in blob service whose Put Block
   calls it can hold, to show that writing continues meanwhile, that at most one block is in flight, and that a
   failed block fails the upload.
