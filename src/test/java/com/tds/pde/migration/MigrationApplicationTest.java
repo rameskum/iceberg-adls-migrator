@@ -131,6 +131,41 @@ class MigrationApplicationTest {
     }
 
     @Test
+    void rejectsASecretInsideSpringApplicationJsonWithoutRepeatingIt() {
+        for (String parameter : List.of(
+                "--spring.application.json={\"migration\":{\"azure\":{\"auth\":{\"connection-string\":\"AccountKey=s3cr3t\"}}}}",
+                "--spring.application.json={\"migration.azure.auth.connection-string\":\"AccountKey=s3cr3t\"}",
+                "--spring.application-json={\"migration\":{\"azure.auth\":{\"connectionString\":\"AccountKey=s3cr3t\"}}}")) {
+            String[] args = Stream.concat(Arrays.stream(args("0e9c1a5e-4c55-4a3b-9f3e-1c2a7d8b6e01")),
+                    Stream.of(parameter)).toArray(String[]::new);
+            AtomicBoolean started = new AtomicBoolean();
+            SpringApplication application = applicationTrackingClose(new AtomicBoolean());
+            application.addListeners(event -> started.set(true));
+
+            assertThatThrownBy(() -> MigrationApplication.run(application, args))
+                    .as(parameter)
+                    .isInstanceOf(IllegalArgumentException.class)
+                    .hasMessageStartingWith("Job parameter --spring.application")
+                    .hasMessageContaining("holds a secret")
+                    .hasMessageContaining("MIGRATION_AZURE_AUTH_CONNECTIONSTRING")
+                    .message().doesNotContain("s3cr3t");
+            assertThat(started).as("rejected before Spring starts").isFalse();
+        }
+    }
+
+    @Test
+    void acceptsSpringApplicationJsonWithoutSecrets() {
+        AtomicBoolean closed = new AtomicBoolean();
+        String[] args = Stream.concat(Arrays.stream(args("0e9c1a5e-4c55-4a3b-9f3e-1c2a7d8b6e01")),
+                Stream.of("--spring.application.json={\"migration\":{\"azure\":{\"auth\":{\"client-id\":\"t\"}}}}"))
+                .toArray(String[]::new);
+
+        MigrationApplication.run(applicationTrackingClose(closed), args);
+
+        assertThat(closed).isTrue();
+    }
+
+    @Test
     void rejectsTheRunIdOfRunsThatCouldBeResumed() {
         String[] args = java.util.stream.Stream.concat(java.util.Arrays.stream(args("0e9c1a5e-4c55-4a3b-9f3e-1c2a7d8b6e01")),
                 java.util.stream.Stream.of("--migration.run-id=20261117-103000-ab12cd")).toArray(String[]::new);
