@@ -107,8 +107,10 @@ Parameters are checked strictly before anything runs: dataset ids must be UUIDs,
 `--migration.`, `--spring.` or `--logging.`.
 
 **Secrets**, if any, come from environment variables set on the cluster with secret references
-(`{{secrets/<scope>/<key>}}`), never from the YAML file. The state tables need none: they are written through the
-cluster's Spark session as the job's identity.
+(`{{secrets/<scope>/<key>}}`), never from the YAML file or a job parameter: job parameters show in the job's settings
+and run history, so a secret one, such as `--migration.azure.auth.connection-string`, fails startup and names the
+environment variable to use instead (`MIGRATION_AZURE_AUTH_CONNECTIONSTRING`). The state tables need none: they are
+written through the cluster's Spark session as the job's identity.
 
 **Before the first run:**
 - create the target container (the app never creates it);
@@ -134,7 +136,7 @@ complete example. Invalid values stop the app before any data is touched.
 | `migration.datasets.stub-directory` | required | Folder of `<dataset-id>.json` descriptors |
 | `migration.azure.auth.mode` | `MANAGED_IDENTITY` | Or `CONNECTION_STRING` (local runs and tests only) |
 | `migration.azure.auth.client-id` | empty | Client id of a user-assigned managed identity |
-| `migration.azure.auth.connection-string` | empty | Required for `CONNECTION_STRING` mode |
+| `migration.azure.auth.connection-string` | empty | Required for `CONNECTION_STRING` mode; a secret, so only from the environment variable `MIGRATION_AZURE_AUTH_CONNECTIONSTRING` |
 | `migration.parquet.row-group-size` | `32MB` | Parquet row group size; the main writer memory per file in flight, see below |
 | `migration.parquet.page-size` | `1MB` | Parquet page size |
 | `migration.parquet.compression` | `ZSTD` | `ZSTD`, `SNAPPY`, `GZIP` or `UNCOMPRESSED` |
@@ -143,7 +145,7 @@ complete example. Invalid values stop the app before any data is touched.
 | `migration.failure.on-file-failure` | `FAIL_FAST` | Or `CONTINUE` with the remaining files |
 | `migration.state.control-table` | required | e.g. `main.migration.migration_control` |
 | `migration.state.file-table` | required | e.g. `main.migration.migration_file` |
-| `migration.state.write-retries` | `5` | Attempts per state table call before the run stops |
+| `migration.state.write-retries` | `5` | Attempts per state table call, read or write, before the run stops; only conflicts and transient errors are retried |
 | `migration.state.outcome-batch-size` | `50` | File outcomes written to the file table in one commit |
 | `migration.state.outcome-flush-interval` | `30s` | The first outcome after this long since the last write is written at once, with any waiting |
 | `migration.state.heartbeat-timeout` | `5m` | A RUNNING run whose heartbeat is older than this has died; until then `clean` is refused. At least 4 x `log-every` |
@@ -241,7 +243,8 @@ with conditional `UPDATE`s whose values are bound as parameters:
 
 The statements run through the cluster's `SparkSession`, reached by reflection because the launcher's isolated class
 loader hides the runtime's classes; each call switches the thread's context class loader to Spark's, because Spark and
-Hadoop load their own classes through it. Every statement is a Delta commit, so a file costs one write: its outcome.
+Hadoop load their own classes through it. Every statement is a Delta commit; file outcomes are written in batches
+(`migration.state.outcome-batch-size`, 50 by default), so a file costs a fraction of a write.
 Parallel jobs migrating *different* tables share the tables safely: deletion vectors and row tracking give row-level
 concurrency, and the rare conflicting commit is retried with jittered backoff. A retried conditional `UPDATE` is
 evaluated again against the row as it now is.
@@ -261,6 +264,11 @@ A refusal writes nothing and names the run and what to set. Cleaning deletes eve
 and is refused at a container root. A Databricks task retry or *Repair run* re-sends the same parameters, so after a
 failure it is refused until it is rerun with `--migration.target.clean=true`.
 
+**Targets must not overlap.** A target that is the same folder as another migration's target, or lies within it or
+contains it, is refused: a clean of either would delete the other's files. The control table holds every
+migration's target location, so this is checked before the run claims its migration, and again before it cleans or
+writes the target, which also catches two such runs that started at the same moment.
+
 **One run per migration.** A run claims the control row before it writes anything: the first run of a migration
 inserts the row, a later run updates it only while it is still exactly as read. Of two runs racing, Delta commits one
 write and the other, retried after the conflict, no longer applies. The run then reads the row back and only goes on
@@ -278,7 +286,8 @@ concurrent runs* to 1 adds a second guard.
 
 **Publishing a file is atomic.** Every target blob is committed in one Put Block List together with its metadata
 (`migration_run_id`, `source_file`, `source_partition`, `source_snapshot_id`, `physical_records`, `records_written`),
-under a deterministic name, so a partial file is never visible.
+under a deterministic name, so a partial file is never visible. Each staged block is sent with its Content-MD5, so
+the service rejects a block whose bytes changed in transit, and the file fails.
 
 ## Progress reporting
 
@@ -344,19 +353,22 @@ Each completed file also logs `Source file completed` with its source and target
   files (source, target, reason) and throws `MigrationFailedException`; the next run needs
   `migration.target.clean=true` and copies everything again.
 - **Checked before anything is written:** a run that did not complete, another live run, non-Parquet data files,
-  unreadable delete files, format versions above 3, schema mismatches, a non-empty target without `clean`.
-- **State table failures** are retried with jittered backoff (about 1s, then 2s, ...); if they persist the run stops
-  and is recorded as `FAILED` where it still can be. A run that crashed, or could not record its end, stays `RUNNING`
-  and counts as failed once its heartbeat is older than `migration.state.heartbeat-timeout`. A heartbeat renewal that
-  keeps failing is logged and tried again with the next `Progress:` line; after half the timeout without one, the
-  run stops publishing.
+  unreadable delete files, format versions above 3, schema mismatches, a non-empty target without `clean`, a target
+  overlapping another migration's, two source files that would get the same target name.
+- **State table failures** are retried with jittered backoff (about 1s, then 2s, ...) when they are Delta commit
+  conflicts or transient; if they persist the run stops and is recorded as `FAILED` where it still can be. An error
+  that retrying cannot change, such as a missing table or permission or a statement Spark rejects, stops it at once.
+  A run that crashed, or could not record its end, stays `RUNNING` and counts as failed once its heartbeat is older
+  than `migration.state.heartbeat-timeout`. A heartbeat renewal that keeps failing is logged and tried again with the
+  next `Progress:` line; after half the timeout without one, the run stops publishing.
 
 ## Output
 
 - **One flat folder per target**, with the partition in the file name, for example
   `sales/orders/region=EU.event_ts_day=2026-01-15__00000-5-a1b2c3d4-0001-00001-9f3e1c2a.parquet`. Names are
   deterministic and contain a hash of the source location, so source files with the same name in different folders
-  never collide. Names never start with `_` or `.`, which Spark would skip.
+  do not collide; should two source files still get the same name, the run fails before writing anything. Names
+  never start with `_` or `.`, which Spark would skip.
 - **Schema.** Every file uses the table schema: the current schema when migrating the current snapshot (as a
   plain read does), or the snapshot's own schema when `snapshot-id` is set (as time travel does). Older files are
   projected onto it: added columns are null, renamed columns appear under their current names.
@@ -387,15 +399,20 @@ Each completed file also logs `Source file completed` with its source and target
   calls it can hold, to show that writing continues meanwhile, that at most one block is in flight, and that a
   failed block fails the upload.
 - **Azure:** the Blob adapter tests and one end-to-end test need a real Blob API. They run when
-  `AZURE_STORAGE_TEST_CONNECTION_STRING` is set, for example against Azurite:
+  `AZURE_STORAGE_TEST_CONNECTION_STRING` is set, for example against Azurite, whose development account the Azure
+  SDK knows as `UseDevelopmentStorage=true`:
 
   ```bash
   npx azurite --inMemoryPersistence --skipApiVersionCheck --loose --blobHost 127.0.0.1 &
-  export AZURE_STORAGE_TEST_CONNECTION_STRING="DefaultEndpointsProtocol=http;AccountName=devstoreaccount1;AccountKey=<Azurite's well-known key>;BlobEndpoint=http://127.0.0.1:10000/devstoreaccount1;"
+  export AZURE_STORAGE_TEST_CONNECTION_STRING="UseDevelopmentStorage=true"
   ./mvnw verify
   ```
 
-  Azurite's account key is published in its documentation.
+- **CI** ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) runs `./mvnw verify` on JDK 21 for every pull
+  request and every push to `master`, with Azurite, so the Azure tests run too.
+
+The Maven wrapper keeps its launcher jar in `.mvn/wrapper`, so it downloads Maven through Java, with no `curl` or
+`wget`, and checks the download's SHA-256.
 
 Spark and Delta do not run in the tests: the orchestration tests keep state in an in-memory stand-in for the
 repository, and the Spark bridge is tested against stand-in classes with Spark's API shape. The repository's
@@ -409,6 +426,8 @@ lost the row, finishing, and refusing an earlier version's control table.
 - Managed identity sign-in, and the state tables on Databricks' own Spark and Delta with Unity Catalog, including
   row-level concurrency between parallel jobs and between two first runs inserting the same control row: these
   need the Databricks workspace.
+- Which state table errors Databricks reports as commit conflicts, analysis or permission errors: the retry
+  decision is tested against stand-ins with the shape of Spark's and Delta's exceptions.
 - A production HDFS cluster (tests use an in-process one).
 - Equality deletes are loaded into memory per data file; memory then grows with the size of the equality delete
   files, not the data files. Tables here are append-only, so none are expected.

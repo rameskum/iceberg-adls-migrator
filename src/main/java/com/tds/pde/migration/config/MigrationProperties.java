@@ -148,7 +148,8 @@ public record MigrationProperties(
      *
      * @param controlTable          fully qualified control table, e.g. {@code main.migration.migration_control}
      * @param fileTable             fully qualified file table, e.g. {@code main.migration.migration_file}
-     * @param writeRetries          attempts for each state write before the run is stopped
+     * @param writeRetries          attempts for each state table call, read or write, before the run is stopped;
+     *                              only commit conflicts and transient errors are retried
      * @param outcomeBatchSize      file outcomes written to the file table in one commit
      * @param outcomeFlushInterval  longest a file outcome waits for its batch to fill; the next outcome after it
      *                              writes the batch

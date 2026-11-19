@@ -23,6 +23,7 @@ import com.tds.pde.migration.testing.InMemoryState;
 import com.tds.pde.migration.testing.TestProperties;
 import java.io.IOException;
 import java.io.OutputStream;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.time.Instant;
@@ -117,6 +118,96 @@ class RunStarterTest {
         publish("sales/orders-archive/part-0.parquet");
 
         assertThat(start(Map.of()).previous()).isNull();
+    }
+
+    @Test
+    void refusesATargetWithinAnotherMigrationsTarget() {
+        ControlRecord parent = otherMigration("abfss://data@salesacct.dfs.core.windows.net/sales");
+        state.putControl(parent);
+
+        assertThatThrownBy(() -> start(Map.of("migration.target.clean", "true")))
+                .isInstanceOf(MigrationFailedException.class)
+                .hasMessage("Target abfss://data@salesacct.dfs.core.windows.net/sales/orders is within the target "
+                        + "abfss://data@salesacct.dfs.core.windows.net/sales of target dataset " + parent.targetDatasetId()
+                        + ", so a clean of either would delete the other's files. Give each target dataset a folder "
+                        + "of its own, neither within the other; nothing was written.");
+        assertThat(state.controls()).containsExactly(parent);
+    }
+
+    @Test
+    void refusesATargetContainingAnotherMigrationsTarget() {
+        ControlRecord child = otherMigration("abfss://data@salesacct.dfs.core.windows.net/sales/orders/eu/");
+        state.putControl(child);
+
+        assertThatThrownBy(() -> start(Map.of()))
+                .isInstanceOf(MigrationFailedException.class)
+                .hasMessageContaining("Target abfss://data@salesacct.dfs.core.windows.net/sales/orders contains the "
+                        + "target abfss://data@salesacct.dfs.core.windows.net/sales/orders/eu/ of target dataset "
+                        + child.targetDatasetId());
+        assertThat(state.findControls(TARGET_ID)).isEmpty();
+    }
+
+    @Test
+    void refusesATargetThatIsAnotherMigrationsTarget() {
+        state.putControl(otherMigration("abfss://data@salesacct.dfs.core.windows.net/sales/orders"));
+
+        assertThatThrownBy(() -> start(Map.of()))
+                .isInstanceOf(MigrationFailedException.class)
+                .hasMessageContaining("is the same folder as the target");
+        assertThat(state.findControls(TARGET_ID)).isEmpty();
+    }
+
+    @Test
+    void startsBesideTargetsOfOtherMigrationsThatDoNotOverlapIt() {
+        state.putControl(otherMigration("abfss://data@salesacct.dfs.core.windows.net/sales/orders-archive"));
+        state.putControl(otherMigration("abfss://data@salesacct.dfs.core.windows.net/sales/order"));
+        state.putControl(otherMigration("abfss://other@salesacct.dfs.core.windows.net/sales"));
+        state.putControl(otherMigration("abfss://data@otheracct.dfs.core.windows.net/sales"));
+
+        StartedRun started = start(Map.of());
+        starter(Map.of()).prepare(started, claim(started), LOCATION, blobStore);
+
+        assertThat(state.findControls(TARGET_ID)).singleElement().extracting(ControlRecord::runId)
+                .isEqualTo(started.runId());
+    }
+
+    @Test
+    void refusesToWriteATargetThatAnotherMigrationClaimedWithinAtTheSameMoment() throws IOException {
+        state.putControl(control(EARLIER_RUN, ControlRecord.Status.FAILED, Instant.now(), "boom"));
+        publish(LOCATION.blobName("a.parquet"));
+        StartedRun started = start(Map.of("migration.target.clean", "true"));
+        // A run of another migration, into a folder within this target, started too and claimed its own row.
+        ControlRecord child = otherMigration("abfss://data@salesacct.dfs.core.windows.net/sales/orders/eu");
+        state.putControl(child);
+
+        assertThatThrownBy(() -> starter(Map.of("migration.target.clean", "true"))
+                .prepare(started, claim(started), LOCATION, blobStore))
+                .isInstanceOf(MigrationFailedException.class)
+                .hasMessageEndingWith("contains the target abfss://data@salesacct.dfs.core.windows.net/sales/orders/eu "
+                        + "of target dataset " + child.targetDatasetId() + ", so a clean of either would delete the other's "
+                        + "files. Give each target dataset a folder of its own, neither within the other; nothing "
+                        + "was written to the target.");
+        assertThat(blobStore.blobs()).as("not cleaned").containsOnlyKeys(LOCATION.blobName("a.parquet"));
+        assertThat(state.findFiles(started.runId())).isEmpty();
+    }
+
+    @Test
+    void failsThePlanWhenTwoSourceFilesWouldGetTheSameTargetName() {
+        TargetPathResolver colliding = new TargetPathResolver() {
+            @Override
+            public String resolve(String prefix, String partitionPath, String sourceLocation) {
+                return prefix + "/" + partitionPath.replace('/', '.') + "__part-00000-1a2b3c4d.parquet";
+            }
+        };
+        RunStarter starter = new RunStarter(TestProperties.bind(Map.of()), state,
+                new IcebergMetadataReader(new Configuration()), new TargetSchemaValidator(), colliding);
+
+        assertThatThrownBy(() -> starter.start(source, target(), LOCATION, blobStore))
+                .isInstanceOf(MigrationFailedException.class)
+                .hasMessageMatching("Source files \\S+/region=EU/\\S+\\.parquet and \\S+/region=EU/\\S+\\.parquet "
+                        + "would both be written to sales/orders/region=EU__part-00000-1a2b3c4d\\.parquet, the "
+                        + "second overwriting the first; nothing was written\\.");
+        assertThat(state.controls()).isEmpty();
     }
 
     @Test
@@ -380,6 +471,14 @@ class RunStarterTest {
                 null, heartbeatAt.minus(Duration.ofHours(2)), heartbeatAt,
                 status == ControlRecord.Status.RUNNING ? null : heartbeatAt, 3, 6, ControlRecord.Progress.NONE,
                 error);
+    }
+
+    /** The control row of a completed migration into another target dataset, at {@code targetLocation}. */
+    private ControlRecord otherMigration(String targetLocation) {
+        String targetDatasetId = UUID.nameUUIDFromBytes(targetLocation.getBytes(StandardCharsets.UTF_8)).toString();
+        return new ControlRecord(targetDatasetId, source.datasetId(), source.location(), targetLocation,
+                "20261101-000000-0th3r0", ControlRecord.Status.COMPLETED, null, Instant.now(), Instant.now(),
+                Instant.now(), 3, 6, ControlRecord.Progress.NONE, null);
     }
 
     private static DatasetDescriptor target() {

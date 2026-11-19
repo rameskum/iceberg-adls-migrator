@@ -11,8 +11,10 @@ import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.function.Function;
 import org.jspecify.annotations.Nullable;
 import org.junit.jupiter.api.Test;
@@ -56,6 +58,30 @@ class MigrationStateRepositoryTest {
                 .hasMessageContaining("State table migration_control has the columns [last_run_id, ")
                 .hasMessageContaining("this version needs [bytes_written, completed_files, ")
                 .hasMessageContaining("Drop it, or point the setting at a new table");
+    }
+
+    @Test
+    void carriesOnWhenAnotherJobCreatedTheTableFirst() {
+        sql.details.put("migration_file", List.of("run_id"));
+        sql.failingStatement = StateTable.control("migration_control").createStatement();
+        sql.failure = "[TABLE_OR_VIEW_ALREADY_EXISTS] Cannot create table migration_control";
+
+        repository.createTablesIfMissing();
+
+        assertThat(sql.statements).as("not retried").containsOnlyOnce(sql.failingStatement);
+    }
+
+    @Test
+    void failsWhenTheTableCouldNotBeCreatedAndDoesNotExist() {
+        sql.failingStatement = StateTable.control("migration_control").createStatement();
+        sql.missingTables.add("migration_control");
+
+        assertThatThrownBy(repository::createTablesIfMissing)
+                .isInstanceOf(StateStoreException.class)
+                .hasMessageContaining("create state table migration_control")
+                .hasMessageContaining("[PERMISSION_DENIED]")
+                .satisfies(e -> assertThat(e.getSuppressed()).singleElement().asString()
+                        .contains("TABLE_OR_VIEW_NOT_FOUND"));
     }
 
     @Test
@@ -187,6 +213,15 @@ class MigrationStateRepositoryTest {
     }
 
     @Test
+    void readsTheControlRowsOfEveryOtherTarget() {
+        repository.findOtherControls("target-1");
+
+        assertThat(sql.statements).singleElement().asString().startsWith("SELECT target_dataset_id, ")
+                .endsWith(" FROM migration_control WHERE target_dataset_id <> :target");
+        assertThat(sql.parameters.getFirst()).isEqualTo(Map.of("target", "target-1"));
+    }
+
+    @Test
     void deletesTheControlRowOfARunThatLostTheRaceToInsertIt() {
         repository.deleteControl("target-1", "run-2");
 
@@ -213,6 +248,27 @@ class MigrationStateRepositoryTest {
                 .startsWith("UPDATE migration_control SET "));
     }
 
+    @Test
+    void failsAtOnceOnAnErrorThatRetryingCannotChange() {
+        sql.failingStatement = "DELETE FROM migration_file WHERE run_id = :run_id";
+
+        assertThatThrownBy(() -> repository.deleteFiles("run-1"))
+                .isInstanceOf(StateStoreException.class)
+                .hasMessageContaining("not retried as the error is not transient: delete file rows of run run-1")
+                .hasMessageContaining("[PERMISSION_DENIED]");
+        assertThat(sql.statements).as("tried once").hasSize(1);
+    }
+
+    @Test
+    void stopsRetryingAConflictAfterTheConfiguredAttempts() {
+        sql.failuresBeforeSuccess = Integer.MAX_VALUE;
+
+        assertThatThrownBy(() -> repository.deleteFiles("run-1"))
+                .isInstanceOf(StateStoreException.class)
+                .hasMessageContaining("failed after 5 attempts: delete file rows of run run-1");
+        assertThat(sql.statements).hasSize(5);
+    }
+
     private static ControlRecord control(String runId) {
         return new ControlRecord("target-1", "source-1", "hdfs://nn/orders",
                 "abfss://data@acct.dfs.core.windows.net/orders", runId, ControlRecord.Status.RUNNING, 42L, STARTED,
@@ -231,6 +287,8 @@ class MigrationStateRepositoryTest {
         /** Columns that SHOW COLUMNS reports, by table; by default the table's own. */
         final Map<String, List<String>> columns = new HashMap<>();
         @Nullable String failingStatement;
+        String failure = "[PERMISSION_DENIED] User does not have MANAGE on table";
+        final Set<String> missingTables = new HashSet<>();
         long affectedRows = -1;
         int failuresBeforeSuccess;
 
@@ -239,11 +297,11 @@ class MigrationStateRepositoryTest {
             statements.add(statement);
             parameters.add(new HashMap<>(params));
             if (statement.equals(failingStatement)) {
-                throw new SqlExecutionException("[PERMISSION_DENIED] User does not have MANAGE on table", null);
+                throw new SqlExecutionException(failure, null, false);
             }
             if (failuresBeforeSuccess > 0) {
                 failuresBeforeSuccess--;
-                throw new SqlExecutionException("[DELTA_CONCURRENT_APPEND] ConcurrentAppendException", null);
+                throw new SqlExecutionException("[DELTA_CONCURRENT_APPEND] ConcurrentAppendException", null, true);
             }
             return affectedRows;
         }
@@ -258,6 +316,9 @@ class MigrationStateRepositoryTest {
             }
             if (statement.startsWith("SHOW COLUMNS IN ")) {
                 String table = statement.substring("SHOW COLUMNS IN ".length());
+                if (missingTables.contains(table)) {
+                    throw new SqlExecutionException("[TABLE_OR_VIEW_NOT_FOUND] " + table, null, false);
+                }
                 List<String> names = columns.getOrDefault(table, table.equals("migration_control")
                         ? StateTable.control(table).columnNames() : StateTable.file(table).columnNames());
                 return names.stream().<Map<String, Object>>map(name -> Map.of("col_name", name)).toList();

@@ -3,12 +3,15 @@ package com.tds.pde.migration.state;
 import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
 import java.util.ArrayList;
+import java.util.ConcurrentModificationException;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.UUID;
 import java.util.function.Function;
 import java.util.function.Supplier;
 import lombok.extern.slf4j.Slf4j;
+import org.jspecify.annotations.Nullable;
 import org.springframework.stereotype.Component;
 import org.springframework.util.LinkedCaseInsensitiveMap;
 
@@ -37,6 +40,16 @@ public class SparkSqlExecutor implements SqlExecutor {
     private static final String SEQ_CLASS = "scala.collection.Seq";
     /** Column Delta reports for UPDATE, DELETE, MERGE and INSERT. */
     private static final String AFFECTED_ROWS = "num_affected_rows";
+    /** Spark's error for a statement it cannot analyse, e.g. a missing table or column; parse errors extend it. */
+    private static final String ANALYSIS_EXCEPTION_CLASS = "org.apache.spark.sql.AnalysisException";
+    private static final String SECURITY_EXCEPTION_CLASS = "org.apache.spark.SparkSecurityException";
+    /**
+     * SQLSTATE classes of errors in the statement or its data, which fail again however often they are retried:
+     * 0A feature not supported, 21 cardinality violation (e.g. a MERGE source row matching two target rows),
+     * 22 data exception, 23 integrity constraint violation (e.g. a NULL in a NOT NULL column), 42 syntax error or
+     * access rule violation (e.g. a missing table or permission).
+     */
+    private static final Set<String> PERMANENT_SQL_STATE_CLASSES = Set.of("0A", "21", "22", "23", "42");
 
     private final Supplier<ClassLoader> sparkClassLoader;
     private volatile Bridge bridge;
@@ -79,9 +92,10 @@ public class SparkSqlExecutor implements SqlExecutor {
                 return result;
             });
         } catch (InvocationTargetException e) {
-            throw new SqlExecutionException("Spark SQL failed: " + e.getCause().getMessage(), e.getCause());
+            throw new SqlExecutionException("Spark SQL failed: " + e.getCause().getMessage(), e.getCause(),
+                    isRetryable(e.getCause()));
         } catch (ReflectiveOperationException e) {
-            throw new SqlExecutionException("Cannot call Spark", e);
+            throw new SqlExecutionException("Cannot call Spark", e, false);
         }
     }
 
@@ -101,9 +115,9 @@ public class SparkSqlExecutor implements SqlExecutor {
             });
         } catch (InvocationTargetException e) {
             throw new SqlExecutionException("Spark cannot create the rows to merge: " + e.getCause().getMessage(),
-                    e.getCause());
+                    e.getCause(), isRetryable(e.getCause()));
         } catch (ReflectiveOperationException e) {
-            throw new SqlExecutionException("Cannot call Spark", e);
+            throw new SqlExecutionException("Cannot call Spark", e, false);
         }
         try {
             return body.apply(view);
@@ -114,6 +128,55 @@ public class SparkSqlExecutor implements SqlExecutor {
             } catch (SqlExecutionException e) {
                 log.warn("Cannot drop temporary view: view={} reason={}", view, e.getMessage());
             }
+        }
+    }
+
+    /**
+     * Whether running a failed statement again may succeed. A Delta commit conflict always may: Delta's conflict
+     * exceptions extend {@link ConcurrentModificationException}. An error that was certain from the start never
+     * does: the engine rejected the statement ({@code AnalysisException}, which includes parse errors), the job's
+     * identity lacks a permission, or the SQLSTATE that Spark gives every classified error says the statement or its
+     * data is at fault. Any other failure, such as a lost executor or a storage timeout, is taken as transient.
+     */
+    static boolean isRetryable(Throwable failure) {
+        for (Throwable cause = failure; cause != null; cause = cause.getCause()) {
+            if (cause instanceof ConcurrentModificationException) {
+                return true;
+            }
+        }
+        for (Throwable cause = failure; cause != null; cause = cause.getCause()) {
+            if (cause instanceof SecurityException || isA(cause, ANALYSIS_EXCEPTION_CLASS)
+                    || isA(cause, SECURITY_EXCEPTION_CLASS)) {
+                return false;
+            }
+            String sqlState = sqlState(cause);
+            if (sqlState != null && sqlState.length() >= 2
+                    && PERMANENT_SQL_STATE_CLASSES.contains(sqlState.substring(0, 2))) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private static boolean isA(Throwable failure, String className) {
+        for (Class<?> type = failure.getClass(); type != null; type = type.getSuperclass()) {
+            if (type.getName().equals(className)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /** The SQLSTATE of a Spark error ({@code SparkThrowable.getSqlState()}), or null when it has none. */
+    private static @Nullable String sqlState(Throwable failure) {
+        try {
+            Method getSqlState = failure.getClass().getMethod("getSqlState");
+            if (getSqlState.getReturnType() != String.class || !getSqlState.trySetAccessible()) {
+                return null;
+            }
+            return (String) getSqlState.invoke(failure);
+        } catch (ReflectiveOperationException | RuntimeException e) {
+            return null;
         }
     }
 

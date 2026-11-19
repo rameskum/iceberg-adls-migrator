@@ -16,7 +16,9 @@ import com.tds.pde.migration.testing.TestProperties;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.UUID;
 import java.util.stream.LongStream;
 import org.apache.iceberg.PartitionSpec;
@@ -31,6 +33,8 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.condition.EnabledIfEnvironmentVariable;
 import org.junit.jupiter.api.io.TempDir;
 import org.springframework.boot.SpringApplication;
+import org.springframework.core.env.StandardEnvironment;
+import org.springframework.core.env.SystemEnvironmentPropertySource;
 
 /**
  * The whole application against a real Blob API through the production Azure adapter. Enabled by
@@ -119,10 +123,22 @@ class AzureEndToEndTest {
                 "--migration.datasets.stub-directory=" + datasets,
                 "--migration.state.file-table=" + "migration_file",
                 "--migration.azure.auth.mode=CONNECTION_STRING",
-                "--migration.azure.auth.connection-string=" + connectionString,
                 "--migration.state.control-table=" + "migration_control"));
         args.addAll(List.of(extraArgs));
-        MigrationApplication.run(new SpringApplication(MigrationApplication.class, InMemoryState.class), args.toArray(String[]::new));
+        SpringApplication application = new SpringApplication(MigrationApplication.class, InMemoryState.class);
+        application.setEnvironment(environmentWithConnectionString());
+        MigrationApplication.run(application, args.toArray(String[]::new));
+    }
+
+    /** The connection string set as a secret is on Databricks: in the environment variable named for it. */
+    private StandardEnvironment environmentWithConnectionString() {
+        StandardEnvironment environment = new StandardEnvironment();
+        Map<String, Object> variables = new HashMap<>(environment.getSystemEnvironment());
+        variables.put("MIGRATION_AZURE_AUTH_CONNECTIONSTRING", connectionString);
+        environment.getPropertySources().replace(StandardEnvironment.SYSTEM_ENVIRONMENT_PROPERTY_SOURCE_NAME,
+                new SystemEnvironmentPropertySource(StandardEnvironment.SYSTEM_ENVIRONMENT_PROPERTY_SOURCE_NAME,
+                        variables));
+        return environment;
     }
 
     private static List<Record> rows(String region, long firstId, int count) {

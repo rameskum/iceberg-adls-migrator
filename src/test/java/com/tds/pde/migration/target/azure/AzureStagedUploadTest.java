@@ -3,18 +3,18 @@ package com.tds.pde.migration.target.azure;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
-import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
-import com.azure.core.util.BinaryData;
 import com.azure.storage.blob.options.BlockBlobCommitBlockListOptions;
+import com.azure.storage.blob.options.BlockBlobStageBlockOptions;
 import com.azure.storage.blob.specialized.BlockBlobClient;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.OutputStream;
+import java.security.MessageDigest;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
@@ -42,6 +42,8 @@ class AzureStagedUploadTest {
     private final List<String> stagedIds = Collections.synchronizedList(new ArrayList<>());
     private final ByteArrayOutputStream stagedBytes = new ByteArrayOutputStream();
     private final AtomicInteger stageCalls = new AtomicInteger();
+    private final List<byte[]> stagedBlocks = Collections.synchronizedList(new ArrayList<>());
+    private final List<byte[]> stagedMd5s = Collections.synchronizedList(new ArrayList<>());
 
     @AfterEach
     void shutDown() {
@@ -65,14 +67,17 @@ class AzureStagedUploadTest {
     private void stageThrough(CountDownLatch gate) {
         doAnswer(invocation -> {
             stageCalls.incrementAndGet();
-            byte[] content = invocation.<BinaryData>getArgument(1).toBytes();
+            BlockBlobStageBlockOptions options = invocation.getArgument(0);
+            byte[] content = options.getData().toBytes();
+            stagedMd5s.add(options.getContentMd5());
             gate.await(10, TimeUnit.SECONDS);
             synchronized (stagedBytes) {
                 stagedBytes.write(content);
+                stagedBlocks.add(content);
             }
-            stagedIds.add(invocation.getArgument(0));
+            stagedIds.add(options.getBase64BlockId());
             return null;
-        }).when(blob).stageBlock(anyString(), any(BinaryData.class));
+        }).when(blob).stageBlockWithResponse(any(BlockBlobStageBlockOptions.class), any(), any());
     }
 
     @Test
@@ -122,6 +127,24 @@ class AzureStagedUploadTest {
     }
 
     @Test
+    void sendsTheMd5OfEachBlockSoTheServiceCanRejectOneCorruptedInTransit() throws Exception {
+        stageThrough(new CountDownLatch(0));
+        AzureStagedUpload upload = upload();
+        byte[] content = new byte[BLOCK_SIZE * 2 + 17];
+        new Random(2).nextBytes(content);
+
+        try (OutputStream out = upload.outputStream()) {
+            out.write(content);
+        }
+
+        assertThat(stagedBlocks).hasSize(3);
+        for (int i = 0; i < stagedBlocks.size(); i++) {
+            assertThat(stagedMd5s.get(i)).as("block %d", i)
+                    .isEqualTo(MessageDigest.getInstance("MD5").digest(stagedBlocks.get(i)));
+        }
+    }
+
+    @Test
     void waitsForTheLastBlockWhenTheStreamIsClosed() throws Exception {
         CountDownLatch release = new CountDownLatch(1);
         stageThrough(release);
@@ -146,7 +169,7 @@ class AzureStagedUploadTest {
     void reportsAFailedBlockOnTheNextWriteAndRefusesToCommit() throws Exception {
         doAnswer(invocation -> {
             throw new IllegalStateException("service unavailable");
-        }).when(blob).stageBlock(anyString(), any(BinaryData.class));
+        }).when(blob).stageBlockWithResponse(any(BlockBlobStageBlockOptions.class), any(), any());
         AzureStagedUpload upload = upload();
         OutputStream out = upload.outputStream();
 
@@ -166,7 +189,7 @@ class AzureStagedUploadTest {
     void reportsAFailureOfTheLastBlockWhenTheStreamIsClosed() throws Exception {
         doAnswer(invocation -> {
             throw new IllegalStateException("service unavailable");
-        }).when(blob).stageBlock(anyString(), any(BinaryData.class));
+        }).when(blob).stageBlockWithResponse(any(BlockBlobStageBlockOptions.class), any(), any());
         OutputStream out = upload().outputStream();
         out.write(new byte[10]);
 

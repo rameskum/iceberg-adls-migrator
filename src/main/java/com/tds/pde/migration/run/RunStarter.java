@@ -23,9 +23,11 @@ import java.time.Instant;
 import java.time.ZoneOffset;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.HexFormat;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.jspecify.annotations.Nullable;
@@ -45,6 +47,12 @@ import org.springframework.stereotype.Component;
  * other's write, retried after the conflict, no longer applies. The row is then read back, and the claim only holds
  * when it is the migration's single row and names this run: two first runs inserting at once can both commit, as
  * neither updates an existing row, and then only one of them can see a single row.
+ *
+ * <p>Targets of different migrations must not overlap: a target that is the same folder as another migration's
+ * target, or is within it or contains it, would have its files deleted by the other's clean, or would hold files
+ * the other did not write. The control table knows every target, so a run that would overlap one is refused before
+ * it claims the migration, and checked again before it writes the target, after any other run that started at the
+ * same moment has claimed its own.
  */
 @Slf4j
 @Component
@@ -77,9 +85,11 @@ public class RunStarter {
             throw new MigrationFailedException("Refusing to clean " + location
                     + ": it is a whole container. Point the target at a folder within it.");
         }
+        requireNoOverlappingTarget(target.datasetId(), location, "nothing was written");
 
         MigrationPlan plan = metadataReader.plan(source.location(), properties.source().snapshotId());
         OutputSchema outputSchema = schemaValidator.resolve(plan.table().schema(), target.schema());
+        List<PartitionTasks> tasks = tasks(plan, location);
         if (!clean) {
             requireEmptyTarget(location, blobStore, previous);
         }
@@ -93,7 +103,7 @@ public class RunStarter {
                 claimed.runId(), previous == null ? "<none>" : previous.runId(),
                 previous == null ? "<none>" : previous.status(), clean);
         return new StartedRun(claimed, previous, new RunContext(claimed.runId(), plan.table(), outputSchema), plan,
-                tasks(plan, location));
+                tasks);
     }
 
     /**
@@ -104,6 +114,7 @@ public class RunStarter {
      * @throws ClaimLostException when the run lost its claim, or could not renew its heartbeat for too long
      */
     public void prepare(StartedRun run, RunClaim claim, AzureLocation location, BlobStore blobStore) {
+        requireNoOverlappingTarget(run.control().targetDatasetId(), location, "nothing was written to the target");
         if (properties.target().clean()) {
             clean(claim, location, blobStore);
         }
@@ -152,6 +163,28 @@ public class RunStarter {
         }
     }
 
+    private void requireNoOverlappingTarget(String targetDatasetId, AzureLocation location, String outcome) {
+        for (ControlRecord other : state.findOtherControls(targetDatasetId)) {
+            AzureLocation otherLocation;
+            try {
+                otherLocation = AzureLocation.parse(other.targetLocation());
+            } catch (IllegalArgumentException e) {
+                log.warn("Control row with an unreadable target location, not checked for overlap: "
+                        + "targetDataset={} targetLocation={}", other.targetDatasetId(), other.targetLocation());
+                continue;
+            }
+            if (location.overlaps(otherLocation)) {
+                // Of two overlapping folders, the shorter contains the longer.
+                String relation = location.prefix().equals(otherLocation.prefix()) ? "is the same folder as"
+                        : location.prefix().length() < otherLocation.prefix().length() ? "contains" : "is within";
+                throw new MigrationFailedException("Target " + location + " " + relation + " the target "
+                        + other.targetLocation() + " of target dataset " + other.targetDatasetId() + ", so a clean of "
+                        + "either would delete the other's files. Give each target dataset a folder of its own, "
+                        + "neither within the other; " + outcome + ".");
+            }
+        }
+    }
+
     private void requireEmptyTarget(AzureLocation location, BlobStore blobStore, @Nullable ControlRecord previous) {
         List<BlobStore.BlobInfo> existing = blobStore.list(location.blobPrefix());
         if (existing.isEmpty()) {
@@ -194,13 +227,24 @@ public class RunStarter {
         log.info("Target cleaned: target={} deletedBlobs={}", location, blobs.size());
     }
 
+    /**
+     * The target of every source file. Names are shortened to fit and carry only a short hash of the source, so two
+     * files could get the same name, and the second would overwrite the first; the plan fails instead.
+     */
     private List<PartitionTasks> tasks(MigrationPlan plan, AzureLocation location) {
         List<PartitionTasks> partitions = new ArrayList<>(plan.partitions().size());
+        Map<String, String> sourceByTarget = new HashMap<>();
         for (PlannedPartition partition : plan.partitions()) {
             List<FileTask> files = new ArrayList<>(partition.files().size());
             for (SourceFile file : partition.files()) {
-                files.add(new FileTask(file, partition.path(),
-                        pathResolver.resolve(location.prefix(), partition.path(), file.location())));
+                String target = pathResolver.resolve(location.prefix(), partition.path(), file.location());
+                String clash = sourceByTarget.putIfAbsent(target, file.location());
+                if (clash != null) {
+                    throw new MigrationFailedException("Source files " + clash + " and " + file.location()
+                            + " would both be written to " + target + ", the second overwriting the first; "
+                            + "nothing was written.");
+                }
+                files.add(new FileTask(file, partition.path(), target));
             }
             partitions.add(new PartitionTasks(partition, files));
         }

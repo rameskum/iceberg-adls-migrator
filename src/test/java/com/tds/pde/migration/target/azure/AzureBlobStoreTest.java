@@ -4,9 +4,18 @@ import static org.apache.iceberg.types.Types.NestedField.required;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
+import com.azure.core.http.HttpMethod;
+import com.azure.core.http.HttpPipelineCallContext;
+import com.azure.core.http.HttpPipelineNextPolicy;
+import com.azure.core.http.HttpRequest;
+import com.azure.core.http.HttpResponse;
+import com.azure.core.util.BinaryData;
 import com.azure.storage.blob.BlobClient;
 import com.azure.storage.blob.BlobContainerClient;
 import com.azure.storage.blob.BlobServiceClientBuilder;
+import com.azure.storage.blob.models.BlobErrorCode;
+import com.azure.storage.blob.models.BlobStorageException;
+import com.azure.storage.blob.models.BlockListType;
 import com.tds.pde.migration.target.BlobStore;
 import com.tds.pde.migration.target.TargetPathResolver;
 import com.tds.pde.migration.target.ParquetDataWriter;
@@ -27,10 +36,13 @@ import com.tds.pde.migration.testing.TestProperties;
 import java.io.IOException;
 import java.io.OutputStream;
 import java.nio.file.Path;
+import java.util.Arrays;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Random;
 import java.util.UUID;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import java.util.stream.LongStream;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.iceberg.PartitionSpec;
@@ -44,6 +56,7 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.condition.EnabledIfEnvironmentVariable;
 import org.junit.jupiter.api.io.TempDir;
+import reactor.core.publisher.Mono;
 
 /**
  * Runs the Azure adapter against a real Blob API: Azurite ({@code npx azurite}) or a storage account.
@@ -103,6 +116,49 @@ class AzureBlobStoreTest {
         assertThat(container.getBlobClient(name).getBlockBlobClient().listBlocks(
                 com.azure.storage.blob.models.BlockListType.COMMITTED).getCommittedBlocks()).hasSize(4);
         assertThat(store.list(location.prefix())).containsExactly(new BlobStore.BlobInfo(name, content.length));
+    }
+
+    @Test
+    void rejectsABlockWhoseBytesChangedInTransit() {
+        BlobContainerClient corrupting = new BlobServiceClientBuilder()
+                .connectionString(System.getenv(CONNECTION_STRING_VARIABLE))
+                .addPolicy(AzureBlobStoreTest::flipFirstBitOfEachPutBlock)
+                .buildClient().getBlobContainerClient(container.getBlobContainerName());
+        ExecutorService stagingThreads = Executors.newSingleThreadExecutor();
+        try {
+            BlobStore store = new AzureBlobStore(corrupting, BLOCK_SIZE, stagingThreads);
+            String name = location.blobName("part.parquet");
+            StagedUpload upload = store.startUpload(name);
+
+            assertThatThrownBy(() -> {
+                try (OutputStream out = upload.outputStream()) {
+                    out.write(randomBytes(BLOCK_SIZE + 10));
+                }
+            }).isInstanceOf(IOException.class)
+                    .hasMessageContaining("Failed to stage block 0 of " + name)
+                    .rootCause().isInstanceOfSatisfying(BlobStorageException.class,
+                            e -> assertThat(e.getErrorCode()).isEqualTo(BlobErrorCode.MD5MISMATCH));
+            assertThatThrownBy(() -> container.getBlobClient(name).getBlockBlobClient().listBlocks(BlockListType.ALL))
+                    .as("not even an uncommitted block was stored")
+                    .isInstanceOfSatisfying(BlobStorageException.class,
+                            e -> assertThat(e.getErrorCode()).isEqualTo(BlobErrorCode.BLOB_NOT_FOUND));
+        } finally {
+            stagingThreads.shutdownNow();
+        }
+    }
+
+    /** Stands in for a network that corrupts data: flips a bit of every Put Block body after the SDK built it. */
+    private static Mono<HttpResponse> flipFirstBitOfEachPutBlock(HttpPipelineCallContext context,
+                                                                 HttpPipelineNextPolicy next) {
+        HttpRequest request = context.getHttpRequest();
+        String query = request.getUrl().getQuery();
+        if (request.getHttpMethod() == HttpMethod.PUT && query != null
+                && Arrays.asList(query.split("&")).contains("comp=block")) {
+            byte[] body = request.getBodyAsBinaryData().toBytes();
+            body[0] ^= 1;
+            request.setBody(BinaryData.fromBytes(body));
+        }
+        return next.process();
     }
 
     @Test
