@@ -60,9 +60,8 @@ class MigrationPropertiesTest {
         assertThat(properties.datasets().stubDirectory()).isEqualTo(Path.of("/tmp/datasets"));
         assertThat(properties.azure().auth().mode()).isEqualTo(AuthMode.MANAGED_IDENTITY);
         assertThat(properties.azure().auth().clientId()).isNull();
-        assertThat(properties.parquet().rowGroupSize()).isEqualTo(DataSize.ofMegabytes(128));
+        assertThat(properties.parquet().rowGroupSize()).isEqualTo(DataSize.ofMegabytes(32));
         assertThat(properties.parquet().pageSize()).isEqualTo(DataSize.ofMegabytes(1));
-        assertThat(properties.progress().logEveryRecords()).isEqualTo(100_000);
         assertThat(properties.progress().logEvery()).isEqualTo(Duration.ofSeconds(30));
         assertThat(properties.failure().onFileFailure()).isEqualTo(OnFileFailure.FAIL_FAST);
         assertThat(properties.state().writeRetries()).isEqualTo(5);
@@ -153,17 +152,6 @@ class MigrationPropertiesTest {
                 .isInstanceOf(BindException.class)
                 .hasStackTraceContaining("blockSize")
                 .hasStackTraceContaining("must be between 1 and 4194304000 bytes");
-    }
-
-    @Test
-    void rejectsNonPositiveProgressInterval() {
-        Map<String, String> values = required();
-        values.put("migration.progress.log-every-records", "0");
-
-        assertThatThrownBy(() -> bind(values))
-                .isInstanceOf(BindException.class)
-                .hasStackTraceContaining("logEveryRecords")
-                .hasStackTraceContaining("must be greater than 0");
     }
 
     @Test

@@ -150,10 +150,13 @@ public final class FileRunner {
         String sourcePath = task.source().location();
         // Never write while another run may hold the target.
         lock.ensureHeld();
+        progress.fileStarted(sourcePath, task.source().sizeInBytes(), task.source().recordCount());
         FileResult result = fileProcessor.process(run.context(), task,
-                (physicalRowsRead, written) -> progress.onFileProgress(sourcePath, physicalRowsRead, written));
+                (physicalRowsRead, written, bytesWritten) ->
+                        progress.onFileProgress(sourcePath, physicalRowsRead, written, bytesWritten));
         if (result.succeeded()) {
-            progress.fileCompleted(sourcePath, result.physicalRowsRead(), result.recordsWritten());
+            progress.fileCompleted(sourcePath, result.physicalRowsRead(), result.recordsWritten(),
+                    result.bytesWritten());
             outcomes.record(FileOutcome.completed(sourcePath, result.recordsWritten()));
             if (unfinished.decrementAndGet() == 0) {
                 log.info("Partition completed: partition={} files={}", partition.partition().displayName(),

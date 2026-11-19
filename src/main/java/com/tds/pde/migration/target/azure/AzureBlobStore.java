@@ -17,6 +17,7 @@ import java.time.Duration;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.concurrent.ExecutorService;
 import lombok.extern.slf4j.Slf4j;
 
 /**
@@ -29,16 +30,23 @@ public final class AzureBlobStore implements BlobStore {
     private final BlobContainerClient container;
     private final int blockSize;
     private final Duration lockRenewInterval;
+    private final ExecutorService stagingThreads;
 
-    AzureBlobStore(BlobContainerClient container, int blockSize, Duration lockRenewInterval) {
+    /**
+     * @param stagingThreads runs the Put Block calls of every upload, one at a time per upload
+     */
+    AzureBlobStore(BlobContainerClient container, int blockSize, Duration lockRenewInterval,
+                   ExecutorService stagingThreads) {
         this.container = container;
         this.blockSize = blockSize;
         this.lockRenewInterval = lockRenewInterval;
+        this.stagingThreads = stagingThreads;
     }
 
     @Override
     public StagedUpload startUpload(String blobName) {
-        return new AzureStagedUpload(container.getBlobClient(blobName).getBlockBlobClient(), blockSize);
+        return new AzureStagedUpload(container.getBlobClient(blobName).getBlockBlobClient(), blockSize,
+                stagingThreads);
     }
 
     @Override
@@ -71,8 +79,9 @@ public final class AzureBlobStore implements BlobStore {
         try {
             blob.getBlockBlobClient().upload(BinaryData.fromBytes(new byte[0]), false);
         } catch (BlobStorageException e) {
-            // Already there from an earlier run, possibly leased right now; the lease decides.
-            if (e.getStatusCode() != 409) {
+            // Already there from an earlier run, possibly leased right now (some services answer a write to a leased
+            // blob with 412 LeaseIdMissing instead of 409); the lease decides.
+            if (e.getStatusCode() != 409 && e.getErrorCode() != BlobErrorCode.LEASE_ID_MISSING) {
                 // The first request of a run: turn configuration and permission problems into a readable message.
                 throw new IllegalStateException("Cannot write to container '" + container.getBlobContainerName()
                         + "' of " + container.getAccountUrl() + ": " + e.getStatusCode() + " " + e.getErrorCode()

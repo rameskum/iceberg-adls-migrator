@@ -7,6 +7,7 @@ import com.tds.pde.migration.target.StagedUpload;
 import com.tds.pde.migration.source.IcebergDataReader;
 import com.tds.pde.migration.source.SourceRecords;
 import java.time.Duration;
+import java.util.Locale;
 import java.util.Map;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.iceberg.data.Record;
@@ -58,6 +59,7 @@ public class DataFileProcessor {
         StagedUpload upload = blobStore.startUpload(task.target());
         long physicalRowsRead = 0;
         long recordsWritten = 0;
+        long bytesWritten = 0;
         boolean published = false;
         try {
             FileAppender<Record> appender;
@@ -69,14 +71,15 @@ public class DataFileProcessor {
                         appender.add(mapper.map(row));
                         recordsWritten++;
                         if (recordsWritten % PROGRESS_INTERVAL == 0) {
-                            listener.onProgress(rows.physicalRowsRead(), recordsWritten);
+                            listener.onProgress(rows.physicalRowsRead(), recordsWritten, appender.length());
                         }
                     }
                 }
                 physicalRowsRead = rows.physicalRowsRead();
+                bytesWritten = appender.length();
             }
             // Still in flight: the rows only count once the file is published.
-            listener.onProgress(physicalRowsRead, recordsWritten);
+            listener.onProgress(physicalRowsRead, recordsWritten, bytesWritten);
             verify(task, physicalRowsRead, recordsWritten, appender.metrics().recordCount());
 
             beforePublish.run();
@@ -85,9 +88,11 @@ public class DataFileProcessor {
 
             Duration duration = Duration.ofNanos(System.nanoTime() - started);
             log.info("Source file completed: source={} target={} recordsWritten={} recordsDeleted={} "
-                            + "durationMs={}", task.source().location(), task.target(), recordsWritten,
-                    physicalRowsRead - recordsWritten, duration.toMillis());
-            return FileResult.succeeded(task, physicalRowsRead, recordsWritten, duration);
+                            + "sourceBytes={} targetBytes={} durationMs={} readMiBPerSecond={}",
+                    task.source().location(), task.target(), recordsWritten, physicalRowsRead - recordsWritten,
+                    task.source().sizeInBytes(), bytesWritten, duration.toMillis(),
+                    mebibytesPerSecond(task.source().sizeInBytes(), duration));
+            return FileResult.succeeded(task, physicalRowsRead, recordsWritten, bytesWritten, duration);
         } catch (Exception e) {
             Duration duration = Duration.ofNanos(System.nanoTime() - started);
             log.error("Source file failed, nothing was published: source={} target={} "
@@ -99,6 +104,12 @@ public class DataFileProcessor {
                 upload.abort();
             }
         }
+    }
+
+    /** Source bytes per second over the file's whole duration, with one decimal. */
+    private static String mebibytesPerSecond(long bytes, Duration duration) {
+        double seconds = duration.toNanos() / 1e9;
+        return seconds == 0 ? "n/a" : String.format(Locale.ROOT, "%.1f", bytes / (1024.0 * 1024.0) / seconds);
     }
 
     /**

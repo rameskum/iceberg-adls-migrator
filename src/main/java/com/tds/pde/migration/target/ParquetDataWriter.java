@@ -45,7 +45,8 @@ public class ParquetDataWriter {
      */
     public FileAppender<Record> open(StagedUpload upload, Schema schema, Map<String, String> footerMetadata)
             throws IOException {
-        Parquet.WriteBuilder builder = Parquet.write(new StagedOutputFile(upload))
+        StagedOutputFile output = new StagedOutputFile(upload);
+        Parquet.WriteBuilder builder = Parquet.write(output)
                 .schema(schema)
                 .createWriterFunc(GenericParquetWriter::create)
                 .set(TableProperties.PARQUET_ROW_GROUP_SIZE_BYTES, String.valueOf(settings.rowGroupSize().toBytes()))
@@ -53,7 +54,7 @@ public class ParquetDataWriter {
                 .set(TableProperties.PARQUET_COMPRESSION, settings.compression().name().toLowerCase(Locale.ROOT))
                 .overwrite();
         footerMetadata.forEach(builder::meta);
-        return new EmptyFileAwareAppender(builder.build(), upload, schema, footerMetadata);
+        return new EmptyFileAwareAppender(builder.build(), output, upload, schema, footerMetadata);
     }
 
     /**
@@ -63,14 +64,17 @@ public class ParquetDataWriter {
     private final class EmptyFileAwareAppender implements FileAppender<Record> {
 
         private final FileAppender<Record> delegate;
+        private final StagedOutputFile output;
         private final StagedUpload upload;
         private final Schema schema;
         private final Map<String, String> footerMetadata;
         private long rows;
+        private long emptyFileLength;
 
-        EmptyFileAwareAppender(FileAppender<Record> delegate, StagedUpload upload, Schema schema,
-                               Map<String, String> footerMetadata) {
+        EmptyFileAwareAppender(FileAppender<Record> delegate, StagedOutputFile output, StagedUpload upload,
+                               Schema schema, Map<String, String> footerMetadata) {
             this.delegate = delegate;
+            this.output = output;
             this.upload = upload;
             this.schema = schema;
             this.footerMetadata = footerMetadata;
@@ -87,9 +91,10 @@ public class ParquetDataWriter {
             return delegate.metrics();
         }
 
+        /** Bytes written to the target so far: the row groups already flushed, then the whole file once closed. */
         @Override
         public long length() {
-            return delegate.length();
+            return emptyFileLength > 0 ? emptyFileLength : output.bytesWritten();
         }
 
         @Override
@@ -113,6 +118,7 @@ public class ParquetDataWriter {
                     settings.rowGroupSize().toBytes(), 0);
             writer.start();
             writer.end(metadata);
+            emptyFileLength = writer.getPos();
         }
     }
 
