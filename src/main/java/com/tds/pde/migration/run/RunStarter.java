@@ -239,9 +239,8 @@ public class RunStarter {
 
     /** Everything under the target prefix except the migration's own bookkeeping, such as the lock. */
     private static List<BlobStore.BlobInfo> outputBlobs(AzureLocation location, BlobStore blobStore) {
-        String prefix = location.isContainerRoot() ? "" : location.prefix() + "/";
-        String bookkeeping = prefix + BOOKKEEPING_FOLDER + "/";
-        return blobStore.list(prefix).stream().filter(blob -> !blob.name().startsWith(bookkeeping)).toList();
+        String bookkeeping = location.blobPrefix() + BOOKKEEPING_FOLDER + "/";
+        return blobStore.list(location.blobPrefix()).stream().filter(blob -> !blob.name().startsWith(bookkeeping)).toList();
     }
 
     private List<PartitionTasks> tasks(MigrationPlan plan, AzureLocation location) {

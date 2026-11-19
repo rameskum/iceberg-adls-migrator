@@ -17,6 +17,7 @@ import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Predicate;
+import java.util.stream.Stream;
 
 /**
  * Blob store fake with the same rules as Azure block blobs: staged bytes are invisible until a commit, a commit
@@ -29,6 +30,7 @@ public final class InMemoryBlobStore implements BlobStore {
 
     private final Map<String, Blob> committed = new ConcurrentHashMap<>();
     private final List<String> aborted = new CopyOnWriteArrayList<>();
+    private final List<String> reads = new CopyOnWriteArrayList<>();
     private final Set<String> locks = ConcurrentHashMap.newKeySet();
     private final Set<String> lostLocks = ConcurrentHashMap.newKeySet();
     private final Map<String, Integer> heldChecksBeforeLoss = new ConcurrentHashMap<>();
@@ -90,6 +92,15 @@ public final class InMemoryBlobStore implements BlobStore {
         return List.copyOf(aborted);
     }
 
+    /** Every read request made to the store, such as {@code list sales/orders/}, in order. */
+    public List<String> reads() {
+        return List.copyOf(reads);
+    }
+
+    public void clearReads() {
+        reads.clear();
+    }
+
     @Override
     public StagedUpload startUpload(String blobName) {
         uploadsStarted.merge(blobName, 1, Integer::sum);
@@ -97,18 +108,25 @@ public final class InMemoryBlobStore implements BlobStore {
         return new Upload(blobName);
     }
 
-    @Override
-    public Optional<Map<String, String>> metadata(String blobName) {
-        return blob(blobName).map(Blob::metadata);
-    }
 
     @Override
     public List<BlobInfo> list(String prefix) {
+        reads.add("list " + prefix);
         return committed.entrySet().stream()
                 .filter(entry -> entry.getKey().startsWith(prefix))
                 .map(entry -> new BlobInfo(entry.getKey(), entry.getValue().content().length))
                 .sorted(java.util.Comparator.comparing(BlobInfo::name))
                 .toList();
+    }
+
+    @Override
+    public Stream<BlobMetadata> listWithMetadata(String prefix) {
+        reads.add("list with metadata " + prefix);
+        return committed.entrySet().stream()
+                .filter(entry -> entry.getKey().startsWith(prefix))
+                .map(entry -> new BlobMetadata(entry.getKey(), entry.getValue().metadata()))
+                .sorted(java.util.Comparator.comparing(BlobMetadata::name))
+                .toList().stream();
     }
 
     @Override

@@ -54,6 +54,11 @@ public record AzureLocation(String account, String container, String prefix, Str
         return prefix.isEmpty();
     }
 
+    /** The start of the name of every blob under this location: the prefix and a slash, or empty at the root. */
+    public String blobPrefix() {
+        return prefix.isEmpty() ? "" : prefix + "/";
+    }
+
     /** Joins a name under this location's prefix. */
     public String blobName(String relativeName) {
         return prefix.isEmpty() ? relativeName : prefix + "/" + relativeName;

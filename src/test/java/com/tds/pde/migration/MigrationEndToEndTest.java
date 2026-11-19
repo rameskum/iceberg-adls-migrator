@@ -242,6 +242,24 @@ class MigrationEndToEndTest {
     }
 
     @Test
+    void findsThePublishedFilesOfAResumedRunWithOneListingOfTheTarget() {
+        appendFiles();
+        IcebergTestTables.append(table, rows("APAC", 10, 1));
+        blobStore.failWritesTo(name -> name.contains("region=EU"));
+        assertThatThrownBy(this::migrate).isInstanceOf(MigrationFailedException.class);
+        assertThat(dataBlobs()).as("both APAC files published").hasSize(2);
+        blobStore.stopFailing();
+        blobStore.clearReads();
+
+        migrate();
+
+        assertThat(blobStore.reads()).containsExactly("list with metadata " + PREFIX + "/");
+        assertThat(onlyRun().status()).isEqualTo(RunRecord.Status.SUCCEEDED);
+        assertThat(dataBlobs()).hasSize(4).filteredOn(blob -> blob.contains("region=APAC")).hasSize(2)
+                .allSatisfy(blob -> assertThat(blobStore.uploadsStarted(blob)).as("not copied again").isOne());
+    }
+
+    @Test
     void resumesARunThatDiedBeforeAllItsFileRowsWereRecorded(CapturedOutput output) {
         appendFiles();
         stateStore.crashAfterFileRows(1);

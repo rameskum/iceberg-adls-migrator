@@ -241,6 +241,8 @@ recorded file that changed, or that the snapshot no longer yields, stops it.
 **What counts as done.** Every target blob is committed together with its metadata (`migration_run_id`,
 `source_file`, `source_snapshot_id`, `physical_records`, `records_written`). On resume, a blob carrying this run's
 markers is a finished file even if recording it in the state store failed; it is recorded and not written again.
+The resume finds these blobs with one listing of the target prefix, metadata included (5,000 blobs per page),
+matched against the planned files in memory, so it makes no request per file.
 
 **One run per target.** A run holds a 60-second blob lease on `<prefix>/_migration/lock`, renewed every
 20 seconds. A second run fails at once. If a run dies, its lease lapses within a minute. The lease is checked before

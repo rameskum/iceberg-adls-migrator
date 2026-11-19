@@ -2,7 +2,7 @@ package com.tds.pde.migration.target;
 
 import java.util.List;
 import java.util.Map;
-import java.util.Optional;
+import java.util.stream.Stream;
 
 /**
  * Target object storage, addressed by blob name within the target container.
@@ -15,14 +15,15 @@ public interface BlobStore {
     StagedUpload startUpload(String blobName);
 
     /**
-     * @return the metadata of a committed blob, or empty when no blob exists under that name
-     */
-    Optional<Map<String, String>> metadata(String blobName);
-
-    /**
      * Committed blobs whose names start with the prefix, in name order.
      */
     List<BlobInfo> list(String prefix);
+
+    /**
+     * Committed blobs whose names start with the prefix, with their metadata, in name order: one listing, read a
+     * page at a time as the stream is consumed, instead of a request per blob.
+     */
+    Stream<BlobMetadata> listWithMetadata(String prefix);
 
     /**
      * Deletes a committed blob; does nothing when it does not exist.
@@ -37,5 +38,8 @@ public interface BlobStore {
     RunLock acquireLock(String blobName);
 
     record BlobInfo(String name, long size) {
+    }
+
+    record BlobMetadata(String name, Map<String, String> metadata) {
     }
 }
