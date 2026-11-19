@@ -176,16 +176,34 @@ class MigrationProgressTrackerTest {
         MigrationProgressTracker progress = tracker();
         progress.start(1_000, 400 * MIB, 4, 2);
         progress.fileStarted("file-1", 100 * MIB, 250);
+        progress.onFileProgress("file-1", 125, 125, 10 * MIB);
         progress.fileFailed("file-1");
         progress.fileStarted("file-2", 100 * MIB, 250);
         progress.fileCompleted("file-2", 250, 250, 100 * MIB);
-        advance(Duration.ofSeconds(100));
+        advance(Duration.ofSeconds(150));
 
         // 200 MiB are left, of the two files not yet started; the failed file is not retried by this run.
+        // Its half read is work done, so it counts in the rate (150 MiB in 150s), but not as bytes read.
         assertThat(heartbeat(progress)).isEqualTo("Progress: files=1/4 (25%) remaining=2 failed=1 inFlight=0 "
                 + "records=250/1000 (25%) written=250 deleted=0 "
                 + "bytesRead=100MiB/400MiB (25%) bytesWritten=100MiB rate=1MiB/s (5m) "
-                + "elapsed=0:01:40 eta=0:03:20");
+                + "elapsed=0:02:30 eta=0:03:20");
+    }
+
+    @Test
+    void heartbeatAgreesWithTheSummaryOnBytesReadWhenAFileFailsHalfway() {
+        MigrationProgressTracker progress = tracker();
+        progress.start(200, 200 * MIB, 2, 1);
+        progress.fileStarted("file-a", 100 * MIB, 100);
+        progress.onFileProgress("file-a", 50, 50, 5 * MIB);
+        progress.fileFailed("file-a");
+        progress.fileStarted("file-b", 100 * MIB, 100);
+        progress.fileCompleted("file-b", 100, 100, 100 * MIB);
+        advance(Duration.ofSeconds(10));
+
+        assertThat(heartbeat(progress)).contains("records=100/200 (50%)", "bytesRead=100MiB/200MiB (50%)")
+                .endsWith("eta=0:00:00");
+        assertThat(progress.summary()).contains("Bytes: read=100MiB/200MiB");
     }
 
     @Test

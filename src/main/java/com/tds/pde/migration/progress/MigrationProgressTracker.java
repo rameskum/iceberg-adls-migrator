@@ -178,7 +178,8 @@ public final class MigrationProgressTracker implements AutoCloseable {
     /** Logs one {@code Progress:} line; called by the timer. */
     synchronized void heartbeat() {
         long now = nanoClock.getAsLong();
-        long processedBytes = processedSourceBytes();
+        long inFlightBytesRead = inFlightSourceBytesRead();
+        long processedBytes = committedSourceBytes + failedSourceBytesRead + inFlightBytesRead;
         samples.add(new Sample(now, processedBytes));
         long windowStart = now - RATE_WINDOW.toNanos();
         while (samples.size() > 2 && samples.peekFirst().at < windowStart) {
@@ -189,9 +190,9 @@ public final class MigrationProgressTracker implements AutoCloseable {
 
         long readRecords = committedRecords + inFlightRecords();
         long writtenRecords = recordsWritten + inFlightWritten();
-        long readBytes = resumedSourceBytes + processedBytes;
+        long readBytes = resumedSourceBytes + committedSourceBytes + inFlightBytesRead;
         // Failed files are not copied again by this run, so they are not left to copy.
-        long remainingBytes = Math.max(0, totalBytes - readBytes - (failedSourceBytes - failedSourceBytesRead));
+        long remainingBytes = Math.max(0, totalBytes - readBytes - failedSourceBytes);
         log.info("Progress: files={}/{} ({}%) remaining={} failed={} inFlight={} "
                         + "records={}/{} ({}%) written={} deleted={} "
                         + "bytesRead={}/{} ({}%) bytesWritten={} rate={}/s (5m) elapsed={} eta={}",
@@ -224,13 +225,9 @@ public final class MigrationProgressTracker implements AutoCloseable {
         }
     }
 
-    /** Source bytes this run has read: its published files, and the share read of the other files. */
-    private long processedSourceBytes() {
-        long bytes = committedSourceBytes + failedSourceBytesRead;
-        for (InFlightFile file : inFlight.values()) {
-            bytes += file.sourceBytesRead();
-        }
-        return bytes;
+    /** Source bytes read so far of the files in flight, by the share of their rows read. */
+    private long inFlightSourceBytesRead() {
+        return inFlight.values().stream().mapToLong(InFlightFile::sourceBytesRead).sum();
     }
 
     private long inFlightRecords() {
