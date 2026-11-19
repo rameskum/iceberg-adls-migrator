@@ -80,7 +80,7 @@ public class MigrationOrchestrator {
             progress.start(run.plan().totalRecords(), run.plan().totalBytes(), run.plan().totalFiles(),
                     run.plan().totalPartitions());
             try {
-                runStarter.prepare(run, location, blobStore);
+                runStarter.prepare(run, claim, location, blobStore);
                 execute(run, blobStore, claim, progress);
             } catch (ClaimLostException e) {
                 // Another run owns the migration now; its state is left to that run.

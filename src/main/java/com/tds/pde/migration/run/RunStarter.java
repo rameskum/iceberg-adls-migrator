@@ -98,18 +98,23 @@ public class RunStarter {
 
     /**
      * Gets the target ready for the claimed run: with clean, deletes every file under it; then replaces the
-     * previous run's file rows, whose files are gone, with this run's, all PENDING.
+     * previous run's file rows, whose files are gone, with this run's, all PENDING. Stops as soon as the run no
+     * longer holds its claim, so a run that lost the migration never deletes what the run that took it over wrote.
+     *
+     * @throws ClaimLostException when the run lost its claim, or could not renew its heartbeat for too long
      */
-    public void prepare(StartedRun run, AzureLocation location, BlobStore blobStore) {
+    public void prepare(StartedRun run, RunClaim claim, AzureLocation location, BlobStore blobStore) {
         if (properties.target().clean()) {
-            clean(location, blobStore);
+            clean(claim, location, blobStore);
         }
+        claim.ensureHeld();
         if (run.previous() != null) {
             long deleted = state.deleteFiles(run.previous().runId());
             log.info("File rows of the previous run deleted: runId={} rows={}", run.previous().runId(),
                     deleted < 0 ? "unknown" : deleted);
         }
         List<FileRecord> files = pendingFiles(run.runId(), run.partitions());
+        claim.ensureHeld();
         state.insertFiles(files);
         log.info("Run started: runId={} snapshotId={} files={}", run.runId(), run.plan().table().snapshotId(),
                 files.size());
@@ -177,12 +182,15 @@ public class RunStarter {
                 + "); only one run may write a target. Nothing was written.");
     }
 
-    private void clean(AzureLocation location, BlobStore blobStore) {
+    private void clean(RunClaim claim, AzureLocation location, BlobStore blobStore) {
         List<BlobStore.BlobInfo> blobs = blobStore.list(location.blobPrefix());
         long bytes = blobs.stream().mapToLong(BlobStore.BlobInfo::size).sum();
         log.warn("Cleaning the target before starting again: target={} blobs={} bytes={}", location, blobs.size(),
                 bytes);
-        blobs.forEach(blob -> blobStore.delete(blob.name()));
+        for (BlobStore.BlobInfo blob : blobs) {
+            claim.ensureHeld();
+            blobStore.delete(blob.name());
+        }
         log.info("Target cleaned: target={} deletedBlobs={}", location, blobs.size());
     }
 

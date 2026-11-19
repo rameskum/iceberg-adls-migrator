@@ -8,10 +8,13 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import com.tds.pde.migration.MigrationFailedException;
 import com.tds.pde.migration.dataset.DatasetDescriptor;
 import com.tds.pde.migration.dataset.DatasetFormat;
+import com.tds.pde.migration.progress.ProgressSnapshot;
 import com.tds.pde.migration.schema.TargetSchemaValidator;
 import com.tds.pde.migration.source.IcebergMetadataReader;
 import com.tds.pde.migration.state.ControlRecord;
 import com.tds.pde.migration.state.FileRecord;
+import com.tds.pde.migration.target.BlobStore;
+import com.tds.pde.migration.target.StagedUpload;
 import com.tds.pde.migration.target.TargetPathResolver;
 import com.tds.pde.migration.target.azure.AzureLocation;
 import com.tds.pde.migration.testing.IcebergTestTables;
@@ -89,7 +92,7 @@ class RunStarterTest {
         assertThat(control.targetLocation()).isEqualTo(target().location());
         assertThat(state.findFiles(started.runId())).as("recorded by prepare").isEmpty();
 
-        starter(Map.of()).prepare(started, LOCATION, blobStore);
+        starter(Map.of()).prepare(started, claim(started), LOCATION, blobStore);
 
         assertThat(state.findFiles(started.runId())).hasSize(3)
                 .allSatisfy(file -> {
@@ -179,7 +182,7 @@ class RunStarterTest {
         publish("sales/orders-archive/keep.parquet");
 
         StartedRun fresh = start(Map.of("migration.target.clean", "true"));
-        starter(Map.of("migration.target.clean", "true")).prepare(fresh, LOCATION, blobStore);
+        starter(Map.of("migration.target.clean", "true")).prepare(fresh, claim(fresh), LOCATION, blobStore);
 
         assertThat(fresh.runId()).isNotEqualTo(EARLIER_RUN);
         assertThat(fresh.previous()).isEqualTo(died);
@@ -196,10 +199,54 @@ class RunStarterTest {
         publish(LOCATION.blobName("old.parquet"));
 
         StartedRun fresh = start(Map.of("migration.target.clean", "true"));
-        starter(Map.of("migration.target.clean", "true")).prepare(fresh, LOCATION, blobStore);
+        starter(Map.of("migration.target.clean", "true")).prepare(fresh, claim(fresh), LOCATION, blobStore);
 
         assertThat(onlyControl().runId()).isEqualTo(fresh.runId());
         assertThat(blobStore.blobs()).isEmpty();
+    }
+
+    @Test
+    void stopsCleaningOnceAnotherRunTookTheMigrationOver() throws IOException {
+        state.putControl(control(EARLIER_RUN, ControlRecord.Status.FAILED, Instant.now(), "boom"));
+        List<String> names = List.of(LOCATION.blobName("a.parquet"), LOCATION.blobName("b.parquet"),
+                LOCATION.blobName("c.parquet"));
+        for (String name : names) {
+            publish(name);
+        }
+        StartedRun fresh = start(Map.of("migration.target.clean", "true"));
+        RunClaim claim = claim(fresh);
+        ControlRecord takenOver = control(InMemoryState.Store.OTHER_RUN, ControlRecord.Status.RUNNING, Instant.now(),
+                null);
+        List<String> deleted = new ArrayList<>();
+        BlobStore takenOverAfterFirstDelete = new BlobStore() {
+            @Override
+            public StagedUpload startUpload(String blobName) {
+                return blobStore.startUpload(blobName);
+            }
+
+            @Override
+            public List<BlobInfo> list(String prefix) {
+                return blobStore.list(prefix);
+            }
+
+            @Override
+            public void delete(String blobName) {
+                blobStore.delete(blobName);
+                deleted.add(blobName);
+                state.putControl(takenOver);
+                claim.renew(new ProgressSnapshot(6, 0, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 2, 0));
+            }
+        };
+
+        assertThatThrownBy(() -> starter(Map.of("migration.target.clean", "true"))
+                .prepare(fresh, claim, LOCATION, takenOverAfterFirstDelete))
+                .isInstanceOf(ClaimLostException.class)
+                .hasMessageContaining("lost its claim on the migration");
+
+        assertThat(deleted).containsExactly(names.getFirst());
+        assertThat(blobStore.blobs().keySet()).containsExactlyInAnyOrderElementsOf(names.subList(1, 3));
+        assertThat(state.findFiles(fresh.runId())).as("file rows of the run that lost the migration").isEmpty();
+        assertThat(onlyControl()).isEqualTo(takenOver);
     }
 
     @Test
@@ -209,7 +256,7 @@ class RunStarterTest {
                 FileRecord.Status.COMPLETED, 1L, null)));
 
         StartedRun next = start(Map.of());
-        starter(Map.of()).prepare(next, LOCATION, blobStore);
+        starter(Map.of()).prepare(next, claim(next), LOCATION, blobStore);
 
         assertThat(onlyControl().runId()).isEqualTo(next.runId());
         assertThat(state.findFiles(EARLIER_RUN)).isEmpty();
@@ -316,6 +363,10 @@ class RunStarterTest {
     private RunStarter starter(Map<String, String> overrides) {
         return new RunStarter(TestProperties.bind(overrides), state, new IcebergMetadataReader(new Configuration()),
                 new TargetSchemaValidator(), new TargetPathResolver());
+    }
+
+    private RunClaim claim(StartedRun run) {
+        return new RunClaim(state, run.control(), Duration.ofMinutes(5));
     }
 
     private ControlRecord onlyControl() {
