@@ -62,9 +62,29 @@ public class MigrationStateRepository {
     public void createTablesIfMissing() {
         for (StateTable table : List.of(controlTable, runTable, fileTable)) {
             retrying("create state table " + table.name(), () -> sql.update(table.createStatement(), Map.of()));
+            if (!table.clusterBy().isEmpty()) {
+                cluster(table);
+            }
         }
         log.info("State tables ready: controlTable={} runTable={} fileTable={}", controlTable.name(),
                 runTable.name(), fileTable.name());
+    }
+
+    /**
+     * Brings a table created before its clustering was defined to that clustering. A table already clustered on
+     * exactly those columns is left alone: altering it would be a Delta metadata commit, which conflicts with
+     * parallel jobs' merges.
+     */
+    private void cluster(StateTable table) {
+        Object current = retrying("read clustering of state table " + table.name(),
+                () -> sql.query("DESCRIBE DETAIL " + table.name(), Map.of())).getFirst().get("clusteringColumns");
+        if (table.clusterBy().equals(current)) {
+            return;
+        }
+        retrying("cluster state table " + table.name(), () -> sql.update("ALTER TABLE " + table.name()
+                + " CLUSTER BY (" + String.join(", ", table.clusterBy()) + ")", Map.of()));
+        log.info("State table clustered: table={} clusterBy={} previousClusterBy={}", table.name(),
+                table.clusterBy(), current);
     }
 
     // ---- control table ----------------------------------------------------------------------------------------

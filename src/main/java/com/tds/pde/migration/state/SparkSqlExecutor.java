@@ -22,7 +22,8 @@ import org.springframework.util.LinkedCaseInsensitiveMap;
  * {@code SparkSession.sql(String, java.util.Map)}, {@code SparkSession.createDataFrame(java.util.List, StructType)},
  * {@code Dataset.collectAsList()}, {@code Dataset.createOrReplaceTempView(String)}, {@code Row.schema()},
  * {@code Row.get(int)}, {@code RowFactory.create(Object...)}, {@code StructType.fromDDL(String)} and
- * {@code StructType.fieldNames()}.
+ * {@code StructType.fieldNames()}; an array value, a Scala {@code Seq}, is read with {@code Seq.iterator()},
+ * {@code Iterator.hasNext()} and {@code Iterator.next()} into a {@link List}.
  */
 @Slf4j
 @Component
@@ -32,6 +33,8 @@ public class SparkSqlExecutor implements SqlExecutor {
     private static final String ROW_CLASS = "org.apache.spark.sql.Row";
     private static final String ROW_FACTORY_CLASS = "org.apache.spark.sql.RowFactory";
     private static final String STRUCT_TYPE_CLASS = "org.apache.spark.sql.types.StructType";
+    /** What {@code Row.get} returns for an array column. */
+    private static final String SEQ_CLASS = "scala.collection.Seq";
     /** Column Delta reports for UPDATE, DELETE, MERGE and INSERT. */
     private static final String AFFECTED_ROWS = "num_affected_rows";
 
@@ -69,7 +72,7 @@ public class SparkSqlExecutor implements SqlExecutor {
                     String[] columns = (String[]) spark.fieldNames.invoke(spark.schema.invoke(row));
                     Map<String, Object> values = new LinkedCaseInsensitiveMap<>(columns.length);
                     for (int i = 0; i < columns.length; i++) {
-                        values.put(columns[i], spark.get.invoke(row, i));
+                        values.put(columns[i], spark.javaValue(spark.get.invoke(row, i)));
                     }
                     result.add(values);
                 }
@@ -152,7 +155,20 @@ public class SparkSqlExecutor implements SqlExecutor {
     /** The resolved Spark session and the methods called on it, its datasets and rows. */
     private record Bridge(ClassLoader loader, Object session, Method sql, Method collectAsList, Method schema,
                           Method get, Method fieldNames, Method createRow, Method fromDdl, Method createDataFrame,
-                          Method createOrReplaceTempView) {
+                          Method createOrReplaceTempView, Class<?> seq, Method iterator, Method hasNext,
+                          Method next) {
+
+        Object javaValue(Object value) throws ReflectiveOperationException {
+            if (!seq.isInstance(value)) {
+                return value;
+            }
+            List<Object> elements = new ArrayList<>();
+            Object elementIterator = iterator.invoke(value);
+            while ((boolean) hasNext.invoke(elementIterator)) {
+                elements.add(javaValue(next.invoke(elementIterator)));
+            }
+            return elements;
+        }
 
         static Bridge resolve(ClassLoader loader) {
             try {
@@ -163,13 +179,17 @@ public class SparkSqlExecutor implements SqlExecutor {
                 Class<?> rowClass = Class.forName(ROW_CLASS, true, loader);
                 Class<?> structType = Class.forName(STRUCT_TYPE_CLASS, true, loader);
                 Method createDataFrame = sessionClass.getMethod("createDataFrame", List.class, structType);
+                Class<?> seq = Class.forName(SEQ_CLASS, true, loader);
+                Method iterator = seq.getMethod("iterator");
                 log.info("Spark session found for the state tables: sparkVersion={}",
                         sessionClass.getMethod("version").invoke(session));
                 return new Bridge(loader, session, sql, collectAsList, rowClass.getMethod("schema"),
                         rowClass.getMethod("get", int.class), structType.getMethod("fieldNames"),
                         Class.forName(ROW_FACTORY_CLASS, true, loader).getMethod("create", Object[].class),
                         structType.getMethod("fromDDL", String.class), createDataFrame,
-                        createDataFrame.getReturnType().getMethod("createOrReplaceTempView", String.class));
+                        createDataFrame.getReturnType().getMethod("createOrReplaceTempView", String.class), seq,
+                        iterator, iterator.getReturnType().getMethod("hasNext"),
+                        iterator.getReturnType().getMethod("next"));
             // Not SqlExecutionException: retrying cannot make Spark appear.
             } catch (InvocationTargetException e) {
                 throw new IllegalStateException("No active Spark session for the state tables: "

@@ -47,6 +47,17 @@ class SparkSqlExecutorTest {
     }
 
     @Test
+    void returnsArrayColumnsAsJavaLists() {
+        SparkSession.nextResult = List.of(new Row(new String[] {"clusteringColumns", "partitionColumns"},
+                scala.collection.Seq.of(List.of("run_id", "source_path")), scala.collection.Seq.of(List.of())));
+
+        Map<String, Object> detail = executor.query("DESCRIBE DETAIL migration_file", Map.of()).getFirst();
+
+        assertThat(detail.get("clusteringColumns")).isEqualTo(List.of("run_id", "source_path"));
+        assertThat(detail.get("partitionColumns")).isEqualTo(List.of());
+    }
+
+    @Test
     void reportsTheRowsDeltaSaysAStatementAffected() {
         SparkSession.nextResult = List.of(new Row(new String[] {"num_affected_rows"}, 1L));
 

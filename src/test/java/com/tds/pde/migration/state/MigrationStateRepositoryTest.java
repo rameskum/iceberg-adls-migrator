@@ -6,6 +6,7 @@ import com.tds.pde.migration.testing.TestProperties;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.function.Function;
@@ -19,16 +20,49 @@ class MigrationStateRepositoryTest {
             new MigrationStateRepository(sql, TestProperties.defaults(), Duration.ZERO);
 
     @Test
-    void clustersTheFileTableByRunAndTheRunTableByTarget() {
+    void createsTheFileTableClusteredByRunAndTheRunTableByTarget() {
+        sql.details.put("migration_run", List.of("target_location"));
+        sql.details.put("migration_file", List.of("run_id"));
+
         repository.createTablesIfMissing();
 
-        assertThat(sql.statements).hasSize(3);
+        assertThat(sql.statements).hasSize(5);
         assertThat(sql.statements.get(0)).startsWith("CREATE TABLE IF NOT EXISTS migration_control ")
                 .doesNotContain("CLUSTER BY");
         assertThat(sql.statements.get(1)).startsWith("CREATE TABLE IF NOT EXISTS migration_run ")
                 .contains(" USING DELTA CLUSTER BY (target_location) COMMENT ");
-        assertThat(sql.statements.get(2)).startsWith("CREATE TABLE IF NOT EXISTS migration_file ")
+        assertThat(sql.statements.get(2)).isEqualTo("DESCRIBE DETAIL migration_run");
+        assertThat(sql.statements.get(3)).startsWith("CREATE TABLE IF NOT EXISTS migration_file ")
                 .contains(" USING DELTA CLUSTER BY (run_id) COMMENT ");
+        assertThat(sql.statements.get(4)).as("already clustered: no metadata commit")
+                .isEqualTo("DESCRIBE DETAIL migration_file");
+    }
+
+    @Test
+    void clustersExistingUnclusteredTables() {
+        sql.details.put("migration_run", List.of());
+        sql.details.put("migration_file", List.of());
+
+        repository.createTablesIfMissing();
+
+        assertThat(sql.statements).filteredOn(statement -> !statement.startsWith("CREATE TABLE")).containsExactly(
+                "DESCRIBE DETAIL migration_run",
+                "ALTER TABLE migration_run CLUSTER BY (target_location)",
+                "DESCRIBE DETAIL migration_file",
+                "ALTER TABLE migration_file CLUSTER BY (run_id)");
+    }
+
+    @Test
+    void reclustersExistingTablesClusteredOnOtherColumns() {
+        sql.details.put("migration_run", List.of("target_location"));
+        sql.details.put("migration_file", List.of("run_id", "source_path"));
+
+        repository.createTablesIfMissing();
+
+        assertThat(sql.statements).filteredOn(statement -> !statement.startsWith("CREATE TABLE")).containsExactly(
+                "DESCRIBE DETAIL migration_run",
+                "DESCRIBE DETAIL migration_file",
+                "ALTER TABLE migration_file CLUSTER BY (run_id)");
     }
 
     @Test
@@ -61,6 +95,8 @@ class MigrationStateRepositoryTest {
         final List<String> schemas = new ArrayList<>();
         final List<List<Object[]>> rows = new ArrayList<>();
         List<Map<String, Object>> queryResult = List.of();
+        /** clusteringColumns that DESCRIBE DETAIL reports, by table. */
+        final Map<String, List<String>> details = new HashMap<>();
 
         @Override
         public long update(String statement, Map<String, ?> params) {
@@ -73,6 +109,10 @@ class MigrationStateRepositoryTest {
         public List<Map<String, Object>> query(String statement, Map<String, ?> params) {
             statements.add(statement);
             parameters.add(params);
+            if (statement.startsWith("DESCRIBE DETAIL ")) {
+                return List.of(Map.of("clusteringColumns",
+                        details.get(statement.substring("DESCRIBE DETAIL ".length()))));
+            }
             return queryResult;
         }
 

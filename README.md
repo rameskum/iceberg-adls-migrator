@@ -185,9 +185,12 @@ their reads and merges select on: the file table `CLUSTER BY (run_id)`, the run 
 (target_location)`. A file outcome merge or a resume's read then touches only the files holding that run's rows,
 which keeps it fast and keeps parallel jobs from conflicting as the tables grow. Liquid clustering reorganises data
 when `OPTIMIZE` runs, which predictive optimization does for Unity Catalog managed tables; otherwise schedule
-`OPTIMIZE` on the two tables. `CREATE TABLE IF NOT EXISTS` leaves tables created before clustering existed as they
-are: cluster those once with `ALTER TABLE <file-table> CLUSTER BY (run_id)` and
-`ALTER TABLE <run-table> CLUSTER BY (target_location)`.
+`OPTIMIZE` on the two tables. At startup the app reads each table's `clusteringColumns` from `DESCRIBE DETAIL` and,
+when they differ, as for tables created before clustering existed, runs `ALTER TABLE <table> CLUSTER BY (...)` and
+logs it. A table already clustered right is left alone, so it gets no metadata commit that could conflict with
+parallel jobs' merges. Altering needs ownership of the table; if the job's identity does not own it, startup fails
+until someone who does runs `ALTER TABLE <file-table> CLUSTER BY (run_id)` and
+`ALTER TABLE <run-table> CLUSTER BY (target_location)` once by hand.
 
 **Retention.** A clean start deletes the file rows of every superseded run of its target: their output is gone
 and they can never be resumed. Their run rows stay, as the target's history. File rows of other runs are kept.
