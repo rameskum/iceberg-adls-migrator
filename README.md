@@ -290,7 +290,7 @@ file reports progress, so a stalled file shows as numbers that stop moving, with
 | `bytesWritten` | Size of the target files written by this run. Row groups are buffered before they are written, so a file in flight shows what was flushed so far; files an earlier run published are not counted |
 | `rate` | Source bytes read per second over the last 5 minutes of this run (since the start, in the first 5 minutes) |
 | `elapsed` | Time since this run started |
-| `eta` | Source bytes still to copy in this run, divided by the rate; `unknown` while the rate is 0. Files an earlier run published and files that failed are not left to copy, and not in the rate |
+| `eta` | Source bytes still to copy in this run, divided by the rate; `unknown` while the rate is 0. Files an earlier run published and files that failed are not left to copy; files an earlier run published are not in the rate, while the rows a failed file read before failing are |
 
 Each completed file also logs `Source file completed` with its source and target sizes and read speed.
 
