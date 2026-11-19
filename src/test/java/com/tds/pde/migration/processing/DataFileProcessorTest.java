@@ -388,24 +388,6 @@ class DataFileProcessorTest {
         }
     }
 
-    @Test
-    void recognisesAFilePublishedByTheSameRun() {
-        Table table = IcebergTestTables.create(tempDir.resolve("orders"), ORDERS, PartitionSpec.unpartitioned());
-        IcebergTestTables.append(table, orders("EU", 1, 2));
-        Run run = plan(table, null);
-        List<FileTask> tasks = List.of(run.task(0));
-        assertThat(PublishedFile.find(blobStore, "", run.context(), tasks)).isEmpty();
-
-        processor.process(run.context(), run.task(0), FileProgressListener.NONE);
-
-        assertThat(PublishedFile.find(blobStore, "", run.context(), tasks))
-                .containsExactly(Map.entry(run.task(0).source().location(), new PublishedFile.Counts(2, 2)));
-        RunContext otherRun = new RunContext("run-2", run.context().source(), run.context().outputSchema());
-        assertThat(PublishedFile.find(blobStore, "", otherRun, tasks)).isEmpty();
-        assertThat(blobStore.reads()).as("one listing per lookup, whatever the number of tasks")
-                .containsExactly("list with metadata ", "list with metadata ", "list with metadata ");
-    }
-
     private FileResult processOnlyFile(Table table) {
         Run run = plan(table, null);
         return processor.process(run.context(), run.task(0), FileProgressListener.NONE);

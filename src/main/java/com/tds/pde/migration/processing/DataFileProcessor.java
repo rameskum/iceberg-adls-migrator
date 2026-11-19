@@ -35,8 +35,8 @@ public class DataFileProcessor {
     }
 
     /**
-     * @param beforePublish runs immediately before each publish and throws to prevent it, e.g. when the run lock
-     *                      was lost while the file was being written
+     * @param beforePublish runs immediately before each publish and throws to prevent it, e.g. when the run lost
+     *                      its claim on the migration while the file was being written
      */
     public DataFileProcessor(IcebergDataReader reader, ParquetDataWriter writer, BlobStore blobStore,
                              Runnable beforePublish) {

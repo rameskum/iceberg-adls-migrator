@@ -18,7 +18,6 @@ public final class TestProperties {
         values.put("migration.target.dataset-id", "5b2f7d3c-8a1e-4f6b-b2d4-9c0e3a7f1d02");
         values.put("migration.datasets.stub-directory", "/tmp/datasets");
         values.put("migration.state.control-table", "migration_control");
-        values.put("migration.state.run-table", "migration_run");
         values.put("migration.state.file-table", "migration_file");
         values.putAll(overrides);
         return new Binder(new MapConfigurationPropertySource(values))

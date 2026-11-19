@@ -41,8 +41,8 @@ import org.junit.jupiter.api.io.TempDir;
 
 /**
  * Migrates two source files, each larger than the whole heap, at the same time, as parallel file copying does.
- * Runs in its own JVM with {@code -Xmx128m} (see the {@code bounded-memory} surefire execution), so holding a file
- * in memory would fail with OutOfMemoryError.
+ * Runs in its own JVM with {@code -Xmx128m} and the serial collector (see the {@code bounded-memory} surefire
+ * execution), so holding a file in memory would fail with OutOfMemoryError.
  */
 @Tag("memory")
 class BoundedMemoryTest {

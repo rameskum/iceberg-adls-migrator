@@ -2,8 +2,6 @@
 #   --spring.config.additional-location=/Volumes/<catalog>/<schema>/<volume>/iceberg-adls-migrator/application.yaml
 # Secrets never go in this file: they come from environment variables backed by {{secrets/<scope>/<key>}}.
 migration:
-  # Empty: start a new run, or auto-resume the latest unfinished run for the same source and target.
-  run-id:
   source:
     dataset-id: 0e9c1a5e-4c55-4a3b-9f3e-1c2a7d8b6e01
     # Optional: migrate this snapshot instead of the current one.
@@ -13,7 +11,8 @@ migration:
       "[fs.defaultFS]": hdfs://namenode:8020
   target:
     dataset-id: 5b2f7d3c-8a1e-4f6b-b2d4-9c0e3a7f1d02
-    # true: delete everything under the target location and start a fresh run.
+    # true: delete everything under the target location and start again from the beginning under a new run id.
+    # Needed after a run that did not complete; refused while that run's heartbeat is fresh.
     clean: false
     # Each file in flight holds up to two blocks: one filling while the other is uploaded.
     block-size: 8MB
@@ -34,7 +33,8 @@ migration:
     # Files copied at the same time. Each holds about a source row group, a target row group and two upload blocks.
     parallel-files: 4
   progress:
-    # How often the "Progress:" heartbeat line is logged.
+    # How often the "Progress:" heartbeat line is logged, and the run's heartbeat and progress written to its
+    # control row.
     log-every: 30s
   failure:
     # FAIL_FAST or CONTINUE
@@ -42,9 +42,10 @@ migration:
   # Delta tables shared by every migration job, created at startup through the cluster's Spark session.
   state:
     control-table: main.migration.migration_control
-    run-table: main.migration.migration_run
     file-table: main.migration.migration_file
     write-retries: 5
     # File outcomes are written in batches: every 50 files, or with the first outcome after 30s.
     outcome-batch-size: 50
     outcome-flush-interval: 30s
+    # A RUNNING run whose heartbeat is older than this has died; clean is refused until then. At least 4 x log-every.
+    heartbeat-timeout: 5m

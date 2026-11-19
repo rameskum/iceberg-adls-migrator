@@ -9,8 +9,10 @@ account without hierarchical namespace). The target is plain Parquet: no Iceberg
   bounded however large the table is.
 - A file becomes visible at its target only once it is complete and verified, so a failed or interrupted
   write can never be mistaken for a finished file.
-- Every table migration, run and file is tracked in Delta tables written through the cluster's own Spark session,
-  and runs can be resumed.
+- Every table migration and file is tracked in Delta tables written through the cluster's own Spark session. One
+  control row per migration keeps two runs from writing the same target and shows the run's progress.
+- A run that does not complete is not resumed: the next run cleans the target and copies everything again, from
+  the beginning, under a new run id.
 
 It runs on Databricks (DBR 18, Java 21) through the team's isolated launcher, and reads HDFS with the plain
 Iceberg and Hadoop Java clients, not with Spark.
@@ -20,33 +22,38 @@ Iceberg and Hadoop Java clients, not with Spark.
 ```
 Databricks job ──app_args──▶ team launcher (isolated class loader) ──▶ MigrationApplication.main
   1. Look up the source and target datasets (dataset API; a JSON stub for now)
-  2. Take the target's run lock (a renewing blob lease)
-  3. Choose the run: resume a given run, auto-resume an unfinished one, clean and start over, or start new
-  4. Pin a snapshot and plan its data files from Iceberg metadata (one task per file, with its delete files)
-  5. For each partition, for each file:
+  2. Read the migration's control row: refuse after a run that did not complete unless clean is set,
+     and refuse while that run's heartbeat is fresh
+  3. Pin a snapshot and plan its data files from Iceberg metadata (one task per file, with its delete files)
+  4. Claim the control row for a new run id (a conditional write, read back); from now on renew its
+     heartbeat and write the progress with every Progress: line
+  5. With clean, delete the target's files; record the run's files as PENDING
+  6. For each partition, for each file:
        read live rows (deletes applied) ─▶ Iceberg Parquet writer ─▶ staged blocks (invisible)
        (staging overlaps with writing: one block is uploaded while the next one fills)
-       close the writer, verify row counts, commit the block list with metadata (atomic) ─▶ record COMPLETED
-  6. Record the run as SUCCEEDED, or FAILED and throw MigrationFailedException
+       close the writer, verify row counts, check the claim,
+       commit the block list with metadata (atomic) ─▶ record COMPLETED
+  7. Mark the control row COMPLETED, or FAILED and throw MigrationFailedException
 ```
 
 | Component | Responsibility |
 |---|---|
 | `MigrationApplication` | Entry point; closes the Spring context and rethrows failures; never calls `System.exit` |
-| `MigrationOrchestrator` | Run lifecycle: datasets, lock, run choice, partition loop, final status and summary |
-| `RunStarter` | New run, resume, auto-resume or clean; pins snapshot, schemas and file list in the state store |
+| `MigrationOrchestrator` | Run lifecycle: datasets, run start, heartbeat, file copying, final status and summary |
+| `RunStarter` | Decides whether a run may start, plans it, claims the control row; cleans the target and records the run's files |
+| `RunClaim` | The run's ownership of the control row: renews the heartbeat and progress, is checked before each target delete of a clean, each file and each publish, records how the run ended |
 | `IcebergMetadataReader` | Loads the table by path, pins the snapshot, plans files, groups them by partition, validates |
 | `TargetSchemaValidator` | Checks the target schema against the Iceberg schema; decides string conversions |
-| `FileRunner` | Copies up to `parallel-files` files at once: lock check, copy, count, record the outcome; failure policy |
+| `FileRunner` | Copies up to `parallel-files` files at once: claim check, copy, count, record the outcome; failure policy |
 | `FileOutcomeRecorder` | Writes file outcomes to the file table in batches |
 | `DataFileProcessor` | Copies one source file to one target file; independent of runs, progress and state |
 | `IcebergDataReader` | Streams the live rows of one data file, the way Iceberg's generic reader does |
 | `ParquetDataWriter` | Writes Parquet with Iceberg's writer (exact type mapping), including empty files |
-| `AzureBlobStore` | Staged block upload (one block staged in the background while the next fills) and atomic commit, metadata, listing, deletes, lease lock |
-| `MigrationStateRepository` | Control, run and file tables, with retries |
+| `AzureBlobStore` | Staged block upload (one block staged in the background while the next fills) and atomic commit, metadata, listing, deletes |
+| `MigrationStateRepository` | Control and file tables, with retries |
 | `StateTable` | Each state table's columns: the source of its DDL and of the schema of rows merged into it |
 | `SparkSqlExecutor` | Runs the state SQL through the cluster's Spark session; turns rows into a typed temporary view to merge from |
-| `MigrationProgressTracker` | Record, byte, file and partition progress, committed and in flight; logs the `Progress:` heartbeat on a timer |
+| `MigrationProgressTracker` | Record, byte, file and partition progress, committed and in flight; logs the `Progress:` heartbeat on a timer and hands its progress to the run's claim |
 
 ## Build
 
@@ -92,12 +99,11 @@ For example:
 --spring.config.additional-location=/Volumes/<catalog>/<schema>/<volume>/iceberg-adls-migrator/application.yaml
 --migration.source.dataset-id=0e9c1a5e-4c55-4a3b-9f3e-1c2a7d8b6e01
 --migration.target.dataset-id=5b2f7d3c-8a1e-4f6b-b2d4-9c0e3a7f1d02
---migration.run-id=20261117-103000-ab12cd
 ```
 
 Any configuration property can be set this way for one run, e.g. `--migration.failure.on-file-failure=CONTINUE`.
 Parameters are checked strictly before anything runs: dataset ids must be UUIDs, an unknown `--migration.*` name
-(such as a misspelled `--migration.run-ld`) fails startup, and so does any parameter not starting with
+(such as a misspelled `--migration.target.claen`) fails startup, and so does any parameter not starting with
 `--migration.`, `--spring.` or `--logging.`.
 
 **Secrets**, if any, come from environment variables set on the cluster with secret references
@@ -119,12 +125,11 @@ complete example. Invalid values stop the app before any data is touched.
 
 | Property | Default | Meaning |
 |---|---|---|
-| `migration.run-id` | empty | Resume this run. Empty: auto-resume an unfinished run, or start a new one |
 | `migration.source.dataset-id` | required | Source dataset (format `ICEBERG`, location = table path on HDFS) |
 | `migration.source.snapshot-id` | current | Migrate this snapshot instead of the current one |
 | `migration.source.hadoop."[key]"` | none | Extra Hadoop settings, e.g. `"[fs.defaultFS]": hdfs://nn:8020`; quote dotted keys |
 | `migration.target.dataset-id` | required | Target dataset (format `PARQUET`, location = `abfss://...`) |
-| `migration.target.clean` | `false` | Delete everything under the target and start a fresh run |
+| `migration.target.clean` | `false` | Delete everything under the target and start again from the beginning; needed after a run that did not complete, see [Runs](#runs) |
 | `migration.target.block-size` | `8MB` | Size of each staged block; each file in flight holds up to two (one filling, one being uploaded) |
 | `migration.datasets.stub-directory` | required | Folder of `<dataset-id>.json` descriptors |
 | `migration.azure.auth.mode` | `MANAGED_IDENTITY` | Or `CONNECTION_STRING` (local runs and tests only) |
@@ -133,15 +138,15 @@ complete example. Invalid values stop the app before any data is touched.
 | `migration.parquet.row-group-size` | `32MB` | Parquet row group size; the main writer memory per file in flight, see below |
 | `migration.parquet.page-size` | `1MB` | Parquet page size |
 | `migration.parquet.compression` | `ZSTD` | `ZSTD`, `SNAPPY`, `GZIP` or `UNCOMPRESSED` |
-| `migration.progress.log-every` | `30s` | How often the `Progress:` heartbeat is logged |
+| `migration.progress.log-every` | `30s` | How often the `Progress:` heartbeat is logged, and the run's heartbeat and progress written to its control row |
 | `migration.processing.parallel-files` | `4` | Files copied at the same time (1 to 64); see memory below |
 | `migration.failure.on-file-failure` | `FAIL_FAST` | Or `CONTINUE` with the remaining files |
 | `migration.state.control-table` | required | e.g. `main.migration.migration_control` |
-| `migration.state.run-table` | required | e.g. `main.migration.migration_run` |
 | `migration.state.file-table` | required | e.g. `main.migration.migration_file` |
 | `migration.state.write-retries` | `5` | Attempts per state table call before the run stops |
 | `migration.state.outcome-batch-size` | `50` | File outcomes written to the file table in one commit |
 | `migration.state.outcome-flush-interval` | `30s` | The first outcome after this long since the last write is written at once, with any waiting |
+| `migration.state.heartbeat-timeout` | `5m` | A RUNNING run whose heartbeat is older than this has died; until then `clean` is refused. At least 4 x `log-every` |
 
 **Memory and parallel files.** Each file being copied holds about one source row group (as written in the
 source table), one target row group (`migration.parquet.row-group-size`) and up to two upload blocks
@@ -177,108 +182,110 @@ is authoritative.
 
 ## State tables
 
-Three Delta tables, shared by every migration job and created at startup with `CREATE TABLE IF NOT EXISTS`. Each
-fact is stored once; the rest is a join away.
+Two Delta tables, shared by every migration job and created at startup with `CREATE TABLE IF NOT EXISTS`. A table
+that exists with other columns, such as one created by an earlier version, stops the app at startup with a message
+to drop it (or point the setting at a new table); the earlier version's run table is no longer used.
 
 | Table | One row per | Columns |
 |---|---|---|
-| control (`migration_control`) | table migration, keyed by `source_dataset_id` and `target_dataset_id` | `status` and `last_run_id` of the latest run; the source table at its pinned snapshot: `snapshot_id`, `total_files`, `total_records` |
-| run (`migration_run`) | run | `run_id`, `status` (`RUNNING`, `SUCCEEDED`, `FAILED`, `SUPERSEDED`), the migration's `source_dataset_id` and `target_dataset_id`, the resolved `source_location` and `target_location`, and what a resume must reproduce: `snapshot_id`, `source_schema_json`, `output_schema_json`; `started_at`, `finished_at`, `error` |
+| control (`migration_control`) | table migration, keyed by `target_dataset_id` | the latest run: `run_id`, `status` (`RUNNING`, `COMPLETED`, `FAILED`), `started_at`, `heartbeat_at`, `finished_at`, `error`; what it copies: `source_dataset_id`, `source_location`, `target_location`, `snapshot_id`; its progress: `completed_files`, `failed_files` and `total_files`, `records_read`, `records_written` and `total_records`, `bytes_written` |
 | file (`migration_file`) | source data file of a run | `run_id`, `source_path`, `target_path`, `physical_records`, `status` (`PENDING`, `COMPLETED`, `FAILED`), `records_written` (the other physical records were deleted), `error` |
 
-**Clustering.** The run and file tables grow with every migration, so they use liquid clustering on the column
-their reads and merges select on: the file table `CLUSTER BY (run_id)`, the run table `CLUSTER BY
-(target_location)`. A file outcome merge or a resume's read then touches only the files holding that run's rows,
-which keeps it fast and keeps parallel jobs from conflicting as the tables grow. Liquid clustering reorganises data
-when `OPTIMIZE` runs, which predictive optimization does for Unity Catalog managed tables; otherwise schedule
-`OPTIMIZE` on the two tables. At startup the app reads each table's `clusteringColumns` from `DESCRIBE DETAIL` and,
-when they differ, as for tables created before clustering existed, runs `ALTER TABLE <table> CLUSTER BY (...)` and
-logs it. A table already clustered right is left alone, so it gets no metadata commit that could conflict with
-parallel jobs' merges. Altering needs ownership of the table. When the alter fails, for example because the job's
-identity does not own the table, it is not retried: the app logs a warning with the statement to run and carries on
-with the table unclustered, until its owner runs `ALTER TABLE <file-table> CLUSTER BY (run_id)` and
-`ALTER TABLE <run-table> CLUSTER BY (target_location)` once by hand.
+Record counts are physical source rows (before deletes): `records_read` of the published files, of which
+`records_written` were live and the rest deleted, out of `total_records`. The counters are those of the latest
+`Progress:` line, so they trail the log by at most `migration.progress.log-every`; the end of the run writes the
+final ones.
 
-**Retention.** A clean start deletes the file rows of every superseded run of its target: their output is gone
-and they can never be resumed. Their run rows stay, as the target's history. File rows of other runs are kept.
+**Clustering.** The file table grows with every migration, so it uses liquid clustering on the column its reads
+and merges select on: `CLUSTER BY (run_id)`. A file outcome merge then touches only the files holding that run's
+rows, which keeps it fast and keeps parallel jobs from conflicting as the table grows. Liquid clustering reorganises
+data when `OPTIMIZE` runs, which predictive optimization does for Unity Catalog managed tables; otherwise schedule
+`OPTIMIZE` on the table. At startup the app reads its `clusteringColumns` from `DESCRIBE DETAIL` and, when they
+differ, as for a table created before clustering existed, runs `ALTER TABLE <table> CLUSTER BY (run_id)` and logs it.
+A table already clustered right is left alone, so it gets no metadata commit that could conflict with parallel jobs'
+merges. Altering needs ownership of the table. When the alter fails, for example because the job's identity does not
+own the table, it is not retried: the app logs a warning with the statement to run and carries on with the table
+unclustered, until its owner runs `ALTER TABLE <file-table> CLUSTER BY (run_id)` once by hand.
 
-A run belongs to the migration with its dataset pair, and the control row points at the latest run. The control row
-is written when a run starts and when it ends; progress while a run is going comes from its file rows, which are
-updated as each file completes:
+**Retention.** The file table holds the files of each migration's latest run: a new run deletes the file rows of
+the run it replaces, whose output it has just deleted, or found already gone.
 
-```sql
-SELECT c.source_dataset_id, c.target_dataset_id, c.status, c.last_run_id, c.snapshot_id,
-       count_if(f.status = 'COMPLETED') AS completed_files, count_if(f.status = 'FAILED') AS failed_files,
-       c.total_files, coalesce(sum(f.records_written), 0) AS records_written, c.total_records,
-       r.started_at, r.finished_at, r.error
-FROM main.migration.migration_control c
-JOIN main.migration.migration_run r ON r.run_id = c.last_run_id
-LEFT JOIN main.migration.migration_file f ON f.run_id = r.run_id
-GROUP BY ALL;
-```
-
-Every run of one migration, oldest first:
+Every migration, its latest run and how far it got:
 
 ```sql
-SELECT * FROM main.migration.migration_run
-WHERE source_dataset_id = :source AND target_dataset_id = :target
-ORDER BY started_at;
+SELECT target_dataset_id, source_dataset_id, run_id, status, started_at, heartbeat_at, finished_at,
+       completed_files, failed_files, total_files, records_read, records_written, total_records, bytes_written,
+       error
+FROM main.migration.migration_control;
 ```
 
-**Writes.** Every write is a `MERGE INTO`. The rows to write become a DataFrame typed by the table's `StateTable`
-definition, registered as a temporary view and merged on the table's key:
+The files of a run, for example the failed ones:
 
-| Write | Merge |
+```sql
+SELECT source_path, target_path, error FROM main.migration.migration_file
+WHERE run_id = :run_id AND status = 'FAILED';
+```
+
+**Writes.** File rows are written with `MERGE INTO`: the rows to write become a DataFrame typed by the table's
+`StateTable` definition, registered as a temporary view and merged on the table's key. The control row is changed
+with conditional `UPDATE`s whose values are bound as parameters:
+
+| Write | Statement |
 |---|---|
-| Control row | `WHEN MATCHED THEN UPDATE SET * WHEN NOT MATCHED THEN INSERT *` |
-| New run, its file rows | `WHEN NOT MATCHED THEN INSERT *`, so a retry after a commit that did land adds nothing |
-| Run status, file outcome, superseding runs | `WHEN MATCHED THEN UPDATE SET` the changed columns; a run or file outcome must match exactly one row |
-| File rows of superseded runs, on a clean start | `WHEN MATCHED THEN DELETE`, merged on `run_id` |
+| First run of a migration claims its row | `MERGE ... WHEN NOT MATCHED THEN INSERT *` on `target_dataset_id` |
+| A later run claims the row | `UPDATE` every column `WHERE` the row still holds the `run_id`, `status` and `heartbeat_at` it was read with |
+| Heartbeat and progress; how the run ended | `UPDATE` those columns `WHERE run_id` is the run's own |
+| New run's file rows | `WHEN NOT MATCHED THEN INSERT *`, so a retry after a commit that did land adds nothing |
+| File outcomes | `WHEN MATCHED THEN UPDATE SET` the changed columns; each must match exactly one row |
+| File rows of the replaced run | `DELETE ... WHERE run_id` |
 
 The statements run through the cluster's `SparkSession`, reached by reflection because the launcher's isolated class
 loader hides the runtime's classes; each call switches the thread's context class loader to Spark's, because Spark and
 Hadoop load their own classes through it. Every statement is a Delta commit, so a file costs one write: its outcome.
 Parallel jobs migrating *different* tables share the tables safely: deletion vectors and row tracking give row-level
-concurrency, and the rare conflicting commit is retried with jittered backoff.
+concurrency, and the rare conflicting commit is retried with jittered backoff. A retried conditional `UPDATE` is
+evaluated again against the row as it now is.
 
-## Runs and resume
+## Runs
 
-What happens depends on `migration.run-id` and `migration.target.clean`:
+Every run starts from the beginning under a new run id; nothing is resumed. Whether a run may start depends on the
+latest run in the migration's control row and on `migration.target.clean`:
 
-| `run-id` | `clean` | Behaviour |
+| Latest run | `clean=false` | `clean=true` |
 |---|---|---|
-| set | `false` | Resume that run. It must copy the same source to the same target and not be superseded |
-| empty | `false` | Resume the latest RUNNING or FAILED run for this source and target; otherwise start a new run, which requires an empty target |
-| empty | `true` | Delete everything under the target prefix (refused at a container root), mark earlier runs `SUPERSEDED` and delete their file rows, start a new run |
-| set | `true` | Refused |
+| none, or `COMPLETED` | Start, if the target is empty; otherwise refused | Delete the target's files, start |
+| `FAILED`, or `RUNNING` with a heartbeat older than `heartbeat-timeout` (it died) | Refused | Delete the target's files, start |
+| `RUNNING` with a fresh heartbeat | Refused | Refused: it may still be writing |
 
-So a Databricks task retry or *Repair run*, which re-sends the same parameters, simply continues where the run
-stopped.
+A refusal writes nothing and names the run and what to set. Cleaning deletes everything under the target prefix,
+and is refused at a container root. A Databricks task retry or *Repair run* re-sends the same parameters, so after a
+failure it is refused until it is rerun with `--migration.target.clean=true`.
 
-**A run pins** its snapshot, read schema, output schema and file list. A resume plans the pinned snapshot again
-and refuses to continue if any of these no longer match (for example, the target schema was edited, or
-snapshot expiry removed a file). A new run records its run row first, then its file rows in batches; if the job
-dies in between, the resume records the planned files that have no row yet as `PENDING` and carries on. Only a
-recorded file that changed, or that the snapshot no longer yields, stops it.
+**One run per migration.** A run claims the control row before it writes anything: the first run of a migration
+inserts the row, a later run updates it only while it is still exactly as read. Of two runs racing, Delta commits one
+write and the other, retried after the conflict, no longer applies. The run then reads the row back and only goes on
+when it is the migration's single row and names its run id. Row-level concurrency does not treat two inserts of a
+new key as a conflict, so two first runs can both insert; only one of them can then see a single row, the other
+withdraws its row, and if both see two rows both stop.
 
-**What counts as done.** Every target blob is committed together with its metadata (`migration_run_id`,
-`source_file`, `source_snapshot_id`, `physical_records`, `records_written`). On resume, a blob carrying this run's
-markers is a finished file even if recording it in the state store failed; it is recorded and not written again.
-The resume finds these blobs with one listing of the target prefix, metadata included (5,000 blobs per page),
-matched against the planned files in memory, so it makes no request per file.
+**The heartbeat.** While a run is live, every `Progress:` line (`migration.progress.log-every`, 30s) renews
+`heartbeat_at` and writes the progress, if the row still names the run. A run whose row names another run id has
+lost the migration, to a run that cleaned the target after its heartbeat went stale; so has a run that could not
+renew its heartbeat for half of `heartbeat-timeout`, as another run may clean the target from the full timeout on.
+The claim is checked before each blob a clean deletes, before each file starts and again immediately before each file
+is published, so such a run deletes and publishes nothing more and stops without writing the migration's state. Setting the Databricks job's *Maximum
+concurrent runs* to 1 adds a second guard.
 
-**One run per target.** A run holds a 60-second blob lease on `<prefix>/_migration/lock`, renewed every
-20 seconds. A second run fails at once. If a run dies, its lease lapses within a minute. The lease is checked before
-each file and again immediately before each file is published, so a run that loses it publishes nothing more and
-stops without touching the run's state, which then belongs to whichever run took the lease over. Setting the
-Databricks job's *Maximum concurrent runs* to 1 adds a second guard.
+**Publishing a file is atomic.** Every target blob is committed in one Put Block List together with its metadata
+(`migration_run_id`, `source_file`, `source_partition`, `source_snapshot_id`, `physical_records`, `records_written`),
+under a deterministic name, so a partial file is never visible.
 
 ## Progress reporting
 
 Records, bytes, files and partitions are tracked independently, with `percentage = total == 0 ? 100.0 : completed * 100.0 / total`:
 
 ```text
-Migration overview: runId=20261117-204240-0fef7d resumed=false table=hdfs://nn/warehouse/orders snapshotId=825090155793393105
+Migration overview: runId=20261117-204240-0fef7d table=hdfs://nn/warehouse/orders snapshotId=825090155793393105
   Total partitions: 3
   Total data files: 4
   Total records: 1000
@@ -303,15 +310,15 @@ file reports progress, so a stalled file shows as numbers that stop moving, with
 
 | Field | Meaning |
 |---|---|
-| `files=done/total (%)` | Files published, including those an earlier run published when resuming |
+| `files=done/total (%)` | Files published |
 | `remaining` | Files not yet published or failed: the ones this run still has to copy |
 | `failed`, `inFlight` | Files that failed in this run; files being copied right now |
 | `records=read/total (%)`, `written`, `deleted` | Physical source rows read so far (published files plus rows of the files in flight), the live rows among them, and the rows removed by deletes |
 | `bytesRead=read/total (%)` | Source data file sizes from Iceberg metadata. A file in flight counts for the share of its rows read, so this is an estimate until the file is published |
-| `bytesWritten` | Size of the target files written by this run. Row groups are buffered before they are written, so a file in flight shows what was flushed so far; files an earlier run published are not counted |
+| `bytesWritten` | Size of the target files written so far. Row groups are buffered before they are written, so a file in flight shows what was flushed so far |
 | `rate` | Source bytes read per second over the last 5 minutes of this run (since the start, in the first 5 minutes) |
 | `elapsed` | Time since this run started |
-| `eta` | Source bytes still to copy in this run, divided by the rate; `unknown` while the rate is 0. Files an earlier run published and files that failed are not left to copy; files an earlier run published are not in the rate, while the rows a failed file read before failing are |
+| `eta` | Source bytes still to copy, divided by the rate; `unknown` while the rate is 0. Files that failed are not left to copy, while the rows a failed file read before failing are in the rate |
 
 Each completed file also logs `Source file completed` with its source and target sizes and read speed.
 
@@ -322,8 +329,7 @@ Each completed file also logs `Source file completed` with its source and target
   copied in parallel; they become `committed` only when their file is published, and are dropped if it fails.
   Files count when published; partitions count when all their files are. With files copied in parallel, the log
   lines of different files interleave; the thread name (`file-worker-N`) tells them apart.
-- **Resuming** counts the files the earlier run published as done, so the percentages are those of the whole
-  migration, while the rate and the ETA describe this run only.
+- **The control row carries the same counts**, written with every `Progress:` line: see [State tables](#state-tables).
 - **The file table trails the log slightly:** outcomes are written in batches (see
   `migration.state.outcome-batch-size`), so a finished file can show `PENDING` there until its batch is written.
 - For JSON logs set `logging.structured.format.console=ecs` (or `logstash`).
@@ -335,12 +341,15 @@ Each completed file also logs `Source file completed` with its source and target
   and the closed Parquet file must hold exactly the rows written.
 - **`FAIL_FAST`** (default) starts no more files after the first failed one; files already being copied in
   parallel finish and count. **`CONTINUE`** processes the rest. Either way the run ends `FAILED`, lists the failed
-  files (source, target, reason) and throws `MigrationFailedException` with the run id to resume.
-- **Checked before anything is written:** non-Parquet data files, unreadable delete files, format versions above 3,
-  schema mismatches, a non-empty target for a new run, another active run.
-- **State table failures** are retried with jittered backoff (about 1s, then 2s, ...); if they persist the run stops,
-  and the next resume recognises published files by their blob metadata. The same covers outcomes that were still
-  waiting for their batch when a run stopped or crashed: nothing published is copied twice.
+  files (source, target, reason) and throws `MigrationFailedException`; the next run needs
+  `migration.target.clean=true` and copies everything again.
+- **Checked before anything is written:** a run that did not complete, another live run, non-Parquet data files,
+  unreadable delete files, format versions above 3, schema mismatches, a non-empty target without `clean`.
+- **State table failures** are retried with jittered backoff (about 1s, then 2s, ...); if they persist the run stops
+  and is recorded as `FAILED` where it still can be. A run that crashed, or could not record its end, stays `RUNNING`
+  and counts as failed once its heartbeat is older than `migration.state.heartbeat-timeout`. A heartbeat renewal that
+  keeps failing is logged and tried again with the next `Progress:` line; after half the timeout without one, the
+  run stops publishing.
 
 ## Output
 
@@ -365,13 +374,15 @@ Each completed file also logs `Source file completed` with its source and target
 ./mvnw verify
 ```
 
-- **Unit tests** for configuration, schema matching, file naming, progress, state store, run choice.
+- **Unit tests** for configuration, schema matching, file naming, progress, state store SQL, run start rules,
+  claims racing for the control row (including two first runs whose inserts both commit), and the run's heartbeat.
 - **End-to-end tests** run the whole application against real Iceberg tables: deletes of every kind, schema
-  changes, empty and never-written tables, fail-fast, continue, resume, recovery of completions the state store
-  missed and of file rows a crash kept from being written, lock conflicts and loss, clean.
+  changes, empty and never-written tables, fail-fast, continue, a failed run blocking the next start until clean,
+  clean refused under a live run and allowed once its heartbeat is stale, progress counters on the control row, a
+  run that loses the migration (between files, and while a file is being written) publishing nothing more.
 - **HDFS:** one end-to-end test reads the source from an in-process HDFS (`MiniDFSCluster`).
-- **Bounded memory:** `BoundedMemoryTest` (tag `memory`) runs in its own JVM with `-Xmx128m` and migrates two
-  source files, each larger than the heap, at the same time.
+- **Bounded memory:** `BoundedMemoryTest` (tag `memory`) runs in its own JVM with `-Xmx128m` and the serial
+  collector, and migrates two source files, each larger than the heap, at the same time.
 - **Async block staging:** `AzureStagedUploadTest` drives the upload against a stand-in blob service whose Put Block
   calls it can hold, to show that writing continues meanwhile, that at most one block is in flight, and that a
   failed block fails the upload.
@@ -387,14 +398,17 @@ Each completed file also logs `Source file completed` with its source and target
   Azurite's account key is published in its documentation.
 
 Spark and Delta do not run in the tests: the orchestration tests keep state in an in-memory stand-in for the
-repository, and the Spark bridge is tested against stand-in classes with Spark's API shape. The packaged app was run
-by hand through a replica of the launcher on a JVM holding open-source Spark 4.0.1 and Delta 4.0.0, covering a new
-run, a refused rerun, a clean run with a failed file, and its resume.
+repository, and the Spark bridge is tested against stand-in classes with Spark's API shape. The repository's
+statements were run by hand through `SparkSqlExecutor` on open-source Spark 4.0.1 and Delta 4.0.0: creating and
+checking the tables, two first runs inserting the control row at once and two runs claiming it at once (in both,
+Delta failed one commit as concurrent, and its retry no longer applied), renewals by the owner and by a run that
+lost the row, finishing, and refusing an earlier version's control table.
 
 ## Not yet verified outside tests
 
 - Managed identity sign-in, and the state tables on Databricks' own Spark and Delta with Unity Catalog, including
-  row-level concurrency between parallel jobs: these need the Databricks workspace.
+  row-level concurrency between parallel jobs and between two first runs inserting the same control row: these
+  need the Databricks workspace.
 - A production HDFS cluster (tests use an in-process one).
 - Equality deletes are loaded into memory per data file; memory then grows with the size of the equality delete
   files, not the data files. Tables here are append-only, so none are expected.

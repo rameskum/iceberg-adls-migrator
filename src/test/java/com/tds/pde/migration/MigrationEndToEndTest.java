@@ -4,14 +4,11 @@ import static org.apache.iceberg.types.Types.NestedField.optional;
 import static org.apache.iceberg.types.Types.NestedField.required;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
-import static org.assertj.core.api.Assertions.tuple;
 import static org.awaitility.Awaitility.await;
 
-import com.tds.pde.migration.target.BlobStore;
 import com.tds.pde.migration.state.ControlRecord;
 import com.tds.pde.migration.state.FileRecord;
-import com.tds.pde.migration.state.MigrationStateRepository;
-import com.tds.pde.migration.state.RunRecord;
+import com.tds.pde.migration.target.BlobStore;
 import com.tds.pde.migration.testing.InMemoryState;
 import com.tds.pde.migration.testing.IcebergTestTables;
 import com.tds.pde.migration.testing.InMemoryBlobStore;
@@ -22,6 +19,7 @@ import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
@@ -65,7 +63,10 @@ class MigrationEndToEndTest {
             required(1, "id", Types.LongType.get()),
             optional(2, "region", Types.StringType.get()));
     private static final String PREFIX = "sales/orders";
-    private static final String LOCK = PREFIX + "/_migration/lock";
+    private static final String SOURCE_ID = "0e9c1a5e-4c55-4a3b-9f3e-1c2a7d8b6e01";
+    private static final String TARGET_ID = "5b2f7d3c-8a1e-4f6b-b2d4-9c0e3a7f1d02";
+    private static final String TARGET_LOCATION = "abfss://data@salesacct.dfs.core.windows.net/" + PREFIX;
+    private static final String EARLIER_RUN = "20261117-103000-ab12cd";
 
     private final InMemoryBlobStore blobStore = new InMemoryBlobStore();
 
@@ -111,10 +112,20 @@ class MigrationEndToEndTest {
                 .contains("Records: 9/9 (100%) written=7 deleted=2\n  Files: 4/4 (100%) failed=0\n"
                         + "  Partitions: 3/3 (100%)\n  Bytes: read=");
 
-        RunRecord run = onlyRun();
-        assertThat(run.status()).isEqualTo(RunRecord.Status.SUCCEEDED);
-        assertThat(run.finishedAt()).isNotNull();
-        List<FileRecord> files = files(run);
+        ControlRecord control = control();
+        assertThat(control.status()).isEqualTo(ControlRecord.Status.COMPLETED);
+        assertThat(control.finishedAt()).isNotNull();
+        assertThat(control.error()).isNull();
+        assertThat(control.sourceDatasetId()).isEqualTo(SOURCE_ID);
+        assertThat(control.targetLocation()).isEqualTo(TARGET_LOCATION);
+        assertThat(control.snapshotId()).isEqualTo(table.currentSnapshot().snapshotId());
+        assertThat(control.totalFiles()).isEqualTo(4);
+        assertThat(control.totalRecords()).isEqualTo(9);
+        long bytesInOutput = dataBlobs().stream().mapToLong(name -> blobStore.blob(name).orElseThrow().content().length)
+                .sum();
+        assertThat(control.progress()).isEqualTo(new ControlRecord.Progress(4, 0, 9, 7, bytesInOutput));
+
+        List<FileRecord> files = files();
         assertThat(files).hasSize(4).allSatisfy(file -> {
             assertThat(file.status()).isEqualTo(FileRecord.Status.COMPLETED);
             assertThat(file.error()).isNull();
@@ -127,17 +138,6 @@ class MigrationEndToEndTest {
                         .standaloneRows().size())
                 .sum();
         assertThat(rowsInOutput).isEqualTo(7);
-        assertThat(blobStore.isLocked(LOCK)).isFalse();
-
-        ControlRecord control = control();
-        assertThat(control.status()).isEqualTo(RunRecord.Status.SUCCEEDED);
-        assertThat(control.lastRunId()).isEqualTo(run.runId());
-        assertThat(run.sourceDatasetId()).as("run links to its migration").isEqualTo(control.sourceDatasetId());
-        assertThat(run.targetDatasetId()).isEqualTo(control.targetDatasetId());
-        assertThat(control.snapshotId()).isEqualTo(table.currentSnapshot().snapshotId());
-        assertThat(control.totalFiles()).isEqualTo(4);
-        assertThat(control.totalRecords()).isEqualTo(9);
-        assertThat(files.stream().mapToLong(FileRecord::recordsWritten).sum()).as("records written").isEqualTo(7);
     }
 
     @Test
@@ -146,7 +146,7 @@ class MigrationEndToEndTest {
 
         assertThat(output.getOut()).contains("Migration completed: runId=")
                 .contains("Records: 0/0 (100%)", "Files: 0/0 (100%)", "Partitions: 0/0 (100%)");
-        assertThat(onlyRun().status()).isEqualTo(RunRecord.Status.SUCCEEDED);
+        assertThat(control().status()).isEqualTo(ControlRecord.Status.COMPLETED);
         assertThat(dataBlobs()).isEmpty();
     }
 
@@ -158,8 +158,8 @@ class MigrationEndToEndTest {
         migrate("--migration.processing.parallel-files=3");
 
         assertThat(blobStore.maxConcurrentUploads()).isEqualTo(3);
-        assertThat(onlyRun().status()).isEqualTo(RunRecord.Status.SUCCEEDED);
-        assertThat(files(onlyRun())).extracting(FileRecord::status).containsOnly(FileRecord.Status.COMPLETED);
+        assertThat(control().status()).isEqualTo(ControlRecord.Status.COMPLETED);
+        assertThat(files()).extracting(FileRecord::status).containsOnly(FileRecord.Status.COMPLETED);
         assertThat(dataBlobs()).hasSize(3);
     }
 
@@ -184,11 +184,46 @@ class MigrationEndToEndTest {
             runner.shutdownNow();
         }
 
-        assertThat(onlyRun().status()).isEqualTo(RunRecord.Status.SUCCEEDED);
+        assertThat(control().status()).isEqualTo(ControlRecord.Status.COMPLETED);
         assertThat(output.getOut()).contains("Progress: files=").contains("bytesRead=", "rate=", "eta=");
         int lines = countOf(output, "Progress: ");
+        int renewals = stateStore.renewals().size();
         Thread.sleep(200);
         assertThat(countOf(output, "Progress: ")).as("the heartbeat stops with the run").isEqualTo(lines);
+        assertThat(stateStore.renewals()).as("and so do the renewals").hasSize(renewals);
+    }
+
+    @Test
+    void writesTheProgressToTheControlRowWithEveryHeartbeat() throws Exception {
+        appendFiles();
+        // The APAC file is copied first and published; the EU files wait.
+        CountDownLatch release = new CountDownLatch(1);
+        blobStore.holdCommitsTo(name -> name.contains("region=EU"), release);
+        ExecutorService runner = Executors.newSingleThreadExecutor();
+        try {
+            Future<?> run = runner.submit(() -> migrate("--migration.processing.parallel-files=1",
+                    "--migration.progress.log-every=50ms"));
+
+            await().atMost(Duration.ofSeconds(10)).until(() -> control().progress().completedFiles() == 1);
+            ControlRecord running = control();
+            assertThat(running.status()).isEqualTo(ControlRecord.Status.RUNNING);
+            assertThat(running.progress().recordsRead()).isEqualTo(1);
+            assertThat(running.progress().recordsWritten()).isEqualTo(1);
+            assertThat(running.progress().bytesWritten()).isPositive();
+            Instant heartbeat = running.heartbeatAt();
+            await().atMost(Duration.ofSeconds(10)).until(() -> control().heartbeatAt().isAfter(heartbeat));
+
+            release.countDown();
+            run.get(30, TimeUnit.SECONDS);
+        } finally {
+            release.countDown();
+            runner.shutdownNow();
+        }
+
+        assertThat(stateStore.renewals()).extracting(ControlRecord.Progress::completedFiles)
+                .as("renewed while files were copied").contains(1L).isSorted();
+        assertThat(control().progress().completedFiles()).isEqualTo(3);
+        assertThat(control().progress().recordsRead()).isEqualTo(5);
     }
 
     private static int countOf(CapturedOutput output, String text) {
@@ -202,7 +237,7 @@ class MigrationEndToEndTest {
         migrate("--migration.state.outcome-batch-size=2", "--migration.state.outcome-flush-interval=1h");
 
         assertThat(stateStore.outcomeWrites()).as("a full batch, then the rest at the end").containsExactly(2, 1);
-        assertThat(files(onlyRun())).extracting(FileRecord::status).containsOnly(FileRecord.Status.COMPLETED);
+        assertThat(files()).extracting(FileRecord::status).containsOnly(FileRecord.Status.COMPLETED);
     }
 
     @Test
@@ -223,23 +258,22 @@ class MigrationEndToEndTest {
         assertThatThrownBy(() -> migrate("--migration.processing.parallel-files=1"))
                 .isInstanceOf(MigrationFailedException.class)
                 .hasMessageContaining("failed: 1 of 3 files failed")
-                .hasMessageContaining("resume it with migration.run-id=");
+                .hasMessageContaining("start again from the beginning with migration.target.clean=true");
 
-        RunRecord run = onlyRun();
-        assertThat(run.status()).isEqualTo(RunRecord.Status.FAILED);
-        assertThat(run.error()).isEqualTo("1 of 3 files failed");
-        assertThat(statusByPartition(run)).isEqualTo(Map.of(
+        ControlRecord control = control();
+        assertThat(control.status()).isEqualTo(ControlRecord.Status.FAILED);
+        assertThat(control.error()).isEqualTo("1 of 3 files failed");
+        assertThat(control.finishedAt()).isNotNull();
+        assertThat(control.progress().completedFiles()).isEqualTo(1);
+        assertThat(control.progress().failedFiles()).isEqualTo(1);
+        assertThat(statusByPartition()).isEqualTo(Map.of(
                 "region=APAC", List.of(FileRecord.Status.COMPLETED),
                 "region=EU", List.of(FileRecord.Status.FAILED, FileRecord.Status.PENDING)));
         // Only two partitions exist; with fail-fast the second EU file was never started.
         assertThat(output.getOut()).contains("Stopped starting files after the first failed file");
-        assertThat(files(run)).filteredOn(file -> file.status() == FileRecord.Status.FAILED).singleElement()
+        assertThat(files()).filteredOn(file -> file.status() == FileRecord.Status.FAILED).singleElement()
                 .satisfies(file -> assertThat(file.error()).contains("injected write failure"));
         assertThat(dataBlobs()).hasSize(1);
-        assertThat(control()).satisfies(control -> {
-            assertThat(control.status()).isEqualTo(RunRecord.Status.FAILED);
-            assertThat(control.lastRunId()).isEqualTo(run.runId());
-        });
     }
 
     @Test
@@ -254,167 +288,141 @@ class MigrationEndToEndTest {
         assertThat(output.getOut()).contains("Migration failed: runId=")
                 .contains("Files: 2/3 (66.6667%) failed=1", "Partitions: 1/2 (50%)")
                 .contains("Failed files:\n    source=" + firstEuFileLocation());
-        assertThat(files(onlyRun())).extracting(FileRecord::status).containsExactlyInAnyOrder(
+        assertThat(files()).extracting(FileRecord::status).containsExactlyInAnyOrder(
                 FileRecord.Status.COMPLETED, FileRecord.Status.COMPLETED, FileRecord.Status.FAILED);
     }
 
     @Test
-    void resumesAFailedRunWithoutRewritingPublishedFiles(CapturedOutput output) {
+    void refusesToStartAfterAFailedRunUntilCleanIsSetThenStartsOverUnderANewRun() {
         appendFiles();
         blobStore.failWritesTo(name -> name.contains("region=EU"));
-        assertThatThrownBy(this::migrate).isInstanceOf(MigrationFailedException.class);
+        assertThatThrownBy(() -> migrate("--migration.processing.parallel-files=1"))
+                .isInstanceOf(MigrationFailedException.class);
+        String failedRun = control().runId();
         String apacBlob = dataBlobs().getFirst();
         blobStore.stopFailing();
 
-        migrate();
+        assertThatThrownBy(this::migrate)
+                .isInstanceOf(MigrationFailedException.class)
+                .hasMessageContaining("Run " + failedRun + " of this migration failed (1 of 3 files failed)")
+                .hasMessageContaining("Set migration.target.clean=true");
+        assertThat(control().runId()).isEqualTo(failedRun);
 
-        assertThat(output.getOut()).contains("Resuming after already published work:")
-                .contains("Files: 3/3 (100%) failed=0\n  Partitions: 2/2 (100%)");
-        RunRecord run = onlyRun();
-        assertThat(run.status()).isEqualTo(RunRecord.Status.SUCCEEDED);
-        assertThat(blobStore.uploadsStarted(apacBlob)).isEqualTo(1);
-        assertThat(files(run)).allSatisfy(file -> assertThat(file.status()).isEqualTo(FileRecord.Status.COMPLETED));
-        assertThat(files(run)).allSatisfy(file -> assertThat(file.error()).isNull());
-        assertThat(control()).satisfies(control -> {
-            assertThat(control.status()).isEqualTo(RunRecord.Status.SUCCEEDED);
-            assertThat(control.lastRunId()).isEqualTo(run.runId());
-        });
-    }
+        migrate("--migration.target.clean=true");
 
-    @Test
-    void findsThePublishedFilesOfAResumedRunWithOneListingOfTheTarget() {
-        appendFiles();
-        IcebergTestTables.append(table, rows("APAC", 10, 1));
-        blobStore.failWritesTo(name -> name.contains("region=EU"));
-        assertThatThrownBy(this::migrate).isInstanceOf(MigrationFailedException.class);
-        assertThat(dataBlobs()).as("both APAC files published").hasSize(2);
-        blobStore.stopFailing();
-        blobStore.clearReads();
-
-        migrate();
-
-        assertThat(blobStore.reads()).containsExactly("list with metadata " + PREFIX + "/");
-        assertThat(onlyRun().status()).isEqualTo(RunRecord.Status.SUCCEEDED);
-        assertThat(dataBlobs()).hasSize(4).filteredOn(blob -> blob.contains("region=APAC")).hasSize(2)
-                .allSatisfy(blob -> assertThat(blobStore.uploadsStarted(blob)).as("not copied again").isOne());
-    }
-
-    @Test
-    void resumesARunThatDiedBeforeAllItsFileRowsWereRecorded(CapturedOutput output) {
-        appendFiles();
-        stateStore.crashAfterFileRows(1);
-        assertThatThrownBy(this::migrate).isInstanceOf(MigrationFailedException.class)
-                .hasMessageContaining("injected crash after 1 file rows");
-        assertThat(onlyRun().status()).isEqualTo(RunRecord.Status.RUNNING);
-        assertThat(files(onlyRun())).hasSize(1);
-
-        migrate();
-
-        assertThat(output.getOut()).contains("recording the 2 missing as PENDING");
-        RunRecord run = onlyRun();
-        assertThat(run.status()).isEqualTo(RunRecord.Status.SUCCEEDED);
-        assertThat(files(run)).hasSize(3)
+        ControlRecord control = control();
+        assertThat(control.runId()).isNotEqualTo(failedRun);
+        assertThat(control.status()).isEqualTo(ControlRecord.Status.COMPLETED);
+        assertThat(control.progress().completedFiles()).isEqualTo(3);
+        assertThat(blobStore.uploadsStarted(apacBlob)).as("copied again from the beginning").isEqualTo(2);
+        assertThat(stateStore.findFiles(failedRun)).as("file rows of the failed run").isEmpty();
+        assertThat(files()).hasSize(3)
                 .allSatisfy(file -> assertThat(file.status()).isEqualTo(FileRecord.Status.COMPLETED));
         assertThat(dataBlobs()).hasSize(3);
     }
 
     @Test
-    void recordsAPublishedFileWhoseCompletionTheStateStoreMissed() {
+    void refusesToCleanUnderALiveRunAndCleansOnceItsHeartbeatIsStale() throws IOException {
         appendFiles();
-        blobStore.failWritesTo(name -> name.contains("region=EU"));
-        assertThatThrownBy(this::migrate).isInstanceOf(MigrationFailedException.class);
-        String apacBlob = dataBlobs().getFirst();
-        FileRecord apac = files(onlyRun()).stream().filter(file -> file.targetPath().equals(apacBlob))
-                .findFirst().orElseThrow();
-        stateStore.replaceFile(new FileRecord(apac.runId(), apac.sourcePath(), apac.targetPath(),
-                apac.physicalRecords(), FileRecord.Status.PENDING, null, null));
-        blobStore.stopFailing();
+        stateStore.putControl(earlierRun(Instant.now()));
+        publish(PREFIX + "/written-by-the-earlier-run.parquet");
 
-        migrate();
+        assertThatThrownBy(() -> migrate("--migration.target.clean=true"))
+                .isInstanceOf(MigrationFailedException.class)
+                .hasMessageContaining("Run " + EARLIER_RUN + " of this migration is still running")
+                .hasMessageContaining("migration.target.clean=true is refused");
+        assertThat(control().runId()).isEqualTo(EARLIER_RUN);
+        assertThat(dataBlobs()).containsExactly(PREFIX + "/written-by-the-earlier-run.parquet");
 
-        assertThat(blobStore.uploadsStarted(apacBlob)).isEqualTo(1);
-        assertThat(files(onlyRun())).filteredOn(file -> file.targetPath().equals(apacBlob)).singleElement()
-                .satisfies(file -> {
-                    assertThat(file.status()).isEqualTo(FileRecord.Status.COMPLETED);
-                    assertThat(file.recordsWritten()).isEqualTo(1);
-                });
+        // The earlier run died: its heartbeat is older than the timeout.
+        stateStore.putControl(earlierRun(Instant.now().minus(Duration.ofMinutes(6))));
+
+        migrate("--migration.target.clean=true");
+
+        assertThat(control().runId()).isNotEqualTo(EARLIER_RUN);
+        assertThat(control().status()).isEqualTo(ControlRecord.Status.COMPLETED);
+        assertThat(dataBlobs()).hasSize(3).doesNotContain(PREFIX + "/written-by-the-earlier-run.parquet");
     }
 
     @Test
-    void refusesToRunWhileAnotherRunHoldsTheTarget() {
+    void refusesToRunWhileAnotherRunIsLive() {
         appendFiles();
-        blobStore.acquireLock(LOCK);
+        ControlRecord live = earlierRun(Instant.now());
+        stateStore.putControl(live);
 
         assertThatThrownBy(this::migrate)
                 .isInstanceOf(MigrationFailedException.class)
-                .hasMessageContaining("Another migration run holds the lock " + LOCK);
+                .hasMessageContaining("Run " + EARLIER_RUN + " of this migration is still running");
 
-        assertThat(runs()).isEmpty();
+        assertThat(stateStore.controls()).containsExactly(live);
         assertThat(dataBlobs()).isEmpty();
     }
 
     @Test
-    void stopsWritingAsSoonAsTheLockIsLost() {
+    void stopsPublishingOnceAnotherRunTookTheMigrationOver() {
         appendFiles();
-        blobStore.loseLock(LOCK);
+        stateStore.takeOverOnFirstOutcome();
 
-        assertThatThrownBy(this::migrate)
+        assertThatThrownBy(() -> migrate("--migration.processing.parallel-files=1",
+                "--migration.state.outcome-flush-interval=0s", "--migration.progress.log-every=50ms"))
                 .isInstanceOf(MigrationFailedException.class)
-                .hasMessageContaining("Lost the run lock");
+                .hasMessageContaining("lost its claim on the migration");
 
-        // The run's state is left to whichever run took the lock over.
-        assertThat(onlyRun().status()).isEqualTo(RunRecord.Status.RUNNING);
-        assertThat(dataBlobs()).isEmpty();
+        // The migration's state is left to the run that owns it now.
+        assertThat(control().runId()).isEqualTo(InMemoryState.Store.OTHER_RUN);
+        assertThat(control().status()).isEqualTo(ControlRecord.Status.RUNNING);
+        assertThat(dataBlobs()).hasSize(1);
     }
 
     @Test
-    void publishesNothingWhenTheLockIsLostWhileAFileIsBeingWritten() {
+    void publishesNothingWhenTheMigrationIsTakenOverWhileAFileIsBeingWritten() {
         appendFiles();
-        // The check before the first file passes; the check just before publishing it fails.
-        blobStore.loseLockAfter(LOCK, 1);
+        // The check before the file starts passes; the check just before publishing it fails.
+        blobStore.onFirstWrite(stateStore::takeOver);
 
-        assertThatThrownBy(this::migrate)
+        assertThatThrownBy(() -> migrate("--migration.processing.parallel-files=1",
+                "--migration.progress.log-every=50ms"))
                 .isInstanceOf(MigrationFailedException.class)
-                .hasMessageContaining("Lost the run lock");
+                .hasMessageContaining("lost its claim on the migration");
 
         assertThat(dataBlobs()).isEmpty();
         assertThat(blobStore.aborted()).hasSize(1);
-        assertThat(files(onlyRun())).extracting(FileRecord::status)
-                .containsOnly(FileRecord.Status.PENDING);
+        assertThat(control().runId()).isEqualTo(InMemoryState.Store.OTHER_RUN);
     }
 
     @Test
     void refusesANewRunIntoATargetThatAlreadyHoldsOutput() {
         appendFiles();
         migrate();
+        String completed = control().runId();
 
         assertThatThrownBy(this::migrate)
                 .isInstanceOf(MigrationFailedException.class)
-                .hasMessageContaining("already holds 3 files written by run " + onlyRun().runId() + " (SUCCEEDED)");
+                .hasMessageContaining("already holds 3 files written by run " + completed + " (COMPLETED)");
+        assertThat(control().runId()).isEqualTo(completed);
     }
 
     @Test
     void replacesEarlierOutputWhenAskedToClean() {
         appendFiles();
         migrate();
-        String firstRun = onlyRun().runId();
+        String firstRun = control().runId();
         IcebergTestTables.append(table, rows("US", 500, 2));
 
         migrate("--migration.target.clean=true");
 
-        assertThat(runs()).extracting(RunRecord::runId, RunRecord::status).contains(
-                tuple(firstRun, RunRecord.Status.SUPERSEDED));
-        assertThat(runs()).filteredOn(run -> run.status() == RunRecord.Status.SUCCEEDED).singleElement()
-                .satisfies(run -> assertThat(files(run)).hasSize(4));
+        assertThat(control().runId()).isNotEqualTo(firstRun);
+        assertThat(control().status()).isEqualTo(ControlRecord.Status.COMPLETED);
+        assertThat(stateStore.findFiles(firstRun)).isEmpty();
+        assertThat(files()).hasSize(4);
         assertThat(dataBlobs()).hasSize(4);
     }
 
     private void migrate(String... extraArgs) {
         List<String> args = new ArrayList<>(List.of(
-                "--migration.source.dataset-id=0e9c1a5e-4c55-4a3b-9f3e-1c2a7d8b6e01",
-                "--migration.target.dataset-id=5b2f7d3c-8a1e-4f6b-b2d4-9c0e3a7f1d02",
+                "--migration.source.dataset-id=" + SOURCE_ID,
+                "--migration.target.dataset-id=" + TARGET_ID,
                 "--migration.datasets.stub-directory=" + datasets,
-                "--migration.state.run-table=" + "migration_run",
                 "--migration.state.file-table=" + "migration_file",
                 "--migration.state.control-table=" + "migration_control"));
         args.addAll(List.of(extraArgs));
@@ -449,41 +457,43 @@ class MigrationEndToEndTest {
         return locations.stream().sorted().toList();
     }
 
-    private List<RunRecord> runs() {
-        return stateStore.runs();
-    }
-
-    private RunRecord onlyRun() {
-        List<RunRecord> runs = runs();
-        assertThat(runs).hasSize(1);
-        return runs.getFirst();
-    }
-
     private ControlRecord control() {
-        return repository().findControl("0e9c1a5e-4c55-4a3b-9f3e-1c2a7d8b6e01",
-                "5b2f7d3c-8a1e-4f6b-b2d4-9c0e3a7f1d02").orElseThrow();
+        List<ControlRecord> controls = stateStore.findControls(TARGET_ID);
+        assertThat(controls).hasSize(1);
+        return controls.getFirst();
     }
 
-    private List<FileRecord> files(RunRecord run) {
-        return repository().findFiles(run.runId());
+    /** The file rows of the migration's latest run. */
+    private List<FileRecord> files() {
+        return stateStore.findFiles(control().runId());
     }
 
-    private Map<String, List<FileRecord.Status>> statusByPartition(RunRecord run) {
-        return files(run).stream()
+    private Map<String, List<FileRecord.Status>> statusByPartition() {
+        return files().stream()
                 .sorted(Comparator.comparing(FileRecord::sourcePath))
                 .collect(Collectors.groupingBy(file -> file.sourcePath().replaceAll(".*/(region=[^/]+)/.*", "$1"),
                         TreeMap::new,
                         Collectors.mapping(FileRecord::status, Collectors.toList())));
     }
 
-    private MigrationStateRepository repository() {
-        return stateStore;
+    /** The control row of a run that started before this test's run, last renewed at {@code heartbeatAt}. */
+    private ControlRecord earlierRun(Instant heartbeatAt) {
+        return new ControlRecord(TARGET_ID, SOURCE_ID, table.location(), TARGET_LOCATION, EARLIER_RUN,
+                ControlRecord.Status.RUNNING, null, heartbeatAt.minus(Duration.ofHours(1)), heartbeatAt, null, 3, 5,
+                ControlRecord.Progress.NONE, null);
+    }
+
+    private void publish(String blobName) throws IOException {
+        var upload = blobStore.startUpload(blobName);
+        try (var out = upload.outputStream()) {
+            out.write(new byte[] {1, 2, 3});
+        }
+        upload.commit(Map.of());
     }
 
     private List<String> dataBlobs() {
         return blobStore.list(PREFIX + "/").stream()
                 .map(BlobStore.BlobInfo::name)
-                .filter(name -> !name.startsWith(PREFIX + "/_migration/"))
                 .sorted()
                 .toList();
     }

@@ -4,14 +4,12 @@ import static org.apache.iceberg.types.Types.NestedField.required;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
+import com.azure.storage.blob.BlobClient;
 import com.azure.storage.blob.BlobContainerClient;
 import com.azure.storage.blob.BlobServiceClientBuilder;
-import com.azure.storage.blob.specialized.BlobLeaseClientBuilder;
 import com.tds.pde.migration.target.BlobStore;
 import com.tds.pde.migration.target.TargetPathResolver;
-import com.tds.pde.migration.target.LockUnavailableException;
 import com.tds.pde.migration.target.ParquetDataWriter;
-import com.tds.pde.migration.target.RunLock;
 import com.tds.pde.migration.target.StagedUpload;
 import com.tds.pde.migration.processing.DataFileProcessor;
 import com.tds.pde.migration.processing.FileProgressListener;
@@ -29,13 +27,11 @@ import com.tds.pde.migration.testing.TestProperties;
 import java.io.IOException;
 import java.io.OutputStream;
 import java.nio.file.Path;
-import java.time.Duration;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Random;
 import java.util.UUID;
 import java.util.stream.LongStream;
-import java.util.stream.Stream;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.iceberg.PartitionSpec;
 import org.apache.iceberg.Schema;
@@ -110,7 +106,7 @@ class AzureBlobStoreTest {
     }
 
     @Test
-    void listsTheMetadataOfTheCommittedBlobsUnderAPrefixInOneListing() throws IOException {
+    void listsTheCommittedBlobsUnderAPrefix() throws IOException {
         BlobStore store = factory.open(location);
         String first = location.blobName("region=EU__part-0.parquet");
         String second = location.blobName("region=US__part-1.parquet");
@@ -122,12 +118,19 @@ class AzureBlobStoreTest {
             out.write(randomBytes(BLOCK_SIZE * 2));
         }
 
-        try (Stream<BlobStore.BlobMetadata> blobs = store.listWithMetadata(location.blobPrefix())) {
-            assertThat(blobs).containsExactly(
-                    new BlobStore.BlobMetadata(first, Map.of()),
-                    new BlobStore.BlobMetadata(second,
-                            Map.of("migration_run_id", "run-1", "source_file", "hdfs%3A%2F%2Fnn")));
-        }
+        assertThat(store.list(location.blobPrefix())).containsExactly(
+                new BlobStore.BlobInfo(first, 10), new BlobStore.BlobInfo(second, 10));
+    }
+
+    @Test
+    void explainsAMissingContainer() {
+        BlobStore store = factory.open(AzureLocation.parse("abfss://missing-" + UUID.randomUUID()
+                + "@devstoreaccount1.dfs.core.windows.net/sales/orders"));
+
+        assertThatThrownBy(() -> store.list("sales/orders/"))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("Cannot list container 'missing-")
+                .hasMessageContaining("ContainerNotFound (create the container first)");
     }
 
     @Test
@@ -181,41 +184,6 @@ class AzureBlobStoreTest {
     }
 
     @Test
-    void grantsTheLockToOneHolderAtATime() {
-        BlobStore store = factory.open(location);
-        String lockName = location.blobName("_migration/lock");
-
-        RunLock lock = store.acquireLock(lockName);
-        assertThatThrownBy(() -> store.acquireLock(lockName))
-                .isInstanceOf(LockUnavailableException.class)
-                .hasMessageContaining("Another migration run holds the lock");
-
-        lock.close();
-        try (RunLock again = store.acquireLock(lockName)) {
-            again.ensureHeld();
-        }
-    }
-
-    @Test
-    void keepsRenewingTheLockAndReportsWhenItIsTakenAway() throws InterruptedException {
-        BlobStore store = factory.open(location, Duration.ofMillis(200));
-        String lockName = location.blobName("_migration/lock");
-
-        try (RunLock lock = store.acquireLock(lockName)) {
-            Thread.sleep(700);
-            lock.ensureHeld();
-
-            new BlobLeaseClientBuilder().blobClient(container.getBlobClient(lockName)).buildClient()
-                    .breakLease();
-            Thread.sleep(700);
-
-            assertThatThrownBy(lock::ensureHeld)
-                    .isInstanceOf(LockUnavailableException.class)
-                    .hasMessageContaining("Lost the run lock");
-        }
-    }
-
-    @Test
     void publishesAMigratedDataFileReadableAsStandaloneParquet() {
         Schema schema = new Schema(required(1, "id", Types.LongType.get()), required(2, "note", Types.StringType.get()));
         Table table = IcebergTestTables.create(tempDir.resolve("orders"), schema, PartitionSpec.unpartitioned());
@@ -244,11 +212,10 @@ class AzureBlobStoreTest {
         assertThat(output.records(schema).getLast().getField("note")).isEqualTo("order-4999");
     }
 
-    /** The metadata of the named blob, if it is committed, as the resume finds it: through a listing. */
-    private static Optional<Map<String, String>> metadata(BlobStore store, String name) {
-        try (Stream<BlobStore.BlobMetadata> blobs = store.listWithMetadata(name)) {
-            return blobs.filter(blob -> blob.name().equals(name)).map(BlobStore.BlobMetadata::metadata).findFirst();
-        }
+    /** The metadata of the named blob, if it is committed. */
+    private Optional<Map<String, String>> metadata(BlobStore store, String name) {
+        BlobClient blob = container.getBlobClient(name);
+        return blob.exists() ? Optional.of(blob.getProperties().getMetadata()) : Optional.empty();
     }
 
     private static void upload(BlobStore store, String name, byte[] content, Map<String, String> metadata)

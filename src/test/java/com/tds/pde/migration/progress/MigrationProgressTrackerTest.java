@@ -6,7 +6,9 @@ import static org.awaitility.Awaitility.await;
 import com.tds.pde.migration.testing.LogCapture;
 import com.tds.pde.migration.testing.TestProperties;
 import java.time.Duration;
+import java.util.List;
 import java.util.Map;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.atomic.AtomicLong;
 import org.junit.jupiter.api.Test;
 
@@ -125,19 +127,6 @@ class MigrationProgressTrackerTest {
     }
 
     @Test
-    void countsWorkAResumedRunHadAlreadyDone() {
-        MigrationProgressTracker progress = tracker();
-        progress.start(300, 300 * MIB, 3, 2);
-
-        progress.fileAlreadyCompleted(100, 100, 100 * MIB);
-        progress.partitionAlreadyCompleted();
-
-        assertThat(progress.snapshot()).isEqualTo(
-                new ProgressSnapshot(300, 100, 100, 0, 0, 300 * MIB, 100 * MIB, 0, 0, 3, 1, 0, 2, 1));
-        assertThat(progress.snapshot().partitionPercentage()).isEqualTo(50.0);
-    }
-
-    @Test
     void heartbeatReportsFilesRecordsBytesRateElapsedAndEta() {
         MigrationProgressTracker progress = tracker();
         progress.start(1_000, 400 * MIB, 4, 2);
@@ -152,23 +141,6 @@ class MigrationProgressTrackerTest {
                 + "records=375/1000 (37.5%) written=360 deleted=15 "
                 + "bytesRead=150MiB/400MiB (37.5%) bytesWritten=60MiB rate=2.5MiB/s (5m) "
                 + "elapsed=0:01:00 eta=0:01:40");
-    }
-
-    @Test
-    void heartbeatLeavesFilesAnEarlierRunPublishedOutOfTheRateAndTheEta() {
-        MigrationProgressTracker progress = tracker();
-        progress.start(1_000, 400 * MIB, 4, 2);
-        progress.fileAlreadyCompleted(250, 250, 100 * MIB);
-        progress.fileAlreadyCompleted(250, 250, 100 * MIB);
-        progress.fileStarted("file-3", 100 * MIB, 250);
-        advance(Duration.ofSeconds(100));
-        progress.fileCompleted("file-3", 250, 250, 100 * MIB);
-
-        // 100 MiB in 100 s is 1 MiB/s; the 100 MiB left take 100 s however much the earlier run did.
-        assertThat(heartbeat(progress)).isEqualTo("Progress: files=3/4 (75%) remaining=1 failed=0 inFlight=0 "
-                + "records=750/1000 (75%) written=750 deleted=0 "
-                + "bytesRead=300MiB/400MiB (75%) bytesWritten=100MiB rate=1MiB/s (5m) "
-                + "elapsed=0:01:40 eta=0:01:40");
     }
 
     @Test
@@ -250,7 +222,8 @@ class MigrationProgressTrackerTest {
     @Test
     void logsTheHeartbeatOnATimerEvenWhileNoFileReportsProgress() throws InterruptedException {
         MigrationProgressTracker progress = new MigrationProgressTracker(
-                TestProperties.bind(Map.of("migration.progress.log-every", "30ms")).progress());
+                TestProperties.bind(Map.of("migration.progress.log-every", "30ms")).progress(), snapshot -> {
+                });
         try (LogCapture logs = new LogCapture(MigrationProgressTracker.class.getName())) {
             progress.start(100, 100 * MIB, 1, 1);
             // A file that started and then went quiet.
@@ -267,6 +240,29 @@ class MigrationProgressTrackerTest {
             Thread.sleep(150);
             assertThat(logs.messagesStartingWith("Progress: ")).as("the timer stops with the tracker")
                     .hasSize(afterClose);
+        } finally {
+            progress.close();
+        }
+    }
+
+    @Test
+    void handsEveryHeartbeatsProgressToTheListenerAndKeepsGoingWhenItFails() {
+        List<ProgressSnapshot> heard = new CopyOnWriteArrayList<>();
+        MigrationProgressTracker progress = new MigrationProgressTracker(
+                TestProperties.bind(Map.of("migration.progress.log-every", "20ms")).progress(), snapshot -> {
+                    heard.add(snapshot);
+                    throw new IllegalStateException("state table unavailable");
+                });
+        try (LogCapture logs = new LogCapture(MigrationProgressTracker.class.getName())) {
+            progress.start(100, 100 * MIB, 1, 1);
+            progress.fileStarted("file-1", 100 * MIB, 100);
+            progress.fileCompleted("file-1", 100, 90, 7);
+
+            await().atMost(Duration.ofSeconds(10)).until(() -> heard.size() >= 3);
+            assertThat(heard.getFirst()).isEqualTo(
+                    new ProgressSnapshot(100, 100, 90, 0, 0, 100 * MIB, 100 * MIB, 7, 0, 1, 1, 0, 1, 0));
+            assertThat(logs.messagesStartingWith("Heartbeat listener failed: reason=state table unavailable"))
+                    .isNotEmpty();
         } finally {
             progress.close();
         }
