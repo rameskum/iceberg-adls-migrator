@@ -15,6 +15,7 @@ import java.util.ArrayList;
 import java.util.Base64;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.UUID;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
@@ -50,6 +51,7 @@ final class AzureStagedUpload implements StagedUpload {
     private boolean streamClosed;
     private @Nullable Future<?> staging;
     private @Nullable IOException failure;
+    private int buffersAllocated;
 
     AzureStagedUpload(BlockBlobClient blob, int blockSize, ExecutorService stagingThreads) {
         this.blob = blob;
@@ -91,6 +93,10 @@ final class AzureStagedUpload implements StagedUpload {
         log.debug("Upload abandoned, {} staged blocks left for Azure to discard: blob={}", blockIds.size(), blobName());
     }
 
+    int buffersAllocated() {
+        return buffersAllocated;
+    }
+
     private String nextBlockId() {
         // Block ids must be Base64 and equally long within a blob.
         String raw = uploadId + "-" + String.format("%06d", blockIds.size());
@@ -99,8 +105,9 @@ final class AzureStagedUpload implements StagedUpload {
 
     private final class BlockStagingStream extends OutputStream {
 
-        private byte[] filling = new byte[blockSize];
-        /** The buffer not being filled: free, or holding the block being staged. Allocated when first needed. */
+        /** The buffer being filled. Allocated when the next byte needs it, so a one-block file uses one buffer. */
+        private byte @Nullable [] filling;
+        /** The buffer not being filled: free, or holding the block being staged. */
         private byte @Nullable [] other;
         private int buffered;
 
@@ -115,10 +122,14 @@ final class AzureStagedUpload implements StagedUpload {
                 throw new IOException("Stream closed: " + blobName());
             }
             while (length > 0) {
-                if (buffered == filling.length) {
+                if (buffered == blockSize) {
                     stageBufferedBlock();
                 }
-                int chunk = Math.min(length, filling.length - buffered);
+                if (filling == null) {
+                    filling = new byte[blockSize];
+                    buffersAllocated++;
+                }
+                int chunk = Math.min(length, blockSize - buffered);
                 System.arraycopy(bytes, offset, filling, buffered, chunk);
                 buffered += chunk;
                 offset += chunk;
@@ -151,7 +162,7 @@ final class AzureStagedUpload implements StagedUpload {
             }
             int index = blockIds.size();
             String blockId = nextBlockId();
-            byte[] block = filling;
+            byte[] block = Objects.requireNonNull(filling);
             int length = buffered;
             blockIds.add(blockId);
             staging = stagingThreads.submit(() -> {
@@ -159,7 +170,7 @@ final class AzureStagedUpload implements StagedUpload {
                 blob.stageBlock(blockId, BinaryData.fromByteBuffer(ByteBuffer.wrap(block, 0, length)));
                 log.trace("Block staged: blob={} block={} bytes={}", blobName(), index, length);
             });
-            filling = other == null ? new byte[blockSize] : other;
+            filling = other;
             other = block;
             buffered = 0;
         }

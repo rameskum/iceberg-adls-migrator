@@ -184,5 +184,21 @@ class AzureStagedUploadTest {
         }
 
         assertThat(stageCalls).hasValue(1);
+        assertThat(upload.buffersAllocated()).isEqualTo(1);
+    }
+
+    @Test
+    void reusesTwoBuffersForAFileOfManyBlocks() throws Exception {
+        stageThrough(new CountDownLatch(0));
+        AzureStagedUpload upload = upload();
+
+        try (OutputStream out = upload.outputStream()) {
+            for (int i = 0; i < 10; i++) {
+                out.write(new byte[BLOCK_SIZE]);
+            }
+        }
+
+        assertThat(stageCalls).hasValue(10);
+        assertThat(upload.buffersAllocated()).isEqualTo(2);
     }
 }
