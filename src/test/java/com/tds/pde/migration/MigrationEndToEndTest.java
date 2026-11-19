@@ -5,6 +5,7 @@ import static org.apache.iceberg.types.Types.NestedField.required;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.assertj.core.api.Assertions.tuple;
+import static org.awaitility.Awaitility.await;
 
 import com.tds.pde.migration.target.BlobStore;
 import com.tds.pde.migration.state.ControlRecord;
@@ -20,11 +21,18 @@ import com.tds.pde.migration.testing.TestProperties;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
 import java.util.Map;
 import java.util.TreeMap;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
+import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 import java.util.stream.LongStream;
 import org.apache.iceberg.DataFile;
@@ -98,10 +106,10 @@ class MigrationEndToEndTest {
                 .contains("Total partitions: 3\n  Total data files: 4\n  Total records: 9")
                 .contains("Partition progress: 1/3 (33.3333%)", "Partition progress: 2/3 (66.6667%)",
                         "Partition progress: 3/3 (100%)")
-                .contains("File progress: 4/4 (100%)")
+                .doesNotContain("File progress:", "Record progress:")
                 .contains("Migration completed: runId=")
                 .contains("Records: 9/9 (100%) written=7 deleted=2\n  Files: 4/4 (100%) failed=0\n"
-                        + "  Partitions: 3/3 (100%)");
+                        + "  Partitions: 3/3 (100%)\n  Bytes: read=");
 
         RunRecord run = onlyRun();
         assertThat(run.status()).isEqualTo(RunRecord.Status.SUCCEEDED);
@@ -153,6 +161,38 @@ class MigrationEndToEndTest {
         assertThat(onlyRun().status()).isEqualTo(RunRecord.Status.SUCCEEDED);
         assertThat(files(onlyRun())).extracting(FileRecord::status).containsOnly(FileRecord.Status.COMPLETED);
         assertThat(dataBlobs()).hasSize(3);
+    }
+
+    @Test
+    void logsTheProgressHeartbeatWhileAFileIsStalledAndStopsItWhenTheRunEnds(CapturedOutput output)
+            throws Exception {
+        appendFiles();
+        CountDownLatch release = new CountDownLatch(1);
+        blobStore.holdCommitsUntil(release);
+        ExecutorService runner = Executors.newSingleThreadExecutor();
+        try {
+            Future<?> run = runner.submit(() -> migrate("--migration.processing.parallel-files=1",
+                    "--migration.progress.log-every=50ms"));
+
+            // No file finishes, so nothing else reports progress; the heartbeat still does.
+            await().atMost(Duration.ofSeconds(10)).until(() -> countOf(output, "Progress: files=0/3 (0%) "
+                    + "remaining=3 failed=0 inFlight=1 ") >= 2);
+            release.countDown();
+            run.get(30, TimeUnit.SECONDS);
+        } finally {
+            release.countDown();
+            runner.shutdownNow();
+        }
+
+        assertThat(onlyRun().status()).isEqualTo(RunRecord.Status.SUCCEEDED);
+        assertThat(output.getOut()).contains("Progress: files=").contains("bytesRead=", "rate=", "eta=");
+        int lines = countOf(output, "Progress: ");
+        Thread.sleep(200);
+        assertThat(countOf(output, "Progress: ")).as("the heartbeat stops with the run").isEqualTo(lines);
+    }
+
+    private static int countOf(CapturedOutput output, String text) {
+        return output.getOut().split(Pattern.quote(text), -1).length - 1;
     }
 
     @Test

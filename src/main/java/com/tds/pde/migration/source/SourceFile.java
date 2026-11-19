@@ -20,6 +20,11 @@ public record SourceFile(FileScanTask task) {
         return task.file().recordCount();
     }
 
+    /** Size of the data file, as recorded in Iceberg metadata. */
+    public long sizeInBytes() {
+        return task.file().fileSizeInBytes();
+    }
+
     public int deleteFileCount() {
         return task.deletes().size();
     }

@@ -16,6 +16,7 @@ import com.tds.pde.migration.source.PlannedPartition;
 import com.tds.pde.migration.source.SourceFile;
 import com.tds.pde.migration.testing.IcebergTestTables;
 import com.tds.pde.migration.testing.InMemoryBlobStore;
+import com.tds.pde.migration.testing.LogCapture;
 import com.tds.pde.migration.testing.ParquetOutput;
 import com.tds.pde.migration.testing.TestProperties;
 import java.io.IOException;
@@ -95,6 +96,7 @@ class DataFileProcessorTest {
         assertThat(blobStore.aborted()).isEmpty();
 
         InMemoryBlobStore.Blob blob = blobStore.blob(run.task(0).target()).orElseThrow();
+        assertThat(result.bytesWritten()).as("size of the target file").isEqualTo(blob.content().length);
         ParquetOutput output = ParquetOutput.of(blob.content(), tempDir);
         assertThat(output.records(ORDERS)).containsExactlyElementsOf(rows);
 
@@ -144,6 +146,66 @@ class DataFileProcessorTest {
     }
 
     @Test
+    void appliesAnEqualityDeleteOnAColumnDroppedAfterTheMigratedSnapshot() throws IOException {
+        Table table = IcebergTestTables.create(tempDir.resolve("orders"), ORDERS, PartitionSpec.unpartitioned());
+        IcebergTestTables.append(table, orders("EU", 0, 1));
+        IcebergTestTables.append(table, orders("US", 2, 3));
+        table.newRowDelta().addDeletes(equalityDeletesOnRegion(table, "EU")).commit();
+        long snapshotWithDelete = table.currentSnapshot().snapshotId();
+        table.updateSchema().deleteColumn("region").commit();
+
+        // Time travel: the snapshot's own schema still has the column the delete keys on.
+        Run run = planAt(table, snapshotWithDelete);
+        FileTask euFile = run.tasks().stream().filter(task -> task.source().deleteFileCount() > 0).findFirst()
+                .orElseThrow();
+        FileResult eu = processor.process(run.context(), euFile, FileProgressListener.NONE);
+
+        assertThat(eu.succeeded()).as("failure: %s", eu.failureReason()).isTrue();
+        assertThat(eu.recordsDeleted()).isEqualTo(2);
+        assertThat(eu.recordsWritten()).isZero();
+    }
+
+    @Test
+    void appliesAnEqualityDeleteOnAColumnDroppedBeforeTheMigratedSnapshot() throws IOException {
+        Table table = IcebergTestTables.create(tempDir.resolve("orders"), ORDERS, PartitionSpec.unpartitioned());
+        IcebergTestTables.append(table, orders("EU", 0, 1));
+        IcebergTestTables.append(table, orders("US", 2, 3));
+        table.newRowDelta().addDeletes(equalityDeletesOnRegion(table, "EU")).commit();
+        table.updateSchema().deleteColumn("region").commit();
+        IcebergTestTables.append(table, List.of(orderWithoutRegion(table, 4)));
+        long snapshot = table.currentSnapshot().snapshotId();
+
+        Run run = planAt(table, snapshot);
+        List<FileResult> results = run.tasks().stream()
+                .map(task -> processor.process(run.context(), task, FileProgressListener.NONE)).toList();
+
+        assertThat(results).allSatisfy(result -> assertThat(result.succeeded())
+                .as("failure: %s", result.failureReason()).isTrue());
+        assertThat(results).extracting(FileResult::recordsWritten).containsExactlyInAnyOrder(0L, 2L, 1L);
+        assertThat(results).flatExtracting(result -> output(result).records(run.context().source().schema()))
+                .extracting(row -> row.getField("id")).containsExactlyInAnyOrder(2L, 3L, 4L);
+    }
+
+    @Test
+    void appliesAnEqualityDeleteOnAColumnDroppedAfterTheLastSnapshotWhenReadingTheCurrentSnapshot()
+            throws IOException {
+        Table table = IcebergTestTables.create(tempDir.resolve("orders"), ORDERS, PartitionSpec.unpartitioned());
+        IcebergTestTables.append(table, orders("EU", 0, 1));
+        IcebergTestTables.append(table, orders("US", 2, 3));
+        table.newRowDelta().addDeletes(equalityDeletesOnRegion(table, "EU")).commit();
+        table.updateSchema().deleteColumn("region").commit();
+
+        Run run = plan(table, null);
+        List<FileResult> results = run.tasks().stream()
+                .map(task -> processor.process(run.context(), task, FileProgressListener.NONE)).toList();
+
+        assertThat(results).allSatisfy(result -> assertThat(result.succeeded())
+                .as("failure: %s", result.failureReason()).isTrue());
+        assertThat(results).extracting(FileResult::recordsWritten).containsExactlyInAnyOrder(0L, 2L);
+        assertThat(results).extracting(FileResult::recordsDeleted).containsExactlyInAnyOrder(2L, 0L);
+    }
+
+    @Test
     void dropsRowsRemovedByDeletionVectors() throws IOException {
         Table table = IcebergTestTables.create(tempDir.resolve("orders"), ORDERS, PartitionSpec.unpartitioned(), 3);
         DataFile data = IcebergTestTables.append(table, orders("EU", 0, 1, 2));
@@ -175,6 +237,8 @@ class DataFileProcessorTest {
         assertThat(result.recordsWritten()).isZero();
         assertThat(result.recordsDeleted()).isEqualTo(2);
         ParquetOutput output = output(result);
+        assertThat(result.bytesWritten()).isEqualTo(blobStore.blob(result.task().target()).orElseThrow()
+                .content().length).isPositive();
         assertThat(output.standaloneRows()).isEmpty();
         assertThat(output.parquetSchema().getFieldCount()).isEqualTo(ORDERS.columns().size());
     }
@@ -299,10 +363,29 @@ class DataFileProcessorTest {
         List<long[]> reports = new ArrayList<>();
 
         Run run = plan(table, null);
-        processor.process(run.context(), run.task(0), (read, written) -> reports.add(new long[] {read, written}));
+        processor.process(run.context(), run.task(0), (read, written, bytes) -> reports.add(new long[] {read, written, bytes}));
 
         assertThat(reports).extracting(report -> report[1]).containsExactly(1024L, 2048L, 2500L);
         assertThat(reports.getLast()[0]).isEqualTo(2500);
+        assertThat(reports).extracting(report -> report[2]).isSorted();
+        assertThat(reports.getLast()[2]).as("the final report is the size of the target file")
+                .isEqualTo(blobStore.blob(run.task(0).target()).orElseThrow().content().length);
+    }
+
+    @Test
+    void logsTheSizesAndSpeedOfACompletedFile() {
+        Table table = IcebergTestTables.create(tempDir.resolve("orders"), ORDERS, PartitionSpec.unpartitioned());
+        DataFile data = IcebergTestTables.append(table, orders("EU", 1, 2, 3));
+        Run run = plan(table, null);
+
+        try (LogCapture logs = new LogCapture(DataFileProcessor.class.getName())) {
+            FileResult result = processor.process(run.context(), run.task(0), FileProgressListener.NONE);
+
+            assertThat(logs.messagesStartingWith("Source file completed: ")).singleElement()
+                    .satisfies(line -> assertThat(line).contains("recordsWritten=3 recordsDeleted=0 sourceBytes=" + data.fileSizeInBytes()
+                            + " targetBytes=" + result.bytesWritten() + " durationMs=")
+                    .containsPattern("readMiBPerSecond=(\\d+\\.\\d|n/a)$"));
+        }
     }
 
     @Test
@@ -328,10 +411,20 @@ class DataFileProcessorTest {
         return processor.process(run.context(), run.task(0), FileProgressListener.NONE);
     }
 
+    private Run planAt(Table table, long snapshotId) {
+        MigrationPlan plan = metadataReader.plan(table.location(), snapshotId);
+        RunContext context = new RunContext("run-1", plan.table(), OutputSchema.unchanged(plan.table().schema()));
+        return new Run(context, tasks(plan));
+    }
+
     private Run plan(Table table, OutputSchema outputSchema) {
         MigrationPlan plan = metadataReader.plan(table.location(), null);
         RunContext context = new RunContext("run-1", plan.table(),
                 outputSchema == null ? OutputSchema.unchanged(plan.table().schema()) : outputSchema);
+        return new Run(context, tasks(plan));
+    }
+
+    private static List<FileTask> tasks(MigrationPlan plan) {
         TargetPathResolver paths = new TargetPathResolver();
         List<FileTask> tasks = new ArrayList<>();
         for (PlannedPartition partition : plan.partitions()) {
@@ -340,7 +433,7 @@ class DataFileProcessorTest {
                         file.location())));
             }
         }
-        return new Run(context, tasks);
+        return tasks;
     }
 
     private record Run(RunContext context, List<FileTask> tasks) {
@@ -399,6 +492,38 @@ class DataFileProcessorTest {
             for (long id : ids) {
                 GenericRecord key = GenericRecord.create(deleteSchema);
                 key.setField("id", id);
+                writer.write(key);
+            }
+        }
+        return writer.toDeleteFile();
+    }
+
+    private static Record orderWithoutRegion(Table table, long id) {
+        GenericRecord row = GenericRecord.create(table.schema());
+        row.setField("id", id);
+        row.setField("amount", new BigDecimal("12.50"));
+        row.setField("ordered_at", OffsetDateTime.of(2026, 1, 15, 10, 0, 0, 0, ZoneOffset.UTC));
+        row.setField("ship_date", LocalDate.of(2026, 1, 17));
+        row.setField("tags", List.of("gift"));
+        return row;
+    }
+
+    private DeleteFile equalityDeletesOnRegion(Table table, String... regions) throws IOException {
+        Schema deleteSchema = table.schema().select("region");
+        EqualityDeleteWriter<Record> writer = Parquet.writeDeletes(
+                        table.io().newOutputFile(tempDir.resolve("orders/data/eq-region-deletes.parquet").toUri()
+                                .toString()))
+                .forTable(table)
+                .withSpec(table.spec())
+                .rowSchema(deleteSchema)
+                .equalityFieldIds(2)
+                .createWriterFunc(GenericParquetWriter::create)
+                .overwrite()
+                .buildEqualityWriter();
+        try (writer) {
+            for (String region : regions) {
+                GenericRecord key = GenericRecord.create(deleteSchema);
+                key.setField("region", region);
                 writer.write(key);
             }
         }

@@ -9,18 +9,20 @@ import org.jspecify.annotations.Nullable;
  *
  * @param physicalRowsRead rows read from the source file before deletes
  * @param recordsWritten   live rows written to the target file
+ * @param bytesWritten     size of the target file
  * @param error            why the file failed; {@code null} when it succeeded
  */
 public record FileResult(FileTask task, boolean succeeded, long physicalRowsRead, long recordsWritten,
-                         Duration duration, @Nullable Exception error) {
+                         long bytesWritten, Duration duration, @Nullable Exception error) {
 
-    static FileResult succeeded(FileTask task, long physicalRowsRead, long recordsWritten, Duration duration) {
-        return new FileResult(task, true, physicalRowsRead, recordsWritten, duration, null);
+    static FileResult succeeded(FileTask task, long physicalRowsRead, long recordsWritten, long bytesWritten,
+                                Duration duration) {
+        return new FileResult(task, true, physicalRowsRead, recordsWritten, bytesWritten, duration, null);
     }
 
     static FileResult failed(FileTask task, long physicalRowsRead, long recordsWritten, Duration duration,
                              Exception error) {
-        return new FileResult(task, false, physicalRowsRead, recordsWritten, duration, error);
+        return new FileResult(task, false, physicalRowsRead, recordsWritten, 0, duration, error);
     }
 
     /** Rows dropped because a delete file removed them. */

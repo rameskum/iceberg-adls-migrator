@@ -91,6 +91,15 @@ class MigrationApplicationTest {
     }
 
     @Test
+    void rejectsTheRetiredRecordProgressIntervalBeforeAnythingRuns() {
+        String[] args = java.util.stream.Stream.concat(java.util.Arrays.stream(args("0e9c1a5e-4c55-4a3b-9f3e-1c2a7d8b6e01")),
+                java.util.stream.Stream.of("--migration.progress.log-every-records=100000")).toArray(String[]::new);
+
+        assertThatThrownBy(() -> MigrationApplication.run(applicationTrackingClose(new AtomicBoolean()), args))
+                .hasStackTraceContaining("migration.progress.log-every-records");
+    }
+
+    @Test
     void rejectsParametersOutsideTheKnownPrefixes() {
         assertThatThrownBy(() -> MigrationApplication.run(applicationTrackingClose(new AtomicBoolean()),
                 "--migraton.run-id=20261117-103000-ab12cd"))

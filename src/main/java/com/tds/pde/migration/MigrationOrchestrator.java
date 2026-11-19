@@ -83,18 +83,20 @@ public class MigrationOrchestrator {
         BlobStore blobStore = blobStoreFactory.open(location);
         try (RunLock lock = blobStore.acquireLock(location.blobName(RunStarter.BOOKKEEPING_FOLDER + "/lock"))) {
             StartedRun run = runStarter.start(source, target, location, blobStore);
-            MigrationProgressTracker progress = new MigrationProgressTracker(properties.progress());
-            progress.start(run.plan().totalRecords(), run.plan().totalFiles(), run.plan().totalPartitions());
-            try {
-                execute(run, location, blobStore, lock, progress);
-            } catch (MigrationFailedException e) {
-                throw e;
-            } catch (LockUnavailableException e) {
-                // Another run may own this run's state now; leave it to that run.
-                throw e;
-            } catch (RuntimeException e) {
-                recordFailure(run, progress, e.getMessage());
-                throw e;
+            try (MigrationProgressTracker progress = new MigrationProgressTracker(properties.progress())) {
+                progress.start(run.plan().totalRecords(), run.plan().totalBytes(), run.plan().totalFiles(),
+                        run.plan().totalPartitions());
+                try {
+                    execute(run, location, blobStore, lock, progress);
+                } catch (MigrationFailedException e) {
+                    throw e;
+                } catch (LockUnavailableException e) {
+                    // Another run may own this run's state now; leave it to that run.
+                    throw e;
+                } catch (RuntimeException e) {
+                    recordFailure(run, progress, e.getMessage());
+                    throw e;
+                }
             }
         }
     }
@@ -108,10 +110,10 @@ public class MigrationOrchestrator {
                 : Map.of();
 
         log.info("Migration overview: runId={} resumed={} table={} snapshotId={}\n  Total partitions: {}\n"
-                        + "  Total data files: {}\n  Total records: {}\n  Delete files: {}\n  Target: {}",
+                        + "  Total data files: {}\n  Total records: {}\n  Total bytes: {}\n  Delete files: {}\n  Target: {}",
                 run.runId(), run.resumed(), run.plan().table().location(), run.plan().table().snapshotId(),
                 run.plan().totalPartitions(), run.plan().totalFiles(), run.plan().totalRecords(),
-                run.plan().totalDeleteFiles(), run.run().targetLocation());
+                run.plan().totalBytes(), run.plan().totalDeleteFiles(), run.run().targetLocation());
         if (!published.isEmpty()) {
             log.info("Resuming after already published work:\n  {}", progress.summary());
         }
@@ -167,7 +169,8 @@ public class MigrationOrchestrator {
                             task.source().location(), task.target());
                     outcomes.record(FileOutcome.completed(sourcePath, counts.recordsWritten()));
                 }
-                progress.fileAlreadyCompleted(counts.physicalRowsRead(), counts.recordsWritten());
+                progress.fileAlreadyCompleted(counts.physicalRowsRead(), counts.recordsWritten(),
+                        task.source().sizeInBytes());
             }
             if (published.keySet().containsAll(keys(partition))) {
                 progress.partitionAlreadyCompleted();
