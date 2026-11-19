@@ -41,7 +41,7 @@ Databricks job ──app_args──▶ team launcher (isolated class loader) ─
 | `MigrationApplication` | Entry point; closes the Spring context and rethrows failures; never calls `System.exit` |
 | `MigrationOrchestrator` | Run lifecycle: datasets, run start, heartbeat, file copying, final status and summary |
 | `RunStarter` | Decides whether a run may start, plans it, claims the control row; cleans the target and records the run's files |
-| `RunClaim` | The run's ownership of the control row: renews the heartbeat and progress, is checked before each file and each publish, records how the run ended |
+| `RunClaim` | The run's ownership of the control row: renews the heartbeat and progress, is checked before each target delete of a clean, each file and each publish, records how the run ended |
 | `IcebergMetadataReader` | Loads the table by path, pins the snapshot, plans files, groups them by partition, validates |
 | `TargetSchemaValidator` | Checks the target schema against the Iceberg schema; decides string conversions |
 | `FileRunner` | Copies up to `parallel-files` files at once: claim check, copy, count, record the outcome; failure policy |
@@ -272,8 +272,8 @@ withdraws its row, and if both see two rows both stop.
 `heartbeat_at` and writes the progress, if the row still names the run. A run whose row names another run id has
 lost the migration, to a run that cleaned the target after its heartbeat went stale; so has a run that could not
 renew its heartbeat for half of `heartbeat-timeout`, as another run may clean the target from the full timeout on.
-The claim is checked before each file starts and again immediately before each file is published, so such a run
-publishes nothing more and stops without writing the migration's state. Setting the Databricks job's *Maximum
+The claim is checked before each blob a clean deletes, before each file starts and again immediately before each file
+is published, so such a run deletes and publishes nothing more and stops without writing the migration's state. Setting the Databricks job's *Maximum
 concurrent runs* to 1 adds a second guard.
 
 **Publishing a file is atomic.** Every target blob is committed in one Put Block List together with its metadata
