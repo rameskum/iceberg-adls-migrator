@@ -137,6 +137,17 @@ public class InMemoryState {
             return owning.size();
         }
 
+        @Override
+        public long deleteSupersededFiles(String targetLocation) {
+            List<String> superseded = runs.values().stream()
+                    .filter(run -> run.targetLocation().equals(targetLocation)
+                            && run.status() == RunRecord.Status.SUPERSEDED)
+                    .map(RunRecord::runId).toList();
+            int before = files.size();
+            files.values().removeIf(file -> superseded.contains(file.runId()));
+            return before - files.size();
+        }
+
         /**
          * Makes the next file row insert record only its first {@code rows} rows and then fail, as if the job died
          * part way through recording a new run's files.

@@ -254,6 +254,8 @@ class RunStarterTest {
         assertThat(fresh.resumed()).isFalse();
         assertThat(fresh.runId()).isNotEqualTo(first.runId());
         assertThat(state.findRun(first.runId()).orElseThrow().status()).isEqualTo(RunRecord.Status.SUPERSEDED);
+        assertThat(state.findFiles(first.runId())).as("file rows of the superseded run").isEmpty();
+        assertThat(state.findFiles(fresh.runId())).hasSize(3);
         assertThat(blobStore.blobs().keySet()).containsExactlyInAnyOrder(LOCK, "sales/orders-archive/keep.parquet");
     }
 

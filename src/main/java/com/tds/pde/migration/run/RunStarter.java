@@ -42,7 +42,8 @@ import org.springframework.stereotype.Component;
  * Decides which run to execute and records it before any file is processed:
  * <ul>
  *   <li>{@code migration.run-id} set: resume that run;</li>
- *   <li>{@code migration.target.clean=true}: delete the target, supersede earlier runs, start fresh;</li>
+ *   <li>{@code migration.target.clean=true}: delete the target, supersede earlier runs and delete their file
+ *       rows, start fresh;</li>
  *   <li>otherwise: resume the latest unfinished run for this source and target, or start a new run into an
  *       empty target.</li>
  * </ul>
@@ -233,8 +234,9 @@ public class RunStarter {
                 bytes);
         blobs.forEach(blob -> blobStore.delete(blob.name()));
         long superseded = state.supersedeRuns(targetLocation);
-        log.info("Target cleaned: target={} deletedBlobs={} supersededRuns={}", location, blobs.size(),
-                superseded);
+        long deletedFileRows = state.deleteSupersededFiles(targetLocation);
+        log.info("Target cleaned: target={} deletedBlobs={} supersededRuns={} deletedFileRows={}", location,
+                blobs.size(), superseded, deletedFileRows);
     }
 
     /** Everything under the target prefix except the migration's own bookkeeping, such as the lock. */

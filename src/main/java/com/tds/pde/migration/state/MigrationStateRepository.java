@@ -138,6 +138,26 @@ public class MigrationStateRepository {
                 "WHEN MATCHED THEN UPDATE SET status = 'SUPERSEDED'");
     }
 
+    /**
+     * Deletes the file rows of every superseded run of the target: their output is gone and they cannot be resumed,
+     * so the rows only slow down the shared file table. The run rows stay as the target's history.
+     *
+     * @return file rows deleted when the engine reports it, otherwise -1
+     */
+    public long deleteSupersededFiles(String targetLocation) {
+        List<Map<String, ?>> runs = select("find superseded runs", runTable, List.of("run_id"),
+                "WHERE target_location = :target AND status = 'SUPERSEDED'", Map.of("target", targetLocation))
+                .stream().<Map<String, ?>>map(row -> Map.of("run_id", row.get("run_id"))).toList();
+        long deleted = 0;
+        for (int start = 0; start < runs.size(); start += FILE_ROWS_PER_MERGE) {
+            List<Map<String, ?>> chunk = runs.subList(start, Math.min(runs.size(), start + FILE_ROWS_PER_MERGE));
+            long affected = merge("delete file rows of " + chunk.size() + " superseded runs", fileTable, chunk,
+                    "t.run_id = s.run_id", "WHEN MATCHED THEN DELETE");
+            deleted = affected < 0 || deleted < 0 ? -1 : deleted + affected;
+        }
+        return deleted;
+    }
+
     // ---- file table -------------------------------------------------------------------------------------------
 
     public void insertFiles(List<FileRecord> files) {
@@ -198,7 +218,12 @@ public class MigrationStateRepository {
 
     private List<Map<String, Object>> select(String operation, StateTable table, String condition,
                                              Map<String, ?> params) {
-        return retrying(operation, () -> sql.query("SELECT " + String.join(", ", table.columnNames()) + " FROM "
+        return select(operation, table, table.columnNames(), condition, params);
+    }
+
+    private List<Map<String, Object>> select(String operation, StateTable table, List<String> columns,
+                                             String condition, Map<String, ?> params) {
+        return retrying(operation, () -> sql.query("SELECT " + String.join(", ", columns) + " FROM "
                 + table.name() + " " + condition, params));
     }
 

@@ -180,6 +180,18 @@ fact is stored once; the rest is a join away.
 | run (`migration_run`) | run | `run_id`, `status` (`RUNNING`, `SUCCEEDED`, `FAILED`, `SUPERSEDED`), the migration's `source_dataset_id` and `target_dataset_id`, the resolved `source_location` and `target_location`, and what a resume must reproduce: `snapshot_id`, `source_schema_json`, `output_schema_json`; `started_at`, `finished_at`, `error` |
 | file (`migration_file`) | source data file of a run | `run_id`, `source_path`, `target_path`, `physical_records`, `status` (`PENDING`, `COMPLETED`, `FAILED`), `records_written` (the other physical records were deleted), `error` |
 
+**Clustering.** The run and file tables grow with every migration, so they use liquid clustering on the column
+their reads and merges select on: the file table `CLUSTER BY (run_id)`, the run table `CLUSTER BY
+(target_location)`. A file outcome merge or a resume's read then touches only the files holding that run's rows,
+which keeps it fast and keeps parallel jobs from conflicting as the tables grow. Liquid clustering reorganises data
+when `OPTIMIZE` runs, which predictive optimization does for Unity Catalog managed tables; otherwise schedule
+`OPTIMIZE` on the two tables. `CREATE TABLE IF NOT EXISTS` leaves tables created before clustering existed as they
+are: cluster those once with `ALTER TABLE <file-table> CLUSTER BY (run_id)` and
+`ALTER TABLE <run-table> CLUSTER BY (target_location)`.
+
+**Retention.** A clean start deletes the file rows of every superseded run of its target: their output is gone
+and they can never be resumed. Their run rows stay, as the target's history. File rows of other runs are kept.
+
 A run belongs to the migration with its dataset pair, and the control row points at the latest run. The control row
 is written when a run starts and when it ends; progress while a run is going comes from its file rows, which are
 updated as each file completes:
@@ -211,6 +223,7 @@ definition, registered as a temporary view and merged on the table's key:
 | Control row | `WHEN MATCHED THEN UPDATE SET * WHEN NOT MATCHED THEN INSERT *` |
 | New run, its file rows | `WHEN NOT MATCHED THEN INSERT *`, so a retry after a commit that did land adds nothing |
 | Run status, file outcome, superseding runs | `WHEN MATCHED THEN UPDATE SET` the changed columns; a run or file outcome must match exactly one row |
+| File rows of superseded runs, on a clean start | `WHEN MATCHED THEN DELETE`, merged on `run_id` |
 
 The statements run through the cluster's `SparkSession`, reached by reflection because the launcher's isolated class
 loader hides the runtime's classes; each call switches the thread's context class loader to Spark's, because Spark and
@@ -226,7 +239,7 @@ What happens depends on `migration.run-id` and `migration.target.clean`:
 |---|---|---|
 | set | `false` | Resume that run. It must copy the same source to the same target and not be superseded |
 | empty | `false` | Resume the latest RUNNING or FAILED run for this source and target; otherwise start a new run, which requires an empty target |
-| empty | `true` | Delete everything under the target prefix (refused at a container root), mark earlier runs `SUPERSEDED`, start a new run |
+| empty | `true` | Delete everything under the target prefix (refused at a container root), mark earlier runs `SUPERSEDED` and delete their file rows, start a new run |
 | set | `true` | Refused |
 
 So a Databricks task retry or *Repair run*, which re-sends the same parameters, simply continues where the run
@@ -322,7 +335,7 @@ Migration completed: runId=20261117-204240-0fef7d
 - **Unit tests** for configuration, schema matching, file naming, progress, state store, run choice.
 - **End-to-end tests** run the whole application against real Iceberg tables: deletes of every kind, schema
   changes, empty and never-written tables, fail-fast, continue, resume, recovery of completions the state store
-  missed, lock conflicts and loss, clean.
+  missed and of file rows a crash kept from being written, lock conflicts and loss, clean.
 - **HDFS:** one end-to-end test reads the source from an in-process HDFS (`MiniDFSCluster`).
 - **Bounded memory:** `BoundedMemoryTest` (tag `memory`) runs in its own JVM with `-Xmx128m` and migrates two
   source files, each larger than the heap, at the same time.
