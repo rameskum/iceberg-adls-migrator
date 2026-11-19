@@ -3,9 +3,14 @@ package com.tds.pde.migration.processing;
 import com.tds.pde.migration.target.BlobStore;
 import java.net.URLEncoder;
 import java.nio.charset.StandardCharsets;
+import java.util.Collection;
+import java.util.HashMap;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.function.Function;
+import java.util.stream.Collectors;
+import java.util.stream.Stream;
 
 /**
  * The metadata committed with every target blob, which makes a published blob its own proof of completion:
@@ -39,18 +44,38 @@ public final class PublishedFile {
     }
 
     /**
-     * @return the counts recorded at publish time when the task's target blob was published by this run
-     *         from this source file at this snapshot; empty otherwise
+     * Finds which tasks are already done with one listing of the blobs under {@code targetPrefix}, matched in
+     * memory: a task is done when its target blob was published by this run from its source file at this snapshot.
+     *
+     * @return the counts recorded at publish time, by source path of the done tasks
      */
-    public static Optional<Counts> find(BlobStore blobStore, RunContext run, FileTask task) {
-        return blobStore.metadata(task.target())
-                .filter(metadata -> Objects.equals(metadata.get(RUN_ID), run.runId())
-                        && Objects.equals(metadata.get(SOURCE_FILE), encode(task.source().location()))
-                        && Objects.equals(metadata.get(SOURCE_SNAPSHOT_ID), String.valueOf(run.source().snapshotId()))
-                        && Objects.equals(metadata.get(PHYSICAL_RECORDS), String.valueOf(task.source().recordCount()))
-                        && metadata.get(RECORDS_WRITTEN) != null)
-                .map(metadata -> new Counts(Long.parseLong(metadata.get(PHYSICAL_RECORDS)),
-                        Long.parseLong(metadata.get(RECORDS_WRITTEN))));
+    public static Map<String, Counts> find(BlobStore blobStore, String targetPrefix, RunContext run,
+                                           Collection<FileTask> tasks) {
+        Map<String, FileTask> byTarget = tasks.stream()
+                .collect(Collectors.toMap(FileTask::target, Function.identity()));
+        Map<String, Counts> published = new HashMap<>();
+        try (Stream<BlobStore.BlobMetadata> blobs = blobStore.listWithMetadata(targetPrefix)) {
+            blobs.forEach(blob -> {
+                FileTask task = byTarget.get(blob.name());
+                if (task != null) {
+                    counts(blob.metadata(), run, task)
+                            .ifPresent(counts -> published.put(task.source().location(), counts));
+                }
+            });
+        }
+        return published;
+    }
+
+    private static Optional<Counts> counts(Map<String, String> metadata, RunContext run, FileTask task) {
+        if (Objects.equals(metadata.get(RUN_ID), run.runId())
+                && Objects.equals(metadata.get(SOURCE_FILE), encode(task.source().location()))
+                && Objects.equals(metadata.get(SOURCE_SNAPSHOT_ID), String.valueOf(run.source().snapshotId()))
+                && Objects.equals(metadata.get(PHYSICAL_RECORDS), String.valueOf(task.source().recordCount()))
+                && metadata.get(RECORDS_WRITTEN) != null) {
+            return Optional.of(new Counts(Long.parseLong(metadata.get(PHYSICAL_RECORDS)),
+                    Long.parseLong(metadata.get(RECORDS_WRITTEN))));
+        }
+        return Optional.empty();
     }
 
     private static String encode(String value) {

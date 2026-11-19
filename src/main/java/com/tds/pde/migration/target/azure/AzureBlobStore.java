@@ -5,6 +5,7 @@ import com.azure.storage.blob.BlobClient;
 import com.azure.storage.blob.BlobContainerClient;
 import com.azure.storage.blob.models.BlobErrorCode;
 import com.azure.storage.blob.models.BlobItem;
+import com.azure.storage.blob.models.BlobListDetails;
 import com.azure.storage.blob.models.BlobStorageException;
 import com.azure.storage.blob.models.ListBlobsOptions;
 import com.azure.storage.blob.specialized.BlobLeaseClient;
@@ -16,7 +17,7 @@ import com.tds.pde.migration.target.StagedUpload;
 import java.time.Duration;
 import java.util.List;
 import java.util.Map;
-import java.util.Optional;
+import java.util.stream.Stream;
 import lombok.extern.slf4j.Slf4j;
 
 /**
@@ -25,6 +26,9 @@ import lombok.extern.slf4j.Slf4j;
  */
 @Slf4j
 public final class AzureBlobStore implements BlobStore {
+
+    /** The most blobs one List Blobs call returns. */
+    private static final int LIST_PAGE_SIZE = 5_000;
 
     private final BlobContainerClient container;
     private final int blockSize;
@@ -42,22 +46,20 @@ public final class AzureBlobStore implements BlobStore {
     }
 
     @Override
-    public Optional<Map<String, String>> metadata(String blobName) {
-        try {
-            return Optional.of(container.getBlobClient(blobName).getProperties().getMetadata());
-        } catch (BlobStorageException e) {
-            if (e.getErrorCode() == BlobErrorCode.BLOB_NOT_FOUND || e.getStatusCode() == 404) {
-                return Optional.empty();
-            }
-            throw e;
-        }
+    public List<BlobInfo> list(String prefix) {
+        return container.listBlobs(new ListBlobsOptions().setPrefix(prefix).setMaxResultsPerPage(LIST_PAGE_SIZE),
+                        null).stream()
+                .map(AzureBlobStore::toInfo)
+                .toList();
     }
 
     @Override
-    public List<BlobInfo> list(String prefix) {
-        return container.listBlobs(new ListBlobsOptions().setPrefix(prefix), null).stream()
-                .map(AzureBlobStore::toInfo)
-                .toList();
+    public Stream<BlobMetadata> listWithMetadata(String prefix) {
+        ListBlobsOptions options = new ListBlobsOptions().setPrefix(prefix).setMaxResultsPerPage(LIST_PAGE_SIZE)
+                .setDetails(new BlobListDetails().setRetrieveMetadata(true));
+        return container.listBlobs(options, null).stream()
+                .map(item -> new BlobMetadata(item.getName(),
+                        item.getMetadata() == null ? Map.of() : item.getMetadata()));
     }
 
     @Override
@@ -71,8 +73,8 @@ public final class AzureBlobStore implements BlobStore {
         try {
             blob.getBlockBlobClient().upload(BinaryData.fromBytes(new byte[0]), false);
         } catch (BlobStorageException e) {
-            // Already there from an earlier run, possibly leased right now; the lease decides.
-            if (e.getStatusCode() != 409) {
+            // Already there from an earlier run (409), or leased right now (412 LeaseIdMissing); the lease decides.
+            if (e.getStatusCode() != 409 && e.getErrorCode() != BlobErrorCode.LEASE_ID_MISSING) {
                 // The first request of a run: turn configuration and permission problems into a readable message.
                 throw new IllegalStateException("Cannot write to container '" + container.getBlobContainerName()
                         + "' of " + container.getAccountUrl() + ": " + e.getStatusCode() + " " + e.getErrorCode()

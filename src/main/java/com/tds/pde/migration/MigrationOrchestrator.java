@@ -27,10 +27,8 @@ import com.tds.pde.migration.state.FileRecord;
 import com.tds.pde.migration.state.MigrationStateRepository;
 import com.tds.pde.migration.state.RunRecord;
 import java.time.Instant;
-import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.Optional;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Component;
@@ -88,7 +86,7 @@ public class MigrationOrchestrator {
             MigrationProgressTracker progress = new MigrationProgressTracker(properties.progress());
             progress.start(run.plan().totalRecords(), run.plan().totalFiles(), run.plan().totalPartitions());
             try {
-                execute(run, blobStore, lock, progress);
+                execute(run, location, blobStore, lock, progress);
             } catch (MigrationFailedException e) {
                 throw e;
             } catch (LockUnavailableException e) {
@@ -101,11 +99,12 @@ public class MigrationOrchestrator {
         }
     }
 
-    private void execute(StartedRun run, BlobStore blobStore, RunLock lock, MigrationProgressTracker progress) {
+    private void execute(StartedRun run, AzureLocation location, BlobStore blobStore, RunLock lock,
+                         MigrationProgressTracker progress) {
         FileOutcomeRecorder outcomes = new FileOutcomeRecorder(state, run.runId(),
                 properties.state().outcomeBatchSize(), properties.state().outcomeFlushInterval());
         Map<String, PublishedFile.Counts> published = run.resumed()
-                ? restorePublished(run, blobStore, progress, outcomes)
+                ? restorePublished(run, location, blobStore, progress, outcomes)
                 : Map.of();
 
         log.info("Migration overview: runId={} resumed={} table={} snapshotId={}\n  Total partitions: {}\n"
@@ -146,27 +145,29 @@ public class MigrationOrchestrator {
 
     /**
      * Counts files a resumed run had already published as done. The blob's metadata is the proof: a file whose
-     * completion the state store missed is recorded now instead of being written again.
+     * completion the state store missed is recorded now instead of being written again. The target is listed once,
+     * whatever the number of files.
      */
-    private Map<String, PublishedFile.Counts> restorePublished(StartedRun run, BlobStore blobStore,
+    private Map<String, PublishedFile.Counts> restorePublished(StartedRun run, AzureLocation location,
+                                                               BlobStore blobStore,
                                                                MigrationProgressTracker progress,
                                                                FileOutcomeRecorder outcomes) {
-        Map<String, PublishedFile.Counts> published = new HashMap<>();
+        Map<String, PublishedFile.Counts> published = PublishedFile.find(blobStore, location.blobPrefix(),
+                run.context(), run.partitions().stream().flatMap(partition -> partition.files().stream()).toList());
         for (PartitionTasks partition : run.partitions()) {
             for (FileTask task : partition.files()) {
                 String sourcePath = task.source().location();
-                Optional<PublishedFile.Counts> counts = PublishedFile.find(blobStore, run.context(), task);
-                if (counts.isEmpty()) {
+                PublishedFile.Counts counts = published.get(sourcePath);
+                if (counts == null) {
                     continue;
                 }
                 FileRecord stored = run.fileStates().get(sourcePath);
                 if (stored == null || stored.status() != FileRecord.Status.COMPLETED) {
                     log.info("Source file was already published; recording it as completed: source={} target={}",
                             task.source().location(), task.target());
-                    outcomes.record(FileOutcome.completed(sourcePath, counts.get().recordsWritten()));
+                    outcomes.record(FileOutcome.completed(sourcePath, counts.recordsWritten()));
                 }
-                published.put(sourcePath, counts.get());
-                progress.fileAlreadyCompleted(counts.get().physicalRowsRead(), counts.get().recordsWritten());
+                progress.fileAlreadyCompleted(counts.physicalRowsRead(), counts.recordsWritten());
             }
             if (published.keySet().containsAll(keys(partition))) {
                 progress.partitionAlreadyCompleted();

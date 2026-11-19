@@ -15,6 +15,7 @@ import com.tds.pde.migration.schema.TargetSchemaValidator;
 import com.tds.pde.migration.source.IcebergMetadataReader;
 import com.tds.pde.migration.state.FileRecord;
 import com.tds.pde.migration.state.RunRecord;
+import com.tds.pde.migration.state.StateStoreException;
 import com.tds.pde.migration.testing.InMemoryState;
 import com.tds.pde.migration.testing.IcebergTestTables;
 import com.tds.pde.migration.testing.InMemoryBlobStore;
@@ -183,6 +184,54 @@ class RunStarterTest {
     }
 
     @Test
+    void recordsTheMissingFilesOfARunThatDiedBeforeRecordingThemAndResumesIt() {
+        state.crashAfterFileRows(0);
+        assertThatThrownBy(() -> starter(Map.of()).start(source, target(null), LOCATION, blobStore))
+                .isInstanceOf(StateStoreException.class);
+        RunRecord crashed = state.runs().getFirst();
+        assertThat(state.findFiles(crashed.runId())).isEmpty();
+
+        StartedRun resumed = starter(Map.of()).start(source, target(null), LOCATION, blobStore);
+
+        assertThat(resumed.resumed()).isTrue();
+        assertThat(resumed.runId()).isEqualTo(crashed.runId());
+        assertThat(resumed.fileStates()).hasSize(3);
+        assertThat(state.findFiles(crashed.runId())).hasSize(3)
+                .allSatisfy(file -> assertThat(file.status()).isEqualTo(FileRecord.Status.PENDING));
+    }
+
+    @Test
+    void keepsTheRecordedStateOfFilesWhenRecordingTheMissingOnes() {
+        StartedRun first = starter(Map.of()).start(source, target(null), LOCATION, blobStore);
+        List<FileRecord> files = state.findFiles(first.runId());
+        FileRecord done = files.getFirst();
+        state.replaceFile(new FileRecord(done.runId(), done.sourcePath(), done.targetPath(), done.physicalRecords(),
+                FileRecord.Status.COMPLETED, done.physicalRecords(), null));
+        state.removeFile(files.getLast());
+
+        StartedRun resumed = starter(Map.of()).start(source, target(null), LOCATION, blobStore);
+
+        assertThat(resumed.fileStates().get(done.sourcePath()).status()).isEqualTo(FileRecord.Status.COMPLETED);
+        assertThat(resumed.fileStates().get(files.getLast().sourcePath()).status())
+                .isEqualTo(FileRecord.Status.PENDING);
+        assertThat(state.findFiles(first.runId())).hasSize(3);
+    }
+
+    @Test
+    void refusesToResumeWhenARecordedFileIsNoLongerPlanned() {
+        StartedRun first = starter(Map.of()).start(source, target(null), LOCATION, blobStore);
+        state.updateRunStatus(first.runId(), RunRecord.Status.FAILED, null, null);
+        state.insertFiles(List.of(new FileRecord(first.runId(), "hdfs://nn/expired.parquet",
+                "sales/orders/expired.parquet", 1, FileRecord.Status.PENDING, null, null)));
+
+        assertThatThrownBy(() -> starter(Map.of()).start(source, target(null), LOCATION, blobStore))
+                .isInstanceOf(MigrationFailedException.class)
+                .hasMessageContaining("no longer yields the files run " + first.runId() + " recorded")
+                .hasMessageContaining("no longer planned: hdfs://nn/expired.parquet");
+        assertThat(state.findFiles(first.runId())).hasSize(4);
+    }
+
+    @Test
     void refusesToResumeWithADifferentConfiguredSnapshot() {
         StartedRun first = starter(Map.of()).start(source, target(null), LOCATION, blobStore);
 
@@ -205,6 +254,8 @@ class RunStarterTest {
         assertThat(fresh.resumed()).isFalse();
         assertThat(fresh.runId()).isNotEqualTo(first.runId());
         assertThat(state.findRun(first.runId()).orElseThrow().status()).isEqualTo(RunRecord.Status.SUPERSEDED);
+        assertThat(state.findFiles(first.runId())).as("file rows of the superseded run").isEmpty();
+        assertThat(state.findFiles(fresh.runId())).hasSize(3);
         assertThat(blobStore.blobs().keySet()).containsExactlyInAnyOrder(LOCK, "sales/orders-archive/keep.parquet");
     }
 

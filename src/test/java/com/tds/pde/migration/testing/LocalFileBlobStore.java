@@ -9,14 +9,15 @@ import java.io.UncheckedIOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
+import java.util.Comparator;
 import java.util.List;
 import java.util.Map;
-import java.util.Optional;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.stream.Stream;
 
 /**
  * Blob store on local disk for data too large to keep in memory: uploads stage into a temporary file that a
- * commit moves into place atomically. Supports uploads and metadata only.
+ * commit moves into place atomically. Supports uploads and listing metadata only.
  */
 public final class LocalFileBlobStore implements BlobStore {
 
@@ -79,8 +80,12 @@ public final class LocalFileBlobStore implements BlobStore {
     }
 
     @Override
-    public Optional<Map<String, String>> metadata(String blobName) {
-        return Optional.ofNullable(metadata.get(blobName));
+    public Stream<BlobMetadata> listWithMetadata(String prefix) {
+        return metadata.entrySet().stream()
+                .filter(entry -> entry.getKey().startsWith(prefix))
+                .map(entry -> new BlobMetadata(entry.getKey(), entry.getValue()))
+                .sorted(Comparator.comparing(BlobMetadata::name))
+                .toList().stream();
     }
 
     @Override

@@ -6,6 +6,7 @@ import com.tds.pde.migration.state.FileRecord;
 import com.tds.pde.migration.state.MigrationStateRepository;
 import com.tds.pde.migration.state.RunRecord;
 import com.tds.pde.migration.state.SqlExecutor;
+import com.tds.pde.migration.state.StateStoreException;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Comparator;
@@ -56,6 +57,7 @@ public class InMemoryState {
         private final Map<String, RunRecord> runs = new LinkedHashMap<>();
         private final Map<String, FileRecord> files = new LinkedHashMap<>();
         private final List<Integer> outcomeWrites = new ArrayList<>();
+        private int fileRowsBeforeCrash = -1;
 
         public Store() {
             super(NO_SQL, TestProperties.defaults());
@@ -68,6 +70,11 @@ public class InMemoryState {
         /** Replaces a file row as if the state table had been changed behind the run's back. */
         public void replaceFile(FileRecord file) {
             files.put(file.runId() + "/" + file.sourcePath(), file);
+        }
+
+        /** Removes a file row as if it had never been written. */
+        public void removeFile(FileRecord file) {
+            files.remove(file.runId() + "/" + file.sourcePath());
         }
 
         @Override
@@ -131,8 +138,36 @@ public class InMemoryState {
         }
 
         @Override
+        public long deleteSupersededFiles(String targetLocation) {
+            List<String> superseded = runs.values().stream()
+                    .filter(run -> run.targetLocation().equals(targetLocation)
+                            && run.status() == RunRecord.Status.SUPERSEDED)
+                    .map(RunRecord::runId).toList();
+            int before = files.size();
+            files.values().removeIf(file -> superseded.contains(file.runId()));
+            return before - files.size();
+        }
+
+        /**
+         * Makes the next file row insert record only its first {@code rows} rows and then fail, as if the job died
+         * part way through recording a new run's files.
+         */
+        public void crashAfterFileRows(int rows) {
+            this.fileRowsBeforeCrash = rows;
+        }
+
+        /** Like the MERGE it stands for: rows already present are left as they are. */
+        @Override
         public void insertFiles(List<FileRecord> newFiles) {
-            newFiles.forEach(this::replaceFile);
+            int crashAfter = fileRowsBeforeCrash;
+            fileRowsBeforeCrash = -1;
+            for (int i = 0; i < newFiles.size(); i++) {
+                if (i == crashAfter) {
+                    throw new StateStoreException("injected crash after " + crashAfter + " file rows", null);
+                }
+                FileRecord file = newFiles.get(i);
+                files.putIfAbsent(file.runId() + "/" + file.sourcePath(), file);
+            }
         }
 
         @Override

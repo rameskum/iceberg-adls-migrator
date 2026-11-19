@@ -62,9 +62,37 @@ public class MigrationStateRepository {
     public void createTablesIfMissing() {
         for (StateTable table : List.of(controlTable, runTable, fileTable)) {
             retrying("create state table " + table.name(), () -> sql.update(table.createStatement(), Map.of()));
+            if (!table.clusterBy().isEmpty()) {
+                cluster(table);
+            }
         }
         log.info("State tables ready: controlTable={} runTable={} fileTable={}", controlTable.name(),
                 runTable.name(), fileTable.name());
+    }
+
+    /**
+     * Brings a table created before its clustering was defined to that clustering. A table already clustered on
+     * exactly those columns is left alone: altering it would be a Delta metadata commit, which conflicts with
+     * parallel jobs' merges. Clustering only speeds the table up, so a failed alter, typically because the job's
+     * identity does not own the table, is tried once and leaves the table as it is.
+     */
+    private void cluster(StateTable table) {
+        Object current = retrying("read clustering of state table " + table.name(),
+                () -> sql.query("DESCRIBE DETAIL " + table.name(), Map.of())).getFirst().get("clusteringColumns");
+        if (table.clusterBy().equals(current)) {
+            return;
+        }
+        String alter = "ALTER TABLE " + table.name() + " CLUSTER BY (" + String.join(", ", table.clusterBy()) + ")";
+        try {
+            sql.update(alter, Map.of());
+        } catch (SqlExecutionException e) {
+            log.warn("Cannot cluster state table, continuing unclustered; to cluster it, run as its owner: {}"
+                            + " table={} clusterBy={} currentClusterBy={} reason={}", alter, table.name(),
+                    table.clusterBy(), current, e.getMessage());
+            return;
+        }
+        log.info("State table clustered: table={} clusterBy={} previousClusterBy={}", table.name(),
+                table.clusterBy(), current);
     }
 
     // ---- control table ----------------------------------------------------------------------------------------
@@ -138,6 +166,26 @@ public class MigrationStateRepository {
                 "WHEN MATCHED THEN UPDATE SET status = 'SUPERSEDED'");
     }
 
+    /**
+     * Deletes the file rows of every superseded run of the target: their output is gone and they cannot be resumed,
+     * so the rows only slow down the shared file table. The run rows stay as the target's history.
+     *
+     * @return file rows deleted when the engine reports it, otherwise -1
+     */
+    public long deleteSupersededFiles(String targetLocation) {
+        List<Map<String, ?>> runs = select("find superseded runs", runTable, List.of("run_id"),
+                "WHERE target_location = :target AND status = 'SUPERSEDED'", Map.of("target", targetLocation))
+                .stream().<Map<String, ?>>map(row -> Map.of("run_id", row.get("run_id"))).toList();
+        long deleted = 0;
+        for (int start = 0; start < runs.size(); start += FILE_ROWS_PER_MERGE) {
+            List<Map<String, ?>> chunk = runs.subList(start, Math.min(runs.size(), start + FILE_ROWS_PER_MERGE));
+            long affected = merge("delete file rows of " + chunk.size() + " superseded runs", fileTable, chunk,
+                    "t.run_id = s.run_id", "WHEN MATCHED THEN DELETE");
+            deleted = affected < 0 || deleted < 0 ? -1 : deleted + affected;
+        }
+        return deleted;
+    }
+
     // ---- file table -------------------------------------------------------------------------------------------
 
     public void insertFiles(List<FileRecord> files) {
@@ -198,7 +246,12 @@ public class MigrationStateRepository {
 
     private List<Map<String, Object>> select(String operation, StateTable table, String condition,
                                              Map<String, ?> params) {
-        return retrying(operation, () -> sql.query("SELECT " + String.join(", ", table.columnNames()) + " FROM "
+        return select(operation, table, table.columnNames(), condition, params);
+    }
+
+    private List<Map<String, Object>> select(String operation, StateTable table, List<String> columns,
+                                             String condition, Map<String, ?> params) {
+        return retrying(operation, () -> sql.query("SELECT " + String.join(", ", columns) + " FROM "
                 + table.name() + " " + condition, params));
     }
 

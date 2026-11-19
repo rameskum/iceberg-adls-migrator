@@ -31,9 +31,11 @@ import java.io.OutputStream;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Random;
 import java.util.UUID;
 import java.util.stream.LongStream;
+import java.util.stream.Stream;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.iceberg.PartitionSpec;
 import org.apache.iceberg.Schema;
@@ -95,16 +97,37 @@ class AzureBlobStoreTest {
             out.write(content, 100, content.length - 100);
         }
 
-        assertThat(store.metadata(name)).isEmpty();
+        assertThat(metadata(store, name)).isEmpty();
         assertThat(store.list(location.prefix())).isEmpty();
 
         upload.commit(Map.of("records_written", "42"));
 
-        assertThat(store.metadata(name)).contains(Map.of("records_written", "42"));
+        assertThat(metadata(store, name)).contains(Map.of("records_written", "42"));
         assertThat(container.getBlobClient(name).downloadContent().toBytes()).isEqualTo(content);
         assertThat(container.getBlobClient(name).getBlockBlobClient().listBlocks(
                 com.azure.storage.blob.models.BlockListType.COMMITTED).getCommittedBlocks()).hasSize(4);
         assertThat(store.list(location.prefix())).containsExactly(new BlobStore.BlobInfo(name, content.length));
+    }
+
+    @Test
+    void listsTheMetadataOfTheCommittedBlobsUnderAPrefixInOneListing() throws IOException {
+        BlobStore store = factory.open(location);
+        String first = location.blobName("region=EU__part-0.parquet");
+        String second = location.blobName("region=US__part-1.parquet");
+        upload(store, second, randomBytes(10), Map.of("migration_run_id", "run-1", "source_file", "hdfs%3A%2F%2Fnn"));
+        upload(store, first, randomBytes(10), Map.of());
+        upload(store, "sales/orders-archive/part-0.parquet", randomBytes(10), Map.of("migration_run_id", "run-0"));
+        StagedUpload staged = store.startUpload(location.blobName("region=EU__part-2.parquet"));
+        try (OutputStream out = staged.outputStream()) {
+            out.write(randomBytes(BLOCK_SIZE * 2));
+        }
+
+        try (Stream<BlobStore.BlobMetadata> blobs = store.listWithMetadata(location.blobPrefix())) {
+            assertThat(blobs).containsExactly(
+                    new BlobStore.BlobMetadata(first, Map.of()),
+                    new BlobStore.BlobMetadata(second,
+                            Map.of("migration_run_id", "run-1", "source_file", "hdfs%3A%2F%2Fnn")));
+        }
     }
 
     @Test
@@ -117,7 +140,7 @@ class AzureBlobStoreTest {
         upload(store, name, second, Map.of("attempt", "2"));
 
         assertThat(container.getBlobClient(name).downloadContent().toBytes()).isEqualTo(second);
-        assertThat(store.metadata(name)).contains(Map.of("attempt", "2"));
+        assertThat(metadata(store, name)).contains(Map.of("attempt", "2"));
     }
 
     @Test
@@ -131,7 +154,7 @@ class AzureBlobStoreTest {
         }
         upload.abort();
 
-        assertThat(store.metadata(name)).isEmpty();
+        assertThat(metadata(store, name)).isEmpty();
         assertThat(store.list("")).isEmpty();
     }
 
@@ -154,7 +177,7 @@ class AzureBlobStoreTest {
         store.delete(name);
         store.delete(name);
 
-        assertThat(store.metadata(name)).isEmpty();
+        assertThat(metadata(store, name)).isEmpty();
     }
 
     @Test
@@ -214,11 +237,18 @@ class AzureBlobStoreTest {
                 FileProgressListener.NONE);
 
         assertThat(result.succeeded()).isTrue();
-        assertThat(store.metadata(task.target()).orElseThrow()).containsEntry("records_written", "5000");
+        assertThat(metadata(store, task.target()).orElseThrow()).containsEntry("records_written", "5000");
         ParquetOutput output = ParquetOutput.of(container.getBlobClient(task.target()).downloadContent().toBytes(),
                 tempDir);
         assertThat(output.standaloneRows()).hasSize(5000);
         assertThat(output.records(schema).getLast().getField("note")).isEqualTo("order-4999");
+    }
+
+    /** The metadata of the named blob, if it is committed, as the resume finds it: through a listing. */
+    private static Optional<Map<String, String>> metadata(BlobStore store, String name) {
+        try (Stream<BlobStore.BlobMetadata> blobs = store.listWithMetadata(name)) {
+            return blobs.filter(blob -> blob.name().equals(name)).map(BlobStore.BlobMetadata::metadata).findFirst();
+        }
     }
 
     private static void upload(BlobStore store, String name, byte[] content, Map<String, String> metadata)

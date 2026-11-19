@@ -20,7 +20,7 @@ public interface SqlExecutor {
     /**
      * Runs a query.
      *
-     * @return one map per row, keyed by column name case-insensitively
+     * @return one map per row, keyed by column name case-insensitively; an array value is a {@link List}
      * @throws SqlExecutionException when the query fails
      */
     List<Map<String, Object>> query(String sql, Map<String, ?> params);

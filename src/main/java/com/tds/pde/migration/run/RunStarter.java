@@ -22,11 +22,14 @@ import java.time.Instant;
 import java.time.ZoneOffset;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.HashSet;
 import java.util.HexFormat;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.Set;
 import java.util.function.Function;
 import java.util.stream.Collectors;
 import lombok.RequiredArgsConstructor;
@@ -39,7 +42,8 @@ import org.springframework.stereotype.Component;
  * Decides which run to execute and records it before any file is processed:
  * <ul>
  *   <li>{@code migration.run-id} set: resume that run;</li>
- *   <li>{@code migration.target.clean=true}: delete the target, supersede earlier runs, start fresh;</li>
+ *   <li>{@code migration.target.clean=true}: delete the target, supersede earlier runs and delete their file
+ *       rows, start fresh;</li>
  *   <li>otherwise: resume the latest unfinished run for this source and target, or start a new run into an
  *       empty target.</li>
  * </ul>
@@ -140,9 +144,16 @@ public class RunStarter {
         }
 
         List<PartitionTasks> partitions = tasks(plan, location);
-        Map<String, FileRecord> stored = state.findFiles(run.runId()).stream()
-                .collect(Collectors.toMap(FileRecord::sourcePath, Function.identity()));
-        requireSameFiles(run, partitions, stored);
+        Map<String, FileRecord> stored = new HashMap<>(state.findFiles(run.runId()).stream()
+                .collect(Collectors.toMap(FileRecord::sourcePath, Function.identity())));
+        List<FileRecord> unrecorded = requireSameFiles(run, partitions, stored);
+        if (!unrecorded.isEmpty()) {
+            // The run started but died before all its file rows were written; finish what it began.
+            log.warn("Run {} stopped before recording all its files; recording the {} missing as PENDING",
+                    run.runId(), unrecorded.size());
+            state.insertFiles(unrecorded);
+            unrecorded.forEach(file -> stored.put(file.sourcePath(), file));
+        }
 
         state.updateRunStatus(run.runId(), RunRecord.Status.RUNNING, null, null);
         long completed = stored.values().stream().filter(f -> f.status() == FileRecord.Status.COMPLETED).count();
@@ -168,31 +179,35 @@ public class RunStarter {
         }
     }
 
-    /** The pinned snapshot is immutable, so re-planning it must yield exactly the files the run recorded. */
-    private static void requireSameFiles(RunRecord run, List<PartitionTasks> partitions,
-                                         Map<String, FileRecord> stored) {
+    /**
+     * The pinned snapshot is immutable, so re-planning it must yield the files the run recorded, unchanged. Planned
+     * files without a row are expected: a run that died while its file rows were being written lacks some of them.
+     *
+     * @return the PENDING rows of the planned files the run has not recorded yet
+     */
+    private static List<FileRecord> requireSameFiles(RunRecord run, List<PartitionTasks> partitions,
+                                                     Map<String, FileRecord> stored) {
         List<String> mismatches = new ArrayList<>();
-        int planned = 0;
-        for (PartitionTasks partition : partitions) {
-            for (FileTask task : partition.files()) {
-                planned++;
-                FileRecord record = stored.get(task.source().location());
-                if (record == null) {
-                    mismatches.add("not recorded: " + task.source().location());
-                } else if (!record.targetPath().equals(task.target())
-                        || record.physicalRecords() != task.source().recordCount()) {
-                    mismatches.add("changed: " + task.source().location());
-                }
+        List<FileRecord> unrecorded = new ArrayList<>();
+        Set<String> planned = new HashSet<>();
+        for (FileRecord file : pendingFiles(run.runId(), partitions)) {
+            planned.add(file.sourcePath());
+            FileRecord record = stored.get(file.sourcePath());
+            if (record == null) {
+                unrecorded.add(file);
+            } else if (!record.targetPath().equals(file.targetPath())
+                    || record.physicalRecords() != file.physicalRecords()) {
+                mismatches.add("changed: " + file.sourcePath());
             }
         }
-        if (planned != stored.size()) {
-            mismatches.add(stored.size() + " files recorded but " + planned + " planned");
-        }
+        stored.keySet().stream().filter(path -> !planned.contains(path)).sorted()
+                .forEach(path -> mismatches.add("no longer planned: " + path));
         if (!mismatches.isEmpty()) {
             throw new MigrationFailedException("Snapshot " + run.snapshotId() + " no longer yields the files run "
                     + run.runId() + " recorded; start over with migration.target.clean=true:\n  "
                     + String.join("\n  ", mismatches.subList(0, Math.min(mismatches.size(), MAX_LISTED_MISMATCHES))));
         }
+        return unrecorded;
     }
 
     private void requireEmptyTarget(AzureLocation location, BlobStore blobStore, String targetLocation) {
@@ -219,15 +234,17 @@ public class RunStarter {
                 bytes);
         blobs.forEach(blob -> blobStore.delete(blob.name()));
         long superseded = state.supersedeRuns(targetLocation);
-        log.info("Target cleaned: target={} deletedBlobs={} supersededRuns={}", location, blobs.size(),
-                superseded);
+        long deletedFileRows = state.deleteSupersededFiles(targetLocation);
+        log.info("Target cleaned: target={} deletedBlobs={} supersededRuns={} deletedFileRows={}", location,
+                blobs.size(), superseded, deletedFileRows);
     }
 
     /** Everything under the target prefix except the migration's own bookkeeping, such as the lock. */
     private static List<BlobStore.BlobInfo> outputBlobs(AzureLocation location, BlobStore blobStore) {
-        String prefix = location.isContainerRoot() ? "" : location.prefix() + "/";
-        String bookkeeping = prefix + BOOKKEEPING_FOLDER + "/";
-        return blobStore.list(prefix).stream().filter(blob -> !blob.name().startsWith(bookkeeping)).toList();
+        String bookkeeping = location.blobPrefix() + BOOKKEEPING_FOLDER + "/";
+        return blobStore.list(location.blobPrefix()).stream()
+                .filter(blob -> !blob.name().startsWith(bookkeeping))
+                .toList();
     }
 
     private List<PartitionTasks> tasks(MigrationPlan plan, AzureLocation location) {

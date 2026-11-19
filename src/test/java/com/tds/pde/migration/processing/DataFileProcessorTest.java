@@ -27,6 +27,7 @@ import java.time.OffsetDateTime;
 import java.time.ZoneOffset;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import java.util.UUID;
 import java.util.stream.LongStream;
 import org.apache.hadoop.conf.Configuration;
@@ -309,14 +310,17 @@ class DataFileProcessorTest {
         Table table = IcebergTestTables.create(tempDir.resolve("orders"), ORDERS, PartitionSpec.unpartitioned());
         IcebergTestTables.append(table, orders("EU", 1, 2));
         Run run = plan(table, null);
-        assertThat(PublishedFile.find(blobStore, run.context(), run.task(0))).isEmpty();
+        List<FileTask> tasks = List.of(run.task(0));
+        assertThat(PublishedFile.find(blobStore, "", run.context(), tasks)).isEmpty();
 
         processor.process(run.context(), run.task(0), FileProgressListener.NONE);
 
-        assertThat(PublishedFile.find(blobStore, run.context(), run.task(0)))
-                .contains(new PublishedFile.Counts(2, 2));
+        assertThat(PublishedFile.find(blobStore, "", run.context(), tasks))
+                .containsExactly(Map.entry(run.task(0).source().location(), new PublishedFile.Counts(2, 2)));
         RunContext otherRun = new RunContext("run-2", run.context().source(), run.context().outputSchema());
-        assertThat(PublishedFile.find(blobStore, otherRun, run.task(0))).isEmpty();
+        assertThat(PublishedFile.find(blobStore, "", otherRun, tasks)).isEmpty();
+        assertThat(blobStore.reads()).as("one listing per lookup, whatever the number of tasks")
+                .containsExactly("list with metadata ", "list with metadata ", "list with metadata ");
     }
 
     private FileResult processOnlyFile(Table table) {

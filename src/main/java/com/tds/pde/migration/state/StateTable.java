@@ -10,9 +10,13 @@ import org.jspecify.annotations.Nullable;
  * Spark schema of the rows merged into it.
  *
  * <p>Deletion vectors and row tracking give Delta row-level concurrency, so parallel jobs merging different rows
- * of the same table do not conflict.
+ * of the same table do not conflict. The run and file tables grow with every migration, so they are clustered
+ * (liquid clustering) by the column their reads and merges select on: a run's files by {@code run_id}, a target's
+ * runs by {@code target_location}. A merge or read then touches the files holding those rows, not the whole table.
+ *
+ * @param clusterBy liquid clustering columns; empty for none
  */
-record StateTable(String name, String comment, List<Column> columns) {
+record StateTable(String name, String comment, List<Column> columns, List<String> clusterBy) {
 
     record Column(String name, String type, boolean nullable, @Nullable String comment) {
     }
@@ -26,7 +30,8 @@ record StateTable(String name, String comment, List<Column> columns) {
                         required("last_run_id", "STRING", "Latest run, in the run table"),
                         optional("snapshot_id", "BIGINT", "Pinned snapshot, NULL when the table was never written"),
                         required("total_files", "BIGINT", "Source data files at the snapshot"),
-                        required("total_records", "BIGINT", "Physical source rows before deletes")));
+                        required("total_records", "BIGINT", "Physical source rows before deletes")),
+                List.of());
     }
 
     static StateTable run(String name) {
@@ -43,7 +48,8 @@ record StateTable(String name, String comment, List<Column> columns) {
                         required("output_schema_json", "STRING", "Iceberg schema of every target file"),
                         required("started_at", "TIMESTAMP"),
                         optional("finished_at", "TIMESTAMP"),
-                        optional("error", "STRING")));
+                        optional("error", "STRING")),
+                List.of("target_location"));
     }
 
     static StateTable file(String name) {
@@ -54,7 +60,8 @@ record StateTable(String name, String comment, List<Column> columns) {
                 required("physical_records", "BIGINT", "Source rows before deletes"),
                 required("status", "STRING", "PENDING, COMPLETED or FAILED"),
                 optional("records_written", "BIGINT", "Live rows published; physical_records minus this were deleted"),
-                optional("error", "STRING", "Why the file last failed")));
+                optional("error", "STRING", "Why the file last failed")),
+                List.of("run_id"));
     }
 
     List<String> columnNames() {
@@ -66,8 +73,9 @@ record StateTable(String name, String comment, List<Column> columns) {
                 .map(column -> column.name() + " " + column.type() + (column.nullable() ? "" : " NOT NULL")
                         + (column.comment() == null ? "" : " COMMENT " + quote(column.comment())))
                 .collect(Collectors.joining(",\n    ", "(\n    ", "\n)"));
-        return "CREATE TABLE IF NOT EXISTS " + name + " " + columnDefinitions + " USING DELTA COMMENT "
-                + quote(comment) + " TBLPROPERTIES ('delta.enableDeletionVectors' = 'true',"
+        String clustering = clusterBy.isEmpty() ? "" : " CLUSTER BY (" + String.join(", ", clusterBy) + ")";
+        return "CREATE TABLE IF NOT EXISTS " + name + " " + columnDefinitions + " USING DELTA" + clustering
+                + " COMMENT " + quote(comment) + " TBLPROPERTIES ('delta.enableDeletionVectors' = 'true',"
                 + " 'delta.enableRowTracking' = 'true')";
     }
 
