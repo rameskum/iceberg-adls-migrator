@@ -23,7 +23,7 @@ public class IcebergDataReader {
      * Opens the file for streaming. Rows are decoded one at a time; only delete sets are held in memory.
      */
     public SourceRecords open(SourceTable table, FileScanTask task) {
-        DeleteFilter<Record> deletes = new GenericDeleteFilter(table.io(), task, table.currentSchema(), table.schema());
+        DeleteFilter<Record> deletes = new GenericDeleteFilter(table.io(), task, table.deleteSchema(), table.schema());
         Schema readSchema = deletes.requiredSchema();
 
         ReadBuilder<Record, ?> builder = FormatModelRegistry

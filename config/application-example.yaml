@@ -15,6 +15,7 @@ migration:
     dataset-id: 5b2f7d3c-8a1e-4f6b-b2d4-9c0e3a7f1d02
     # true: delete everything under the target location and start a fresh run.
     clean: false
+    # Each file in flight holds up to two blocks: one filling while the other is uploaded.
     block-size: 8MB
   datasets:
     stub-directory: /Volumes/<catalog>/<schema>/<volume>/iceberg-adls-migrator/datasets
@@ -24,15 +25,16 @@ migration:
       # Client id of a user-assigned managed identity; leave empty for system-assigned.
       client-id:
   parquet:
-    row-group-size: 128MB
+    # Per file in flight; driver memory is about parallel-files x (source row group + this + 2 x block-size).
+    row-group-size: 32MB
     page-size: 1MB
     # ZSTD, SNAPPY, GZIP or UNCOMPRESSED
     compression: ZSTD
   processing:
-    # Files copied at the same time. Each holds about a source row group, a target row group and an upload block.
+    # Files copied at the same time. Each holds about a source row group, a target row group and two upload blocks.
     parallel-files: 4
   progress:
-    log-every-records: 100000
+    # How often the "Progress:" heartbeat line is logged.
     log-every: 30s
   failure:
     # FAIL_FAST or CONTINUE

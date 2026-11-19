@@ -7,6 +7,7 @@ import com.azure.storage.blob.options.BlockBlobCommitBlockListOptions;
 import com.azure.storage.blob.specialized.BlockBlobClient;
 import com.tds.pde.migration.target.StagedUpload;
 import java.io.IOException;
+import java.io.InterruptedIOException;
 import java.io.OutputStream;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
@@ -15,12 +16,21 @@ import java.util.Base64;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Future;
 import lombok.extern.slf4j.Slf4j;
+import org.jspecify.annotations.Nullable;
 
 /**
  * A block blob built from staged blocks (Put Block) and published in one atomic Put Block List.
  * Staged blocks are invisible to readers, and Azure discards uncommitted blocks after seven days, so an
  * interrupted upload leaves nothing behind that could pass for a finished file.
+ *
+ * <p>Staging overlaps with writing: a full buffer is handed to a background thread while the writer fills the
+ * other of two buffers, so the writer only waits when staging is slower than producing. At most one block is
+ * in flight per upload. A failed block is reported by the next write or close, never lost, and
+ * {@link #commit} is refused unless every block was staged.
  */
 @Slf4j
 final class AzureStagedUpload implements StagedUpload {
@@ -32,15 +42,19 @@ final class AzureStagedUpload implements StagedUpload {
 
     private final BlockBlobClient blob;
     private final int blockSize;
+    private final ExecutorService stagingThreads;
     // Unique per attempt, so blocks left over from an earlier failed upload of the same blob are never committed.
     private final String uploadId = UUID.randomUUID().toString();
     private final List<String> blockIds = new ArrayList<>();
     private boolean streamOpened;
     private boolean streamClosed;
+    private @Nullable Future<?> staging;
+    private @Nullable IOException failure;
 
-    AzureStagedUpload(BlockBlobClient blob, int blockSize) {
+    AzureStagedUpload(BlockBlobClient blob, int blockSize, ExecutorService stagingThreads) {
         this.blob = blob;
         this.blockSize = blockSize;
+        this.stagingThreads = stagingThreads;
     }
 
     @Override
@@ -70,6 +84,10 @@ final class AzureStagedUpload implements StagedUpload {
 
     @Override
     public void abort() {
+        Future<?> inFlight = staging;
+        if (inFlight != null) {
+            inFlight.cancel(true);
+        }
         log.debug("Upload abandoned, {} staged blocks left for Azure to discard: blob={}", blockIds.size(), blobName());
     }
 
@@ -81,15 +99,14 @@ final class AzureStagedUpload implements StagedUpload {
 
     private final class BlockStagingStream extends OutputStream {
 
-        private final byte[] buffer = new byte[blockSize];
+        private byte[] filling = new byte[blockSize];
+        /** The buffer not being filled: free, or holding the block being staged. Allocated when first needed. */
+        private byte @Nullable [] other;
         private int buffered;
 
         @Override
         public void write(int b) throws IOException {
-            if (buffered == buffer.length) {
-                stageBufferedBlock();
-            }
-            buffer[buffered++] = (byte) b;
+            write(new byte[] {(byte) b}, 0, 1);
         }
 
         @Override
@@ -98,42 +115,75 @@ final class AzureStagedUpload implements StagedUpload {
                 throw new IOException("Stream closed: " + blobName());
             }
             while (length > 0) {
-                if (buffered == buffer.length) {
+                if (buffered == filling.length) {
                     stageBufferedBlock();
                 }
-                int chunk = Math.min(length, buffer.length - buffered);
-                System.arraycopy(bytes, offset, buffer, buffered, chunk);
+                int chunk = Math.min(length, filling.length - buffered);
+                System.arraycopy(bytes, offset, filling, buffered, chunk);
                 buffered += chunk;
                 offset += chunk;
                 length -= chunk;
             }
         }
 
-        /** Stages what is buffered; publishing remains {@link #commit}'s job. */
+        /** Stages what is buffered and waits for every block; publishing remains {@link #commit}'s job. */
         @Override
         public void close() throws IOException {
-            if (!streamClosed) {
-                if (buffered > 0) {
-                    stageBufferedBlock();
-                }
-                streamClosed = true;
+            if (streamClosed) {
+                return;
             }
+            if (buffered > 0) {
+                stageBufferedBlock();
+            }
+            awaitStaging();
+            streamClosed = true;
         }
 
+        /**
+         * Hands the full buffer to a staging thread and carries on in the other one. Waits first for the block
+         * staged before it, which also reports that block's failure.
+         */
         private void stageBufferedBlock() throws IOException {
+            awaitStaging();
             if (blockIds.size() == MAX_BLOCKS) {
                 throw new IOException(blobName() + " would exceed Azure's " + MAX_BLOCKS
                         + " blocks per blob; increase migration.target.block-size");
             }
+            int index = blockIds.size();
             String blockId = nextBlockId();
-            try {
-                // Wraps the buffer without copying; staging is synchronous, so the buffer is free again afterwards.
-                blob.stageBlock(blockId, BinaryData.fromByteBuffer(ByteBuffer.wrap(buffer, 0, buffered)));
-            } catch (RuntimeException e) {
-                throw new IOException("Failed to stage block " + blockIds.size() + " of " + blobName(), e);
-            }
+            byte[] block = filling;
+            int length = buffered;
             blockIds.add(blockId);
+            staging = stagingThreads.submit(() -> {
+                // Wraps the block without copying; it is not touched again until staging has finished.
+                blob.stageBlock(blockId, BinaryData.fromByteBuffer(ByteBuffer.wrap(block, 0, length)));
+                log.trace("Block staged: blob={} block={} bytes={}", blobName(), index, length);
+            });
+            filling = other == null ? new byte[blockSize] : other;
+            other = block;
             buffered = 0;
+        }
+
+        /** Waits for the block being staged; once any block has failed, every call fails. */
+        private void awaitStaging() throws IOException {
+            if (failure != null) {
+                throw failure;
+            }
+            Future<?> inFlight = staging;
+            if (inFlight == null) {
+                return;
+            }
+            try {
+                inFlight.get();
+            } catch (ExecutionException e) {
+                failure = new IOException("Failed to stage block " + (blockIds.size() - 1) + " of " + blobName(),
+                        e.getCause());
+                throw failure;
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new InterruptedIOException("Interrupted while staging a block of " + blobName());
+            }
+            staging = null;
         }
     }
 }

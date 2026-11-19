@@ -25,6 +25,7 @@ Databricks job ──app_args──▶ team launcher (isolated class loader) ─
   4. Pin a snapshot and plan its data files from Iceberg metadata (one task per file, with its delete files)
   5. For each partition, for each file:
        read live rows (deletes applied) ─▶ Iceberg Parquet writer ─▶ staged blocks (invisible)
+       (staging overlaps with writing: one block is uploaded while the next one fills)
        close the writer, verify row counts, commit the block list with metadata (atomic) ─▶ record COMPLETED
   6. Record the run as SUCCEEDED, or FAILED and throw MigrationFailedException
 ```
@@ -41,11 +42,11 @@ Databricks job ──app_args──▶ team launcher (isolated class loader) ─
 | `DataFileProcessor` | Copies one source file to one target file; independent of runs, progress and state |
 | `IcebergDataReader` | Streams the live rows of one data file, the way Iceberg's generic reader does |
 | `ParquetDataWriter` | Writes Parquet with Iceberg's writer (exact type mapping), including empty files |
-| `AzureBlobStore` | Staged block upload and atomic commit, metadata, listing, deletes, lease lock |
+| `AzureBlobStore` | Staged block upload (one block staged in the background while the next fills) and atomic commit, metadata, listing, deletes, lease lock |
 | `MigrationStateRepository` | Control, run and file tables, with retries |
 | `StateTable` | Each state table's columns: the source of its DDL and of the schema of rows merged into it |
 | `SparkSqlExecutor` | Runs the state SQL through the cluster's Spark session; turns rows into a typed temporary view to merge from |
-| `MigrationProgressTracker` | Record, file and partition progress, committed and in flight |
+| `MigrationProgressTracker` | Record, byte, file and partition progress, committed and in flight; logs the `Progress:` heartbeat on a timer |
 
 ## Build
 
@@ -124,16 +125,15 @@ complete example. Invalid values stop the app before any data is touched.
 | `migration.source.hadoop."[key]"` | none | Extra Hadoop settings, e.g. `"[fs.defaultFS]": hdfs://nn:8020`; quote dotted keys |
 | `migration.target.dataset-id` | required | Target dataset (format `PARQUET`, location = `abfss://...`) |
 | `migration.target.clean` | `false` | Delete everything under the target and start a fresh run |
-| `migration.target.block-size` | `8MB` | Size of each staged block; also the upload memory per file |
+| `migration.target.block-size` | `8MB` | Size of each staged block; each file in flight holds up to two (one filling, one being uploaded) |
 | `migration.datasets.stub-directory` | required | Folder of `<dataset-id>.json` descriptors |
 | `migration.azure.auth.mode` | `MANAGED_IDENTITY` | Or `CONNECTION_STRING` (local runs and tests only) |
 | `migration.azure.auth.client-id` | empty | Client id of a user-assigned managed identity |
 | `migration.azure.auth.connection-string` | empty | Required for `CONNECTION_STRING` mode |
-| `migration.parquet.row-group-size` | `128MB` | Parquet row group size; the main writer memory |
+| `migration.parquet.row-group-size` | `32MB` | Parquet row group size; the main writer memory per file in flight, see below |
 | `migration.parquet.page-size` | `1MB` | Parquet page size |
 | `migration.parquet.compression` | `ZSTD` | `ZSTD`, `SNAPPY`, `GZIP` or `UNCOMPRESSED` |
-| `migration.progress.log-every-records` | `100000` | Log record progress at least this often (in records) |
-| `migration.progress.log-every` | `30s` | ...and at least this often (in time) |
+| `migration.progress.log-every` | `30s` | How often the `Progress:` heartbeat is logged |
 | `migration.processing.parallel-files` | `4` | Files copied at the same time (1 to 64); see memory below |
 | `migration.failure.on-file-failure` | `FAIL_FAST` | Or `CONTINUE` with the remaining files |
 | `migration.state.control-table` | required | e.g. `main.migration.migration_control` |
@@ -144,10 +144,16 @@ complete example. Invalid values stop the app before any data is touched.
 | `migration.state.outcome-flush-interval` | `30s` | The first outcome after this long since the last write is written at once, with any waiting |
 
 **Memory and parallel files.** Each file being copied holds about one source row group (as written in the
-source table), one target row group (`migration.parquet.row-group-size`) and one upload block
-(`migration.target.block-size`). With the defaults that is up to about 300 MB per file for large source files, so
-`parallel-files: 4` needs roughly 1.2 GB of driver heap at peak; small files need far less. More parallel files help
-until HDFS, the network or Azure is saturated.
+source table), one target row group (`migration.parquet.row-group-size`) and up to two upload blocks
+(`migration.target.block-size`, one filling while the other is uploaded). With the defaults that is 32 MB + 16 MB
+plus the source row group, so with a 128 MB source row group about 180 MB per file and `parallel-files: 4` needs
+roughly 0.75 GB of driver heap at peak; small files need far less. Size the driver heap for
+`parallel-files` x (source row group + `row-group-size` + 2 x `block-size`).
+
+The default row group is 32 MB rather than the 128 MB Parquet writers often use, so that several files fit the
+heap at once; Spark and Databricks read 32 MB row groups without trouble. Raise `row-group-size` if the heap
+allows and readers benefit from fewer, larger row groups, or lower it (with `parallel-files`) on a small driver.
+More parallel files help until HDFS, the network or Azure is saturated.
 
 **Authentication.** The `TokenCredential` bean in `AzureConfig` is the single place to plug in a different
 sign-in mechanism. The default is the cluster's managed identity.
@@ -269,27 +275,45 @@ Databricks job's *Maximum concurrent runs* to 1 adds a second guard.
 
 ## Progress reporting
 
-Records, files and partitions are tracked independently, with `percentage = total == 0 ? 100.0 : completed * 100.0 / total`:
+Records, bytes, files and partitions are tracked independently, with `percentage = total == 0 ? 100.0 : completed * 100.0 / total`:
 
 ```text
 Migration overview: runId=20261117-204240-0fef7d resumed=false table=hdfs://nn/warehouse/orders snapshotId=825090155793393105
   Total partitions: 3
   Total data files: 4
   Total records: 1000
+  Total bytes: 20971520
   Delete files: 0
   Target: abfss://data@salesacct.dfs.core.windows.net/sales/orders
 Partition processing started: partition=region=EU specId=0 files=2 physicalRecords=500
 Source file processing started: source=hdfs://... target=sales/orders/region=EU__... physicalRecords=250 deleteFiles=0
-Record progress: 500/1000 (50%) committed=250 inFlight=250 written=500
-Source file completed: source=hdfs://... target=... recordsWritten=250 recordsDeleted=0 durationMs=61
-File progress: 2/4 (50%)
+Source file completed: source=hdfs://... target=... recordsWritten=250 recordsDeleted=0 sourceBytes=10485760 targetBytes=6291456 durationMs=61 readMiBPerSecond=163.9
+Progress: files=2/4 (50%) remaining=2 failed=0 inFlight=2 records=750/1000 (75%) written=750 deleted=0 bytesRead=15MiB/20MiB (75%) bytesWritten=9.5MiB rate=12.5MiB/s (5m) elapsed=0:00:30 eta=0:00:10
 Partition completed: partition=region=EU files=2
 Partition progress: 2/3 (66.6667%)
 Migration completed: runId=20261117-204240-0fef7d
   Records: 1000/1000 (100%) written=1000 deleted=0
   Files: 4/4 (100%) failed=0
   Partitions: 3/3 (100%)
+  Bytes: read=20MiB/20MiB written=12.5MiB elapsed=0:00:41
 ```
+
+**The `Progress:` heartbeat.** A timer logs one line every `migration.progress.log-every` (30s), whether or not any
+file reports progress, so a stalled file shows as numbers that stop moving, with `rate=0B/s` and `eta=unknown`:
+
+| Field | Meaning |
+|---|---|
+| `files=done/total (%)` | Files published, including those an earlier run published when resuming |
+| `remaining` | Files not yet published or failed: the ones this run still has to copy |
+| `failed`, `inFlight` | Files that failed in this run; files being copied right now |
+| `records=read/total (%)`, `written`, `deleted` | Physical source rows read so far (published files plus rows of the files in flight), the live rows among them, and the rows removed by deletes |
+| `bytesRead=read/total (%)` | Source data file sizes from Iceberg metadata. A file in flight counts for the share of its rows read, so this is an estimate until the file is published |
+| `bytesWritten` | Size of the target files written by this run. Row groups are buffered before they are written, so a file in flight shows what was flushed so far; files an earlier run published are not counted |
+| `rate` | Source bytes read per second over the last 5 minutes of this run (since the start, in the first 5 minutes) |
+| `elapsed` | Time since this run started |
+| `eta` | Source bytes still to copy in this run, divided by the rate; `unknown` while the rate is 0. Files an earlier run published and files that failed are not left to copy; files an earlier run published are not in the rate, while the rows a failed file read before failing are |
+
+Each completed file also logs `Source file completed` with its source and target sizes and read speed.
 
 - **Record totals are physical rows** (before deletes), the only total Iceberg metadata gives exactly without
   scanning the table. Rows removed by deletes count as processed and are reported as `deleted`, so a completed
@@ -298,6 +322,8 @@ Migration completed: runId=20261117-204240-0fef7d
   copied in parallel; they become `committed` only when their file is published, and are dropped if it fails.
   Files count when published; partitions count when all their files are. With files copied in parallel, the log
   lines of different files interleave; the thread name (`file-worker-N`) tells them apart.
+- **Resuming** counts the files the earlier run published as done, so the percentages are those of the whole
+  migration, while the rate and the ETA describe this run only.
 - **The file table trails the log slightly:** outcomes are written in batches (see
   `migration.state.outcome-batch-size`), so a finished file can show `PENDING` there until its batch is written.
 - For JSON logs set `logging.structured.format.console=ecs` (or `logstash`).
@@ -325,6 +351,9 @@ Migration completed: runId=20261117-204240-0fef7d
 - **Schema.** Every file uses the table schema: the current schema when migrating the current snapshot (as a
   plain read does), or the snapshot's own schema when `snapshot-id` is set (as time travel does). Older files are
   projected onto it: added columns are null, renamed columns appear under their current names.
+- **Equality deletes keep working after their key column is dropped.** A delete file written against a column
+  that was dropped later still applies, whether the run reads the current snapshot or an older one: the column is
+  looked up in the table's schema history, and is read only to apply the delete, never written to the output.
 - **Types** are written exactly as Iceberg writes them, with Parquet field ids. Databricks cannot read Parquet
   `UUID` or `TIME` columns; the app warns about them, and converts a top-level `uuid` or `time` column to string
   only when the target schema declares it as `string`.
@@ -343,6 +372,9 @@ Migration completed: runId=20261117-204240-0fef7d
 - **HDFS:** one end-to-end test reads the source from an in-process HDFS (`MiniDFSCluster`).
 - **Bounded memory:** `BoundedMemoryTest` (tag `memory`) runs in its own JVM with `-Xmx128m` and migrates two
   source files, each larger than the heap, at the same time.
+- **Async block staging:** `AzureStagedUploadTest` drives the upload against a stand-in blob service whose Put Block
+  calls it can hold, to show that writing continues meanwhile, that at most one block is in flight, and that a
+  failed block fails the upload.
 - **Azure:** the Blob adapter tests and one end-to-end test need a real Blob API. They run when
   `AZURE_STORAGE_TEST_CONNECTION_STRING` is set, for example against Azurite:
 

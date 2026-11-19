@@ -17,6 +17,7 @@ import com.tds.pde.migration.target.StagedUpload;
 import java.time.Duration;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.ExecutorService;
 import java.util.stream.Stream;
 import lombok.extern.slf4j.Slf4j;
 
@@ -33,16 +34,23 @@ public final class AzureBlobStore implements BlobStore {
     private final BlobContainerClient container;
     private final int blockSize;
     private final Duration lockRenewInterval;
+    private final ExecutorService stagingThreads;
 
-    AzureBlobStore(BlobContainerClient container, int blockSize, Duration lockRenewInterval) {
+    /**
+     * @param stagingThreads runs the Put Block calls of every upload, one at a time per upload
+     */
+    AzureBlobStore(BlobContainerClient container, int blockSize, Duration lockRenewInterval,
+                   ExecutorService stagingThreads) {
         this.container = container;
         this.blockSize = blockSize;
         this.lockRenewInterval = lockRenewInterval;
+        this.stagingThreads = stagingThreads;
     }
 
     @Override
     public StagedUpload startUpload(String blobName) {
-        return new AzureStagedUpload(container.getBlobClient(blobName).getBlockBlobClient(), blockSize);
+        return new AzureStagedUpload(container.getBlobClient(blobName).getBlockBlobClient(), blockSize,
+                stagingThreads);
     }
 
     @Override

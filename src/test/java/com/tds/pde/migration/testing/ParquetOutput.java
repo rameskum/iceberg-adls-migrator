@@ -39,6 +39,10 @@ public final class ParquetOutput {
         return footer().getBlocks().stream().mapToLong(block -> block.getRowCount()).sum();
     }
 
+    public int rowGroupCount() {
+        return footer().getBlocks().size();
+    }
+
     public static ParquetOutput of(byte[] content, Path directory) {
         try {
             return new ParquetOutput(Files.write(Files.createTempFile(directory, "output", ".parquet"), content));

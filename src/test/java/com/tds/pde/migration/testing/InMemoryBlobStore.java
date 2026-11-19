@@ -13,6 +13,7 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -41,6 +42,12 @@ public final class InMemoryBlobStore implements BlobStore {
     private final AtomicInteger openUploads = new AtomicInteger();
     private final AtomicInteger maxOpenUploads = new AtomicInteger();
     private volatile int holdCommitsUntilOpen;
+    private volatile CountDownLatch commitGate = new CountDownLatch(0);
+
+    /** Holds every commit until the latch is released, and fails it if that takes more than ten seconds. */
+    public void holdCommitsUntil(CountDownLatch release) {
+        this.commitGate = release;
+    }
 
     /**
      * Holds every commit until {@code uploads} uploads have been open at the same time, and fails it if that does
@@ -224,6 +231,7 @@ public final class InMemoryBlobStore implements BlobStore {
                 throw new UncheckedIOException(new IOException("injected commit failure for " + blobName));
             }
             awaitConcurrentUploads();
+            awaitCommitGate();
             committed.put(blobName, new Blob(staged.toByteArray(), Map.copyOf(metadata)));
             openUploads.decrementAndGet();
         }
@@ -232,6 +240,17 @@ public final class InMemoryBlobStore implements BlobStore {
         public void abort() {
             aborted.add(blobName);
             openUploads.decrementAndGet();
+        }
+
+        private void awaitCommitGate() {
+            try {
+                if (!commitGate.await(10, TimeUnit.SECONDS)) {
+                    throw new IllegalStateException("commit of " + blobName + " was never released");
+                }
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new IllegalStateException("interrupted while holding the commit of " + blobName, e);
+            }
         }
 
         private void awaitConcurrentUploads() {

@@ -5,6 +5,7 @@ import java.io.OutputStream;
 import org.apache.iceberg.io.InputFile;
 import org.apache.iceberg.io.OutputFile;
 import org.apache.iceberg.io.PositionOutputStream;
+import org.jspecify.annotations.Nullable;
 
 /**
  * Lets Iceberg's Parquet writer write into a {@link StagedUpload}. Closing the writer stages the last bytes;
@@ -13,14 +14,21 @@ import org.apache.iceberg.io.PositionOutputStream;
 final class StagedOutputFile implements OutputFile {
 
     private final StagedUpload upload;
+    private @Nullable CountingStream stream;
 
     StagedOutputFile(StagedUpload upload) {
         this.upload = upload;
     }
 
+    /** Bytes the writer has handed to the upload so far; unlike the writer's own length, it never counts buffers. */
+    long bytesWritten() {
+        return stream == null ? 0 : stream.getPos();
+    }
+
     @Override
     public PositionOutputStream create() {
-        return new CountingStream(upload.outputStream());
+        stream = new CountingStream(upload.outputStream());
+        return stream;
     }
 
     @Override

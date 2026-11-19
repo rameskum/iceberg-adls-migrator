@@ -6,7 +6,6 @@ import jakarta.validation.constraints.Max;
 import jakarta.validation.constraints.Min;
 import jakarta.validation.constraints.NotNull;
 import jakarta.validation.constraints.Pattern;
-import jakarta.validation.constraints.Positive;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.util.Map;
@@ -57,7 +56,8 @@ public record MigrationProperties(
     /**
      * @param datasetId UUID of the target dataset in the dataset API
      * @param clean     delete everything under the target location and start a fresh run
-     * @param blockSize size of each staged block uploaded to Azure Blob Storage, at most Azure's 4000 MiB
+     * @param blockSize size of each staged block uploaded to Azure Blob Storage, at most Azure's 4000 MiB; each
+     *                  file in flight holds up to two, one filling while the other is uploaded
      */
     public record Target(@NotNull UUID datasetId, @DefaultValue("false") boolean clean,
                          @DefaultValue("8MB") @DataSizeRange(min = 1, max = 4000L * 1024 * 1024) DataSize blockSize) {
@@ -96,7 +96,11 @@ public record MigrationProperties(
         }
     }
 
-    public record Parquet(@DefaultValue("128MB") @DataSizeRange(min = 1) DataSize rowGroupSize,
+    /**
+     * @param rowGroupSize target row group size; the writer buffers about this much per file in flight, so
+     *                     {@code parallel-files} times this is the main driver memory cost of the target side
+     */
+    public record Parquet(@DefaultValue("32MB") @DataSizeRange(min = 1) DataSize rowGroupSize,
                           @DefaultValue("1MB") @DataSizeRange(min = 1) DataSize pageSize,
                           @DefaultValue("ZSTD") Compression compression) {
 
@@ -110,16 +114,15 @@ public record MigrationProperties(
 
     /**
      * @param parallelFiles source files copied at the same time. Memory grows with it: each file in flight holds
-     *                      about one source row group, one target row group and one upload block.
+     *                      about one source row group, one target row group and up to two upload blocks.
      */
     public record Processing(@DefaultValue("4") @Min(1) @Max(64) int parallelFiles) {
     }
 
     /**
-     * Record progress is logged whenever either threshold is crossed.
+     * @param logEvery how often the {@code Progress:} heartbeat line is logged while files are being copied
      */
-    public record Progress(@DefaultValue("100000") @Positive long logEveryRecords,
-                           @DefaultValue("30s") @DurationMin(millis = 1) Duration logEvery) {
+    public record Progress(@DefaultValue("30s") @DurationMin(millis = 1) Duration logEvery) {
     }
 
     public record Failure(@DefaultValue("FAIL_FAST") OnFileFailure onFileFailure) {

@@ -32,6 +32,7 @@ import org.apache.iceberg.hadoop.HadoopTables;
 import org.apache.iceberg.io.CloseableIterable;
 import org.apache.iceberg.mapping.NameMapping;
 import org.apache.iceberg.mapping.NameMappingParser;
+import org.apache.iceberg.types.Types;
 import org.jspecify.annotations.Nullable;
 import org.springframework.stereotype.Component;
 
@@ -77,7 +78,7 @@ public class IcebergMetadataReader {
             log.info("Source table identified: table={} formatVersion={} snapshotId=none (table has never been written)",
                     tableLocation, formatVersion);
             return MigrationPlan.empty(new SourceTable(tableLocation, formatVersion, null, table.schema(),
-                    table.schema(), table.io(), nameMapping));
+                    deleteSchema(table), table.io(), nameMapping));
         }
 
         TableScan scan = table.newScan().useSnapshot(snapshot.snapshotId());
@@ -91,8 +92,32 @@ public class IcebergMetadataReader {
                 snapshot.operation(), schema.schemaId(), schema.columns().size(), nameMapping != null);
 
         SourceTable source = new SourceTable(tableLocation, formatVersion, snapshot.snapshotId(), schema,
-                table.schema(), table.io(), nameMapping);
+                deleteSchema(table), table.io(), nameMapping);
         return planFiles(table, scan, source);
+    }
+
+    /**
+     * The current schema extended with the columns later dropped from it. An equality delete file is written
+     * against the schema of its time and keeps applying after its key column is dropped, so resolving it against
+     * the current schema alone, or against the schema of the pinned snapshot, can miss the column. Field ids are
+     * never reused, so each dropped column is added once, from the newest schema that still had it; a dropped
+     * column whose name has been taken by another column since is left out rather than renamed.
+     */
+    static Schema deleteSchema(Table table) {
+        Schema current = table.schema();
+        List<Types.NestedField> columns = new ArrayList<>(current.columns());
+        Set<Integer> ids = new HashSet<>(current.idToName().keySet());
+        Set<String> names = new HashSet<>(current.columns().stream().map(Types.NestedField::name).toList());
+        table.schemas().values().stream()
+                .sorted(Comparator.comparingInt(Schema::schemaId).reversed())
+                .flatMap(schema -> schema.columns().stream())
+                .filter(column -> !ids.contains(column.fieldId()) && !names.contains(column.name()))
+                .forEach(column -> {
+                    columns.add(column);
+                    ids.add(column.fieldId());
+                    names.add(column.name());
+                });
+        return new Schema(columns);
     }
 
     private Table load(String tableLocation) {
@@ -121,6 +146,7 @@ public class IcebergMetadataReader {
         Set<String> problems = new LinkedHashSet<>();
         Set<String> deleteFiles = new HashSet<>();
         long totalRecords = 0;
+        long totalBytes = 0;
         long totalFiles = 0;
 
         // planFiles (unlike planTasks) yields exactly one task per data file, never split.
@@ -144,6 +170,7 @@ public class IcebergMetadataReader {
                                 key -> new ArrayList<>())
                         .add(new SourceFile(task));
                 totalRecords += file.recordCount();
+                totalBytes += file.fileSizeInBytes();
                 totalFiles++;
             }
         } catch (IOException e) {
@@ -171,7 +198,7 @@ public class IcebergMetadataReader {
                     + "deleteFiles={}", source.snapshotId(), deleteFiles.size());
         }
 
-        return new MigrationPlan(source, partitions, totalRecords, totalFiles, deleteFiles.size());
+        return new MigrationPlan(source, partitions, totalRecords, totalBytes, totalFiles, deleteFiles.size());
     }
 
     /** Partitions are told apart by spec as well as values: the same path under two specs is two partitions. */

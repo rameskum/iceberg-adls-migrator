@@ -6,7 +6,12 @@ import com.azure.storage.blob.BlobServiceClientBuilder;
 import com.tds.pde.migration.config.MigrationProperties;
 import com.tds.pde.migration.target.BlobStore;
 import com.tds.pde.migration.target.BlobStoreFactory;
+import jakarta.annotation.PreDestroy;
 import java.time.Duration;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ThreadFactory;
+import java.util.concurrent.atomic.AtomicInteger;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.stereotype.Component;
@@ -21,6 +26,21 @@ public class AzureBlobStoreFactory implements BlobStoreFactory {
     private final MigrationProperties.Azure.Auth auth;
     private final int blockSize;
     private final ObjectProvider<TokenCredential> credential;
+    /**
+     * Runs the Put Block calls so that writing continues meanwhile. Threads are created on demand and, being one
+     * per upload with a block in flight, never outnumber the files copied in parallel.
+     */
+    private final ExecutorService stagingThreads = Executors.newCachedThreadPool(new ThreadFactory() {
+        private final AtomicInteger number = new AtomicInteger();
+
+        @Override
+        public Thread newThread(Runnable runnable) {
+            // Short enough for the log pattern's 15-character thread column.
+            Thread thread = new Thread(runnable, "block-stager-" + number.incrementAndGet());
+            thread.setDaemon(true);
+            return thread;
+        }
+    });
 
     public AzureBlobStoreFactory(MigrationProperties properties, ObjectProvider<TokenCredential> credential) {
         this.auth = properties.azure().auth();
@@ -46,6 +66,12 @@ public class AzureBlobStoreFactory implements BlobStoreFactory {
         };
         log.info("Target storage opened: endpoint={} container={} prefix={} authMode={}",
                 service.getAccountUrl(), location.container(), location.prefix(), auth.mode());
-        return new AzureBlobStore(service.getBlobContainerClient(location.container()), blockSize, lockRenewInterval);
+        return new AzureBlobStore(service.getBlobContainerClient(location.container()), blockSize, lockRenewInterval,
+                stagingThreads);
+    }
+
+    @PreDestroy
+    void close() {
+        stagingThreads.shutdownNow();
     }
 }

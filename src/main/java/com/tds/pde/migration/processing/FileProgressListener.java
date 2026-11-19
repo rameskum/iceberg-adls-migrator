@@ -7,8 +7,11 @@ package com.tds.pde.migration.processing;
 @FunctionalInterface
 public interface FileProgressListener {
 
-    FileProgressListener NONE = (physicalRowsRead, recordsWritten) -> {
+    FileProgressListener NONE = (physicalRowsRead, recordsWritten, bytesWritten) -> {
     };
 
-    void onProgress(long physicalRowsRead, long recordsWritten);
+    /**
+     * @param bytesWritten bytes of the target file written so far; the writer buffers a row group before it writes it
+     */
+    void onProgress(long physicalRowsRead, long recordsWritten, long bytesWritten);
 }
