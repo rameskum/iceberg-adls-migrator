@@ -234,7 +234,9 @@ stopped.
 
 **A run pins** its snapshot, read schema, output schema and file list. A resume plans the pinned snapshot again
 and refuses to continue if any of these no longer match (for example, the target schema was edited, or
-snapshot expiry removed a file).
+snapshot expiry removed a file). A new run records its run row first, then its file rows in batches; if the job
+dies in between, the resume records the planned files that have no row yet as `PENDING` and carries on. Only a
+recorded file that changed, or that the snapshot no longer yields, stops it.
 
 **What counts as done.** Every target blob is committed together with its metadata (`migration_run_id`,
 `source_file`, `source_snapshot_id`, `physical_records`, `records_written`). On resume, a blob carrying this run's
