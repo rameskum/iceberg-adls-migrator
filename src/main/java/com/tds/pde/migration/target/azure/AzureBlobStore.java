@@ -73,8 +73,8 @@ public final class AzureBlobStore implements BlobStore {
         try {
             blob.getBlockBlobClient().upload(BinaryData.fromBytes(new byte[0]), false);
         } catch (BlobStorageException e) {
-            // Already there from an earlier run, possibly leased right now; the lease decides.
-            if (e.getStatusCode() != 409) {
+            // Already there from an earlier run (409), or leased right now (412 LeaseIdMissing); the lease decides.
+            if (e.getStatusCode() != 409 && e.getErrorCode() != BlobErrorCode.LEASE_ID_MISSING) {
                 // The first request of a run: turn configuration and permission problems into a readable message.
                 throw new IllegalStateException("Cannot write to container '" + container.getBlobContainerName()
                         + "' of " + container.getAccountUrl() + ": " + e.getStatusCode() + " " + e.getErrorCode()
