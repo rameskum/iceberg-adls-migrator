@@ -81,7 +81,7 @@ public class MigrationOrchestrator {
                     run.plan().totalPartitions());
             try {
                 runStarter.prepare(run, claim, location, blobStore);
-                execute(run, blobStore, claim, progress);
+                execute(run, location, blobStore, claim, progress);
             } catch (ClaimLostException e) {
                 // Another run owns the migration now; its state is left to that run.
                 throw e;
@@ -94,7 +94,8 @@ public class MigrationOrchestrator {
         }
     }
 
-    private void execute(StartedRun run, BlobStore blobStore, RunClaim claim, MigrationProgressTracker progress) {
+    private void execute(StartedRun run, AzureLocation location, BlobStore blobStore, RunClaim claim,
+                         MigrationProgressTracker progress) {
         log.info("Migration overview: runId={} table={} snapshotId={}\n  Total partitions: {}\n"
                         + "  Total data files: {}\n  Total records: {}\n  Total bytes: {}\n  Delete files: {}\n"
                         + "  Target: {}", run.runId(), run.plan().table().location(),
@@ -116,6 +117,7 @@ public class MigrationOrchestrator {
 
         List<FileResult> failures = result.failures();
         if (failures.isEmpty()) {
+            deleteUploadLeftovers(location, blobStore, claim);
             if (!claim.finish(ControlRecord.Status.COMPLETED, null, progress.snapshot())) {
                 throw new ClaimLostException("Run " + run.runId() + " copied every file, but another run took the "
                         + "migration over before it could record that");
@@ -129,6 +131,21 @@ public class MigrationOrchestrator {
                 failureList(failures));
         throw new MigrationFailedException("Migration run " + run.runId() + " failed: " + reason + "; "
                 + START_OVER);
+    }
+
+    /**
+     * Every file is published, so what uploads left besides them, such as an empty folder of temporary files, is no
+     * longer needed. Only a run that still holds its claim deletes it, as another run may be writing the target
+     * otherwise. Not deleting it does not fail the run: it is hidden from readers, and a clean deletes it.
+     */
+    private static void deleteUploadLeftovers(AzureLocation location, BlobStore blobStore, RunClaim claim) {
+        try {
+            claim.ensureHeld();
+            blobStore.deleteUploadLeftovers(location.blobPrefix());
+        } catch (RuntimeException e) {
+            log.warn("What the uploads left besides the published files was not deleted; the next clean deletes it: "
+                    + "target={} reason={}", location, e.getMessage());
+        }
     }
 
     /** Records a failed run; a failure to do so is logged, as the run's own failure is what gets reported. */

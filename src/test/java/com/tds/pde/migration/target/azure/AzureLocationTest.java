@@ -20,6 +20,14 @@ class AzureLocationTest {
     }
 
     @Test
+    void namesTheContainerAsAHadoopFileSystem() {
+        assertThat(AzureLocation.parse("abfss://data@salesacct.dfs.core.windows.net/sales/orders/").fileSystemUri())
+                .hasToString("abfss://data@salesacct.dfs.core.windows.net");
+        assertThat(AzureLocation.parse("abfs://data@salesacct.dfs.core.windows.net").fileSystemUri())
+                .hasToString("abfs://data@salesacct.dfs.core.windows.net");
+    }
+
+    @Test
     void keepsTheEndpointSuffixOfSovereignClouds() {
         assertThat(AzureLocation.parse("abfss://data@govacct.dfs.core.usgovcloudapi.net/x").blobEndpoint())
                 .isEqualTo("https://govacct.blob.core.usgovcloudapi.net");

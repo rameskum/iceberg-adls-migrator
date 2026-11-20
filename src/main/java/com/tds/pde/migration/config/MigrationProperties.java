@@ -61,11 +61,28 @@ public record MigrationProperties(
      * @param datasetId UUID of the target dataset in the dataset API
      * @param clean     delete everything under the target location and start a new run from the beginning; needed
      *                  after a run that did not complete, and refused while that run's heartbeat is fresh
+     * @param client    how the target storage is written
      * @param blockSize size of each staged block uploaded to Azure Blob Storage, at most Azure's 4000 MiB; each
-     *                  file in flight holds up to two, one filling while the other is uploaded
+     *                  file in flight holds up to two, one filling while the other is uploaded. Used by the
+     *                  {@link Client#AZURE_SDK} client only
      */
     public record Target(@NotNull UUID datasetId, @DefaultValue("false") boolean clean,
+                         @DefaultValue("azure-sdk") Client client,
                          @DefaultValue("8MB") @DataSizeRange(min = 1, max = 4000L * 1024 * 1024) DataSize blockSize) {
+
+        public enum Client {
+            /**
+             * The Azure Blob SDK, signed in with {@code migration.azure.auth}: each file is staged as blocks and
+             * published in one atomic commit, with its metadata.
+             */
+            AZURE_SDK,
+            /**
+             * The Hadoop file system the cluster's Spark session uses for the target URI, with the cluster's own
+             * access to the storage and no Azure settings of this application: each file is written under a
+             * temporary name, checked, and renamed to its final name.
+             */
+            HADOOP
+        }
     }
 
     /**

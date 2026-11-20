@@ -56,7 +56,7 @@ public class DataFileProcessor {
                 task.partitionPath().isEmpty() ? "<unpartitioned>" : task.partitionPath(),
                 task.source().recordCount(), task.source().deleteFileCount());
 
-        StagedUpload upload = blobStore.startUpload(task.target());
+        StagedUpload upload = blobStore.startUpload(task.target(), run.runId());
         long physicalRowsRead = 0;
         long recordsWritten = 0;
         long bytesWritten = 0;

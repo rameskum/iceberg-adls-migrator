@@ -13,13 +13,11 @@ import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.atomic.AtomicInteger;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.ObjectProvider;
-import org.springframework.stereotype.Component;
 
 /**
- * Opens Azure Blob Storage for a target location.
+ * Opens Azure Blob Storage for a target location, through the Azure Blob SDK.
  */
 @Slf4j
-@Component
 public class AzureBlobStoreFactory implements BlobStoreFactory {
 
     private final MigrationProperties.Azure.Auth auth;
@@ -59,7 +57,7 @@ public class AzureBlobStoreFactory implements BlobStoreFactory {
                     .connectionString(auth.connectionString())
                     .buildClient();
         };
-        log.info("Target storage opened: endpoint={} container={} prefix={} authMode={}",
+        log.info("Target storage opened: client=azure-sdk endpoint={} container={} prefix={} authMode={}",
                 service.getAccountUrl(), location.container(), location.prefix(), auth.mode());
         return new AzureBlobStore(service.getBlobContainerClient(location.container()), blockSize, stagingThreads);
     }

@@ -486,7 +486,7 @@ class MigrationEndToEndTest {
     }
 
     private void publish(String blobName) throws IOException {
-        var upload = blobStore.startUpload(blobName);
+        var upload = blobStore.startUpload(blobName, EARLIER_RUN);
         try (var out = upload.outputStream()) {
             out.write(new byte[] {1, 2, 3});
         }

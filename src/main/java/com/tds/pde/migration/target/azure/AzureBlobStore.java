@@ -33,7 +33,7 @@ public final class AzureBlobStore implements BlobStore {
     }
 
     @Override
-    public StagedUpload startUpload(String blobName) {
+    public StagedUpload startUpload(String blobName, String runId) {
         return new AzureStagedUpload(container.getBlobClient(blobName).getBlockBlobClient(), blockSize,
                 stagingThreads);
     }

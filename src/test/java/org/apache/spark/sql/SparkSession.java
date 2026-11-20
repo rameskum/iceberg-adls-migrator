@@ -6,6 +6,7 @@ import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import org.apache.spark.SparkContext;
 import org.apache.spark.SparkException;
 import org.apache.spark.sql.types.StructType;
 
@@ -28,6 +29,10 @@ public class SparkSession {
 
     public String version() {
         return "test";
+    }
+
+    public SparkContext sparkContext() {
+        return new SparkContext();
     }
 
     public Dataset createDataFrame(List<Row> rows, StructType schema) {

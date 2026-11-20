@@ -14,10 +14,15 @@ migration:
     # true: delete everything under the target location and start again from the beginning under a new run id.
     # Needed after a run that did not complete; refused while that run's heartbeat is fresh.
     clean: false
-    # Each file in flight holds up to two blocks: one filling while the other is uploaded.
+    # azure-sdk: the Azure Blob SDK, signed in with migration.azure.auth below.
+    # hadoop: the Hadoop file system of the cluster's Spark session, with the cluster's own access to the storage
+    # (Dedicated access mode); migration.azure and block-size are then not used. See "Target clients" in the README.
+    client: azure-sdk
+    # Azure SDK client: each file in flight holds up to two blocks, one filling while the other is uploaded.
     block-size: 8MB
   datasets:
     stub-directory: /Volumes/<catalog>/<schema>/<volume>/iceberg-adls-migrator/datasets
+  # Azure SDK client only.
   azure:
     auth:
       mode: MANAGED_IDENTITY

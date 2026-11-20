@@ -311,8 +311,8 @@ class RunStarterTest {
         List<String> deleted = new ArrayList<>();
         BlobStore takenOverAfterFirstDelete = new BlobStore() {
             @Override
-            public StagedUpload startUpload(String blobName) {
-                return blobStore.startUpload(blobName);
+            public StagedUpload startUpload(String blobName, String runId) {
+                return blobStore.startUpload(blobName, runId);
             }
 
             @Override
@@ -487,7 +487,7 @@ class RunStarterTest {
     }
 
     private void publish(String blobName) throws IOException {
-        var upload = blobStore.startUpload(blobName);
+        var upload = blobStore.startUpload(blobName, EARLIER_RUN);
         try (OutputStream out = upload.outputStream()) {
             out.write(new byte[] {1, 2, 3});
         }
