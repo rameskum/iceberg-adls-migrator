@@ -9,6 +9,8 @@ account without hierarchical namespace). The target is plain Parquet: no Iceberg
   bounded however large the table is.
 - A file becomes visible at its target only once it is complete and verified, so a failed or interrupted
   write can never be mistaken for a finished file.
+- The target is written either with the Azure Blob SDK (the default) or through the Hadoop file system of the
+  cluster's Spark session, with the cluster's own access to the storage: see [Target clients](#target-clients).
 - Every table migration and file is tracked in Delta tables written through the cluster's own Spark session. One
   control row per migration keeps two runs from writing the same target and shows the run's progress.
 - A run that does not complete is not resumed: the next run cleans the target and copies everything again, from
@@ -33,6 +35,8 @@ Databricks job ──app_args──▶ team launcher (isolated class loader) ─
        (staging overlaps with writing: one block is uploaded while the next one fills)
        close the writer, verify row counts, check the claim,
        commit the block list with metadata (atomic) ─▶ record COMPLETED
+     With the Hadoop client: the writer writes a temporary file under _migration/tmp/<runId>/; after the
+     checks it is renamed to its final name and its size checked ─▶ record COMPLETED
   7. Mark the control row COMPLETED, or FAILED and throw MigrationFailedException
 ```
 
@@ -50,6 +54,7 @@ Databricks job ──app_args──▶ team launcher (isolated class loader) ─
 | `IcebergDataReader` | Streams the live rows of one data file, the way Iceberg's generic reader does |
 | `ParquetDataWriter` | Writes Parquet with Iceberg's writer (exact type mapping), including empty files |
 | `AzureBlobStore` | Staged block upload (one block staged in the background while the next fills) and atomic commit, metadata, listing, deletes |
+| `HadoopBlobStore` | Writes each file under a temporary name and renames it once checked; listing, deletes; through the Spark session's Hadoop file system, called by reflection (`HadoopFileSystem`) |
 | `MigrationStateRepository` | Control and file tables, with retries |
 | `StateTable` | Each state table's columns: the source of its DDL and of the schema of rows merged into it |
 | `SparkSqlExecutor` | Runs the state SQL through the cluster's Spark session; turns rows into a typed temporary view to merge from |
@@ -114,7 +119,8 @@ written through the cluster's Spark session as the job's identity.
 
 **Before the first run:**
 - create the target container (the app never creates it);
-- grant the identity *Storage Blob Data Contributor* on it;
+- with the Azure SDK client, grant the identity *Storage Blob Data Contributor* on it; the Hadoop client needs the
+  cluster's own access to it instead, see [Target clients](#target-clients);
 - grant the job's identity `USE CATALOG`, `USE SCHEMA`, `CREATE TABLE`, and `SELECT` and `MODIFY` on the schema
   holding the state tables. The app creates them at startup from their definitions in
   [`StateTable`](src/main/java/com/tds/pde/migration/state/StateTable.java).
@@ -132,9 +138,10 @@ complete example. Invalid values stop the app before any data is touched.
 | `migration.source.hadoop."[key]"` | none | Extra Hadoop settings, e.g. `"[fs.defaultFS]": hdfs://nn:8020`; quote dotted keys |
 | `migration.target.dataset-id` | required | Target dataset (format `PARQUET`, location = `abfss://...`) |
 | `migration.target.clean` | `false` | Delete everything under the target and start again from the beginning; needed after a run that did not complete, see [Runs](#runs) |
-| `migration.target.block-size` | `8MB` | Size of each staged block; each file in flight holds up to two (one filling, one being uploaded) |
+| `migration.target.client` | `azure-sdk` | How the target is written: `azure-sdk`, or `hadoop` for the Spark session's Hadoop file system, see [Target clients](#target-clients) |
+| `migration.target.block-size` | `8MB` | Azure SDK client: size of each staged block; each file in flight holds up to two (one filling, one being uploaded) |
 | `migration.datasets.stub-directory` | required | Folder of `<dataset-id>.json` descriptors |
-| `migration.azure.auth.mode` | `MANAGED_IDENTITY` | Or `CONNECTION_STRING` (local runs and tests only) |
+| `migration.azure.auth.mode` | `MANAGED_IDENTITY` | Azure SDK client: or `CONNECTION_STRING` (local runs and tests only). The `migration.azure` settings are not read by the Hadoop client |
 | `migration.azure.auth.client-id` | empty | Client id of a user-assigned managed identity |
 | `migration.azure.auth.connection-string` | empty | Required for `CONNECTION_STRING` mode; a secret, so only from the environment variable `MIGRATION_AZURE_AUTH_CONNECTIONSTRING` |
 | `migration.parquet.row-group-size` | `32MB` | Parquet row group size; the main writer memory per file in flight, see below |
@@ -163,7 +170,7 @@ allows and readers benefit from fewer, larger row groups, or lower it (with `par
 More parallel files help until HDFS, the network or Azure is saturated.
 
 **Authentication.** The `TokenCredential` bean in `AzureConfig` is the single place to plug in a different
-sign-in mechanism. The default is the cluster's managed identity.
+sign-in mechanism for the Azure SDK client. The default is the cluster's managed identity.
 
 **Dataset descriptors.** Until the dataset API is wired in, `StubDatasetClient` serves recorded responses:
 
@@ -284,10 +291,93 @@ The claim is checked before each blob a clean deletes, before each file starts a
 is published, so such a run deletes and publishes nothing more and stops without writing the migration's state. Setting the Databricks job's *Maximum
 concurrent runs* to 1 adds a second guard.
 
-**Publishing a file is atomic.** Every target blob is committed in one Put Block List together with its metadata
-(`migration_run_id`, `source_file`, `source_partition`, `source_snapshot_id`, `physical_records`, `records_written`),
-under a deterministic name, so a partial file is never visible. Each staged block is sent with its Content-MD5, so
-the service rejects a block whose bytes changed in transit, and the file fails.
+**Publishing a file is atomic.** With the Azure SDK client, every target blob is committed in one Put Block List
+together with its metadata (`migration_run_id`, `source_file`, `source_partition`, `source_snapshot_id`,
+`physical_records`, `records_written`), under a deterministic name, so a partial file is never visible. Each staged
+block is sent with its Content-MD5, so the service rejects a block whose bytes changed in transit, and the file
+fails. The Hadoop client publishes by rename instead, see [Target clients](#target-clients).
+
+## Target clients
+
+`migration.target.client` chooses how the target is written. The rest of a run is the same with both: the source is
+read with the Java Iceberg reader, files are written with Iceberg's Parquet writer under the same names with the same
+types, and the control row, heartbeat, claim checks (including immediately before each publish), file table, clean
+and the refusal to clean a container root do not change.
+
+| | `azure-sdk` (default) | `hadoop` |
+|---|---|---|
+| Storage access | The Azure Blob SDK, signed in with `migration.azure.auth` (managed identity by default) | The Hadoop file system the cluster's Spark session uses for the target URI, with the cluster's own access; reads no `migration.azure` setting |
+| Publishing a file | Staged blocks, committed in one atomic Put Block List | A temporary file, checked, then renamed to the final name |
+| Proof a file is done | Its file row, and the blob's metadata (`migration_run_id`, ...) | Its file row, and the size check; there is no blob metadata |
+| Memory per file in flight | Two blocks of `migration.target.block-size` | Whatever the file system's driver buffers (for ABFS, `fs.azure.write.request.size` and `fs.azure.data.blocks.buffer`); `block-size` is not used |
+
+With either client the Parquet footer of each file records `migration.run-id`, `migration.source-file` and
+`migration.source-snapshot-id`.
+
+### The Hadoop client
+
+**The file system.** The application gets the file system the way Spark itself does, in the same driver JVM:
+`FileSystem.get(<abfss://container@account...>, spark.sparkContext().hadoopConfiguration())` of the active Spark
+session. The launcher's isolated class loader cannot see the runtime's Hadoop, and the application's own Hadoop
+classes, which read the source, are different classes of the same names, so these calls are made by reflection,
+with the runtime's class loader as the thread's context class loader. The file system is shared with Spark and is
+never closed. The run logs which driver serves the target:
+`Target storage opened: client=hadoop fileSystem=<class> uri=abfss://... prefix=...`.
+
+**Publishing without hierarchical namespace.** Each file is written to
+`<target>/_migration/tmp/<runId>/<file name>`. Once the writer is closed and the row counts are verified, the
+temporary file must hold exactly the bytes written, nothing may exist yet under the final name (an existing file is
+never replaced), and the run must still hold its claim. The file is then renamed to its final name, and the file
+there must hold the same number of bytes, or it is deleted again and the file fails. Only then is its file row
+recorded `COMPLETED`. A file that fails deletes its temporary file. Nothing is ever written under a final name except
+by the rename.
+
+On an account without hierarchical namespace a rename is not atomic: the driver copies the blob on the server and
+then deletes the source. While a file is being renamed, a listing can show it under both names, and the service may
+show the copy under its final name before the copy has finished. A crash between the copy and the delete leaves the
+temporary file behind. So the proof that a file is done is its `COMPLETED` file row, not that it is listed; and a
+run that did not complete needs `clean` before the next run in any case, which deletes everything under the target,
+`_migration` included.
+
+**Tidy targets.** The driver marks the folders of the temporary files with marker blobs. A run that published every
+file deletes `_migration` before it records its completion; a run that failed leaves it for the next clean. Spark and
+Hadoop skip folders whose names start with `_`, so readers of the target never see it.
+
+**On Databricks.**
+
+- **Dedicated access mode.** The client needs the classic Spark API on the driver (`sparkContext()` and its Hadoop
+  configuration). Compute in *Standard* access mode (formerly *Shared*) runs Spark Connect, where JVM code cannot use
+  `sparkContext`, so it does not work there
+  ([Standard compute limitations](https://learn.microsoft.com/en-us/azure/databricks/compute/standard-limitations)).
+- **Access comes from the cluster's Spark config.** Unity Catalog cannot govern an account without hierarchical
+  namespace: external locations require it
+  ([external locations](https://learn.microsoft.com/en-us/azure/databricks/connect/unity-catalog/cloud-storage/external-locations-adls)).
+  The access must therefore be configured on the cluster, as `spark.hadoop.fs.azure.*` settings (with secrets as
+  `{{secrets/<scope>/<key>}}` references), which Spark copies into `sparkContext().hadoopConfiguration()`. Settings
+  made with `spark.conf.set` in a notebook only reach DataFrame operations, not that configuration, so the client
+  does not see them.
+- **The ABFS driver on a flat namespace.** DBR 18 ships Hadoop 3.4.2
+  ([release notes](https://learn.microsoft.com/en-us/azure/databricks/release-notes/runtime/18)). Apache's ABFS
+  driver supports accounts without hierarchical namespace since 3.4.2, through the Blob endpoint only
+  ([HADOOP-19179](https://issues.apache.org/jira/browse/HADOOP-19179),
+  [ABFS over the Blob endpoint](https://hadoop.apache.org/docs/r3.4.2/hadoop-azure/fns_blob.html)); Microsoft does
+  not support the DFS endpoint on such accounts. On them, in Apache's driver: create writes a zero-length blob at once
+  and its content when the stream is closed, and marks the parent folders with marker blobs; rename of a file copies
+  it (Copy Blob) and deletes the source, and returns false when the destination exists; a recursive delete lists the
+  blobs and deletes each; listing lists the blobs. Databricks runs its own build of the ABFS driver, and its
+  documentation does not say how that build treats such accounts.
+
+**Not yet verified on Databricks**, for the owner to try with a small table and a test target before a real
+migration:
+
+- Which class serves `abfss://` on the cluster (the `Target storage opened` line names it), and whether create,
+  rename, delete and listing all work against the target account with its `dfs` URL as given. If they do not,
+  Apache's driver reaches the Blob endpoint of a `dfs` URL with `spark.hadoop.fs.azure.fns.account.service.type BLOB`
+  (and `spark.hadoop.fs.azure.account.hns.enabled false`) in the cluster's Spark config; that Databricks' driver
+  honours them is unverified.
+- That the cluster's access to the account allows writing and deleting, not only reading.
+- How long the server-side copy of a rename takes for large files, and how much driver memory the ABFS output
+  streams buffer with `parallel-files` files in flight.
 
 ## Progress reporting
 
@@ -346,6 +436,7 @@ Each completed file also logs `Source file completed` with its source and target
 ## Failure handling
 
 - **A failed file publishes nothing.** Its staged blocks are never committed; Azure discards them after 7 days.
+  With the Hadoop client its temporary file is deleted; one a crash left behind is deleted by the next clean.
 - **Every file is verified before publishing:** all physical rows recorded in Iceberg metadata must have been read,
   and the closed Parquet file must hold exactly the rows written.
 - **`FAIL_FAST`** (default) starts no more files after the first failed one; files already being copied in
@@ -395,6 +486,13 @@ Each completed file also logs `Source file completed` with its source and target
 - **HDFS:** one end-to-end test reads the source from an in-process HDFS (`MiniDFSCluster`).
 - **Bounded memory:** `BoundedMemoryTest` (tag `memory`) runs in its own JVM with `-Xmx128m` and the serial
   collector, and migrates two source files, each larger than the heap, at the same time.
+- **Hadoop client:** `HadoopBlobStoreTest` publishes, aborts and refuses files against Hadoop's own local file
+  system (a temporary file of the wrong size, an existing final name, a refused rename). `HadoopBlobStoreFactoryTest`
+  gets the file system from stand-in Spark classes loaded by a class loader of their own, with their own copy of
+  Hadoop, as on Databricks, and runs on `FlatNamespaceFileSystem`, a fake of the ABFS driver without hierarchical
+  namespace (rename as copy and delete, folder markers). `HadoopEndToEndTest` runs the whole application with
+  `migration.target.client=hadoop` on that fake: publishing, clean, a refused rename, a file that arrives short, and
+  the temporary files of a crashed run.
 - **Async block staging:** `AzureStagedUploadTest` drives the upload against a stand-in blob service whose Put Block
   calls it can hold, to show that writing continues meanwhile, that at most one block is in flight, and that a
   failed block fails the upload.
@@ -423,6 +521,7 @@ lost the row, finishing, and refusing an earlier version's control table.
 
 ## Not yet verified outside tests
 
+- The Hadoop client on Databricks: see [Not yet verified on Databricks](#the-hadoop-client).
 - Managed identity sign-in, and the state tables on Databricks' own Spark and Delta with Unity Catalog, including
   row-level concurrency between parallel jobs and between two first runs inserting the same control row: these
   need the Databricks workspace.

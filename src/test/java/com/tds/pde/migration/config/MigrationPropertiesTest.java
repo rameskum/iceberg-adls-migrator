@@ -5,6 +5,7 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import com.tds.pde.migration.config.MigrationProperties.Azure.AuthMode;
 import com.tds.pde.migration.config.MigrationProperties.Failure.OnFileFailure;
+import com.tds.pde.migration.config.MigrationProperties.Target.Client;
 import java.io.IOException;
 import java.nio.file.Path;
 import java.time.Duration;
@@ -54,6 +55,7 @@ class MigrationPropertiesTest {
         assertThat(properties.source().snapshotId()).isNull();
         assertThat(properties.source().hadoop()).isEmpty();
         assertThat(properties.target().clean()).isFalse();
+        assertThat(properties.target().client()).isEqualTo(Client.AZURE_SDK);
         assertThat(properties.target().blockSize()).isEqualTo(DataSize.ofMegabytes(8));
         assertThat(properties.datasets().stubDirectory()).isEqualTo(Path.of("/tmp/datasets"));
         assertThat(properties.azure().auth().mode()).isEqualTo(AuthMode.MANAGED_IDENTITY);
@@ -66,6 +68,21 @@ class MigrationPropertiesTest {
         assertThat(properties.state().outcomeBatchSize()).isEqualTo(50);
         assertThat(properties.state().outcomeFlushInterval()).isEqualTo(Duration.ofSeconds(30));
         assertThat(properties.processing().parallelFiles()).isEqualTo(4);
+    }
+
+    @Test
+    void bindsTheTargetClientByItsDocumentedNames() {
+        Map<String, String> values = required();
+        values.put("migration.target.client", "hadoop");
+        assertThat(bind(values).target().client()).isEqualTo(Client.HADOOP);
+
+        values.put("migration.target.client", "azure-sdk");
+        assertThat(bind(values).target().client()).isEqualTo(Client.AZURE_SDK);
+
+        values.put("migration.target.client", "spark");
+        assertThatThrownBy(() -> bind(values))
+                .isInstanceOf(BindException.class)
+                .hasStackTraceContaining("migration.target.client");
     }
 
     @Test

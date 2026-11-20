@@ -50,6 +50,19 @@ public record AzureLocation(String account, String container, String prefix, Str
                 "https://" + account + ".blob." + matcher.group(2), location);
     }
 
+    /**
+     * The location's container as a Hadoop file system URI, such as {@code abfss://<container>@<account>.dfs.<suffix>},
+     * with the scheme and host the location was given with: the file system whose paths are the container's blobs.
+     */
+    public URI fileSystemUri() {
+        URI uri = URI.create(location);
+        try {
+            return new URI(uri.getScheme(), uri.getRawAuthority(), null, null, null);
+        } catch (URISyntaxException e) {
+            throw new IllegalStateException("The authority of a parsed location is valid: " + location, e);
+        }
+    }
+
     public boolean isContainerRoot() {
         return prefix.isEmpty();
     }

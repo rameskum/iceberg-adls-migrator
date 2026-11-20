@@ -30,7 +30,7 @@ public final class LocalFileBlobStore implements BlobStore {
     }
 
     @Override
-    public StagedUpload startUpload(String blobName) {
+    public StagedUpload startUpload(String blobName, String runId) {
         Path staged;
         try {
             Files.createDirectories(root);

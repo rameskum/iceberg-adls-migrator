@@ -40,7 +40,7 @@ class ParquetDataWriterTest {
 
     private int rowGroupsWritten(Map<String, String> settings) throws IOException {
         InMemoryBlobStore store = new InMemoryBlobStore();
-        StagedUpload upload = store.startUpload("part.parquet");
+        StagedUpload upload = store.startUpload("part.parquet", "run-1");
         Random random = new Random(7);
         FileAppender<Record> appender = new ParquetDataWriter(TestProperties.bind(settings))
                 .open(upload, SCHEMA, Map.of());

@@ -107,7 +107,7 @@ public final class InMemoryBlobStore implements BlobStore {
     }
 
     @Override
-    public StagedUpload startUpload(String blobName) {
+    public StagedUpload startUpload(String blobName, String runId) {
         uploadsStarted.merge(blobName, 1, Integer::sum);
         maxOpenUploads.accumulateAndGet(openUploads.incrementAndGet(), Math::max);
         return new Upload(blobName);

@@ -68,6 +68,7 @@ class AzureBlobStoreTest {
     static final String CONNECTION_STRING_VARIABLE = "AZURE_STORAGE_TEST_CONNECTION_STRING";
 
     private static final int BLOCK_SIZE = 1024;
+    private static final String RUN_ID = "20261120-090000-a1b2c3";
 
     @TempDir
     Path tempDir;
@@ -100,7 +101,7 @@ class AzureBlobStoreTest {
         String name = location.blobName("part.parquet");
         byte[] content = randomBytes(BLOCK_SIZE * 3 + 300);
 
-        StagedUpload upload = store.startUpload(name);
+        StagedUpload upload = store.startUpload(name, RUN_ID);
         try (OutputStream out = upload.outputStream()) {
             out.write(content, 0, 100);
             out.write(content, 100, content.length - 100);
@@ -128,7 +129,7 @@ class AzureBlobStoreTest {
         try {
             BlobStore store = new AzureBlobStore(corrupting, BLOCK_SIZE, stagingThreads);
             String name = location.blobName("part.parquet");
-            StagedUpload upload = store.startUpload(name);
+            StagedUpload upload = store.startUpload(name, RUN_ID);
 
             assertThatThrownBy(() -> {
                 try (OutputStream out = upload.outputStream()) {
@@ -169,7 +170,7 @@ class AzureBlobStoreTest {
         upload(store, second, randomBytes(10), Map.of("migration_run_id", "run-1", "source_file", "hdfs%3A%2F%2Fnn"));
         upload(store, first, randomBytes(10), Map.of());
         upload(store, "sales/orders-archive/part-0.parquet", randomBytes(10), Map.of("migration_run_id", "run-0"));
-        StagedUpload staged = store.startUpload(location.blobName("region=EU__part-2.parquet"));
+        StagedUpload staged = store.startUpload(location.blobName("region=EU__part-2.parquet"), RUN_ID);
         try (OutputStream out = staged.outputStream()) {
             out.write(randomBytes(BLOCK_SIZE * 2));
         }
@@ -207,7 +208,7 @@ class AzureBlobStoreTest {
         BlobStore store = factory.open(location);
         String name = location.blobName("part.parquet");
 
-        StagedUpload upload = store.startUpload(name);
+        StagedUpload upload = store.startUpload(name, RUN_ID);
         try (OutputStream out = upload.outputStream()) {
             out.write(randomBytes(BLOCK_SIZE * 2));
         }
@@ -219,7 +220,7 @@ class AzureBlobStoreTest {
 
     @Test
     void refusesToCommitBeforeTheStreamIsClosed() throws IOException {
-        StagedUpload upload = factory.open(location).startUpload(location.blobName("part.parquet"));
+        StagedUpload upload = factory.open(location).startUpload(location.blobName("part.parquet"), RUN_ID);
         upload.outputStream().write(1);
 
         assertThatThrownBy(() -> upload.commit(Map.of()))
@@ -276,7 +277,7 @@ class AzureBlobStoreTest {
 
     private static void upload(BlobStore store, String name, byte[] content, Map<String, String> metadata)
             throws IOException {
-        StagedUpload upload = store.startUpload(name);
+        StagedUpload upload = store.startUpload(name, RUN_ID);
         try (OutputStream out = upload.outputStream()) {
             out.write(content);
         }

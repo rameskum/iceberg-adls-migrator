@@ -224,6 +224,8 @@ public class RunStarter {
             claim.ensureHeld();
             blobStore.delete(blob.name());
         }
+        claim.ensureHeld();
+        blobStore.deleteUploadLeftovers(location.blobPrefix());
         log.info("Target cleaned: target={} deletedBlobs={}", location, blobs.size());
     }
 
